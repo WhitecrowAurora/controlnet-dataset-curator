@@ -4,6 +4,8 @@
 
 **[Click to Download / 点击下载](https://github.com/WhitecrowAurora/controlnet-dataset-curator/releases/download/v1.0.2/controlnet-dataset-curator-v1.0.2.zip)**
 
+## Info / 关于
+
 ControlNet Dataset Curator was originally a desktop GUI tool for NewBie projects, used for filtering, manually reviewing, exporting structured data, backing up and restoring data, and repairing ControlNet training data. Through iterations, it has now become a general-purpose dataset processing tool.
 
 ControlNet Dataset Curator 原本是用于 NewBie 新项目处理 Controlnet 训练数据筛选、人工审核、结构化导出、备份恢复与数据修复的桌面 GUI 工具, 经过迭代现已成为通用数据集处理工具
