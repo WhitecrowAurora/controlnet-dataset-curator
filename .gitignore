@@ -1,0 +1,26 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+output/
+models/
+python/
+.tmp/
+
+# Local settings and progress
+settings.json
+.progress.json
+report.txt
+
+# Backup and temp files
+*.bak_*
+*.tmp
+*.restore_tmp
+*.lock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,34 @@
+# ControlNet GUI 依赖列表
+
+# 核心依赖
+numpy>=1.24.0
+pillow>=10.0.0
+opencv-python>=4.8.0
+tqdm>=4.65.0
+requests>=2.31.0
+
+# PyTorch (需要根据CUDA版本选择)
+# CUDA 11.8: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# CUDA 12.1: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU版本: pip install torch torchvision
+torch>=2.0.0
+torchvision>=0.15.0
+
+# GUI框架
+PyQt5>=5.15.0
+
+# ControlNet辅助库
+controlnet-aux>=0.0.7
+timm>=0.9.0  # controlnet-aux 依赖
+
+# ViTPose/SDPose 支持（可选，用于动漫姿势检测）
+ultralytics>=8.0.0  # YOLO 检测
+onnxruntime-gpu>=1.15.0  # ViTPose ONNX 推理（GPU版本）
+# 如果没有GPU，使用: onnxruntime>=1.15.0
+
+# HuggingFace数据集支持（可选）
+datasets>=2.14.0
+huggingface-hub>=0.16.0
+
+# 其他工具
+pyarrow>=12.0.0  # Parquet文件支持

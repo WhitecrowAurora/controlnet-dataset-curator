@@ -1,0 +1,149 @@
+{
+  "version": "2.0.0",
+  "data_source": {
+    "type": "local_parquet",
+    "local_parquet": {
+      "parquet_files": [],
+      "extract_dir": "./extracted",
+      "num_samples": 0
+    },
+    "streaming": {
+      "dataset_id": "",
+      "split": "train",
+      "hf_token": null,
+      "num_samples": 10000,
+      "extract_dir": "./extracted"
+    }
+  },
+  "output": {
+    "base_dir": "./output",
+    "discard_action": "trash",
+    "trash_dir_name": "_trash",
+    "accepted_dir_name": "accepted"
+  },
+  "processing": {
+    "thread_count": 1,
+    "preload_count": 15,
+    "control_types": {
+      "canny": true,
+      "openpose": false,
+      "depth": false
+    },
+    "canny_presets": [
+      {
+        "name": "light",
+        "low": 30,
+        "high": 120,
+        "strength": 0.2
+      },
+      {
+        "name": "medium",
+        "low": 50,
+        "high": 150,
+        "strength": 0.4
+      },
+      {
+        "name": "clean",
+        "low": 80,
+        "high": 180,
+        "strength": 0.6
+      },
+      {
+        "name": "strong",
+        "low": 120,
+        "high": 220,
+        "strength": 0.8
+      }
+    ],
+    "retry_strategy": {
+      "enabled": true,
+      "max_retries": 2,
+      "retry_threshold": 40,
+      "random_offset_range": 20
+    }
+  },
+  "prefilter": {
+    "blur_detection": {
+      "enabled": true,
+      "laplacian_threshold_high": 100.0,
+      "laplacian_threshold_medium": 50.0
+    }
+  },
+  "scoring": {
+    "active_profile": "general",
+    "profiles": {
+      "general": {
+        "auto_accept": 55,
+        "auto_reject": 40,
+        "canny_auto_accept": 55,
+        "canny_auto_reject": 40,
+        "pose_auto_accept": 60,
+        "pose_auto_reject": 40,
+        "depth_auto_accept": 80,
+        "depth_auto_reject": 40,
+        "canny": {
+          "target_white_ratio": 0.15
+        },
+        "openpose": {
+          "min_visibility_ratio": 0.05,
+          "max_visibility_ratio": 0.35
+        },
+        "depth": {
+          "min_std": 18.0,
+          "min_dynamic_range": 60.0,
+          "min_grad_mean": 2.0,
+          "max_grad_mean": 20.0
+        }
+      },
+      "anime": {
+        "auto_accept": 55,
+        "auto_reject": 35,
+        "canny_auto_accept": 55,
+        "canny_auto_reject": 35,
+        "pose_auto_accept": 60,
+        "pose_auto_reject": 35,
+        "depth_auto_accept": 80,
+        "depth_auto_reject": 35,
+        "canny": {
+          "target_white_ratio": 0.15
+        },
+        "openpose": {
+          "min_visibility_ratio": 0.03,
+          "max_visibility_ratio": 0.4
+        },
+        "depth": {
+          "min_std": 12.0,
+          "min_dynamic_range": 40.0,
+          "min_grad_mean": 1.2,
+          "max_grad_mean": 25.0
+        }
+      }
+    }
+  },
+  "custom_tags": {
+    "enabled": false,
+    "tags": ""
+  },
+  "progress": {
+    "enabled": true,
+    "save_interval": 10,
+    "progress_file": ".progress.json"
+  },
+  "report": {
+    "enabled": true,
+    "output_file": "report.txt"
+  },
+  "gui": {
+    "window_width": 1600,
+    "window_height": 900,
+    "image_size": 160,
+    "original_image_size": 180,
+    "preview_size": 600,
+    "show_scores": true,
+    "highlight_best": true,
+    "show_quality_warnings": true,
+    "show_statistics": true,
+    "theme": "dark"
+  },
+  "language": "zh"
+}
