@@ -1,6 +1,8 @@
 ﻿# ControlNet Dataset Curator
 
-English | 中文
+## Download / 下载
+
+**[Click to Download / 点击下载](https://github.com/WhitecrowAurora/controlnet-dataset-curator/releases/download/v1.0.2/controlnet-dataset-curator-v1.0.2.zip)**
 
 ControlNet Dataset Curator was originally a desktop GUI tool for NewBie projects, used for filtering, manually reviewing, exporting structured data, backing up and restoring data, and repairing ControlNet training data. Through iterations, it has now become a general-purpose dataset processing tool.
 
@@ -20,6 +22,7 @@ It is designed for practical dataset curation workflows rather than model traini
 - Local image workflow and parquet / dataset extraction workflow
 - PyQt5 desktop GUI
 - Supports CPU and GPU processing
+
 
 - 支持 ControlNet 训练图像的筛选与审核
 - 支持 Canny / Pose / Depth 三类输出流程
@@ -216,9 +219,9 @@ See the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgements | 致谢
 
-Thanks to all the volunteers of the Newbie project's Controlnet dataset for their testing.
+Thanks to all the volunteers of the Newbie project's Controlnet dataset for testing the app and helping improve stability during development.
 
-感谢Newbie项目Controlnet数据集全体志愿者的测试。
+感谢Newbie项目Controlnet数据集全体志愿者参与测试，并帮助改进稳定性。
 
 This project builds on the Python ecosystem around PyQt5, PyTorch, OpenCV, Hugging Face tooling, and ControlNet-related utilities.
 
