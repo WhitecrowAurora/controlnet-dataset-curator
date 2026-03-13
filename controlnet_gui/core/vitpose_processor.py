@@ -307,13 +307,17 @@ class VitPoseProcessor:
             [255, 0, 255], [255, 0, 170], [255, 0, 85]
         ]
 
+        # Confidence threshold for drawing. ViTPose heatmaps can contain low-confidence edge peaks
+        # that produce "spider" skeletons, especially on anime/portraits.
+        draw_conf_thresh = 0.2
+
         # Draw limbs
         for i, (p1_idx, p2_idx) in enumerate(limb_seq):
             pt1 = openpose_points[p1_idx]
             pt2 = openpose_points[p2_idx]
 
-            # Skip if confidence too low (lowered threshold for better detection)
-            if pt1[2] < 0.05 or pt2[2] < 0.05:
+            # Skip if confidence too low
+            if pt1[2] < draw_conf_thresh or pt2[2] < draw_conf_thresh:
                 continue
 
             x1, y1 = int(pt1[0]), int(pt1[1])
@@ -330,9 +334,9 @@ class VitPoseProcessor:
                 )
                 cv2.fillConvexPoly(canvas, polygon, colors[i])
 
-        # Draw joints (lowered threshold)
+        # Draw joints
         for i, pt in enumerate(openpose_points):
-            if pt[2] > 0.05:
+            if pt[2] > draw_conf_thresh:
                 cv2.circle(canvas, (int(pt[0]), int(pt[1])), thickness, colors[i], thickness=-1)
 
         return canvas
@@ -358,6 +362,16 @@ class VitPoseProcessor:
         boxes = self.detect_persons(image)
         print(f"[DEBUG] ViTPose detected {len(boxes)} person(s)")
 
+        # Reduce false positives and overlapping skeleton scribbles by preferring the largest person box.
+        # This tool targets dataset curation and typically expects a single main subject.
+        if len(boxes) > 1:
+            boxes = sorted(boxes, key=lambda b: float((b[2] - b[0]) * (b[3] - b[1])), reverse=True)[:1]
+
+        # Heuristic guardrails to avoid drawing obviously invalid poses.
+        # These thresholds are intentionally conservative.
+        min_keypoint_conf = 0.3
+        min_valid_keypoints = 6
+
         for box in boxes:
             x1, y1, x2, y2 = map(int, box)
 
@@ -373,9 +387,20 @@ class VitPoseProcessor:
             bbox_shape = (x2 - x1, y2 - y1)
             coco_keypoints = self.estimate_pose(crop, bbox_shape)
 
-            # Check keypoint confidence
-            valid_keypoints = sum(1 for kp in coco_keypoints if kp[2] > 0.05)
-            print(f"[DEBUG] ViTPose found {valid_keypoints}/17 valid keypoints (conf > 0.05)")
+            # Clamp keypoints into the crop region to avoid extreme lines from out-of-range peaks.
+            coco_keypoints[:, 0] = np.clip(coco_keypoints[:, 0], 0.0, float(bbox_shape[0] - 1))
+            coco_keypoints[:, 1] = np.clip(coco_keypoints[:, 1], 0.0, float(bbox_shape[1] - 1))
+
+            # Check keypoint confidence (guard against "fake" skeletons).
+            conf = coco_keypoints[:, 2]
+            valid_keypoints = int(np.sum(conf > min_keypoint_conf))
+            print(f"[DEBUG] ViTPose found {valid_keypoints}/17 valid keypoints (conf > {min_keypoint_conf})")
+
+            # Require a minimal plausible structure: at least one shoulder and one hip with confidence.
+            has_shoulder = bool(conf[5] > min_keypoint_conf or conf[6] > min_keypoint_conf)
+            has_hip = bool(conf[11] > min_keypoint_conf or conf[12] > min_keypoint_conf)
+            if valid_keypoints < min_valid_keypoints or not (has_shoulder and has_hip):
+                continue
 
             # Convert to OpenPose format
             openpose_points = self.coco_to_openpose(coco_keypoints)
