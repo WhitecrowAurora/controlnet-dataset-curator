@@ -12,18 +12,24 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QProcess
 from PyQt5.QtGui import QIcon
 import json
 import os
-from typing import Optional
+import threading
+from typing import Dict, Optional
 from queue import Queue, Empty, Full
 
 from .settings_panel import SettingsPanel
 from .image_list import ImageListWidget
 from .preview_panel import PreviewPanel
 from .jsona_manager_dialog import JsonaManagerDialog
+from .duplicate_resolution_dialog import DuplicateResolutionDialog
+from .vlm_tag_dialog import VlmTagDialog
 from ..core.data_source import LocalDataSource
 from ..core.controlnet_processor import ControlNetProcessor
 from ..core.image_prefilter import ImagePreFilter
 from ..core.progress_manager import ProgressManager
 from ..core.jsona_backup import JsonaBackupManager
+from ..core.review_inbox import ReviewInbox, ReviewInboxPolicy
+from ..core.tag_formats import build_nl_prompt, build_xml_fragment
+from ..core.vlm_client import VlmConfig
 from ..core.score_converter import (
     canny_to_10_scale, openpose_to_10_scale, depth_to_10_scale
 )
@@ -243,6 +249,7 @@ class ProcessingThread(QThread):
     error_occurred = pyqtSignal(str)
     stats_updated = pyqtSignal(dict)
     progress_updated = pyqtSignal(str)  # Signal for progress text updates
+    duplicate_resolution_needed = pyqtSignal(dict)
 
     def __init__(self, data_source, processor, prefilter, progress_manager, settings):
         super().__init__()
@@ -263,8 +270,111 @@ class ProcessingThread(QThread):
             'auto_accept': 0,
             'auto_reject': 0,
             'need_review': 0,
+            'inbox_pending': 0,
             'in_queue': 0
         }
+        self._duplicate_resolution_default = None
+        self._duplicate_resolution_event = None
+        self._duplicate_resolution_result = None
+
+    def _request_duplicate_resolution(self, payload: Dict) -> str:
+        if self._duplicate_resolution_default in ('overwrite', 'new_revision'):
+            return self._duplicate_resolution_default
+        self._duplicate_resolution_event = threading.Event()
+        self._duplicate_resolution_result = {'action': 'new_revision', 'apply_all': False}
+        self.duplicate_resolution_needed.emit(payload)
+        self._duplicate_resolution_event.wait()
+        result = self._duplicate_resolution_result or {'action': 'new_revision', 'apply_all': False}
+        action = str(result.get('action') or 'new_revision')
+        if result.get('apply_all'):
+            self._duplicate_resolution_default = action
+        self._duplicate_resolution_event = None
+        self._duplicate_resolution_result = None
+        return action
+
+    def resolve_duplicate_decision(self, action: str, apply_all: bool = False):
+        self._duplicate_resolution_result = {
+            'action': action,
+            'apply_all': bool(apply_all),
+        }
+        if self._duplicate_resolution_event is not None:
+            self._duplicate_resolution_event.set()
+
+    @staticmethod
+    def _short_text(value: str, limit: int = 800) -> str:
+        text = (value or '').strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + '...'
+
+    def _format_existing_review_summary(self, record: dict) -> str:
+        stored = record.get('stored', {}) or {}
+        variants = list(stored.get('variants', []) or [])
+        lines = [
+            f"revision: {record.get('revision', 0)}",
+            f"time: {record.get('ts', '')}",
+            f"type: {record.get('control_type', 'unknown')}",
+            f"score: {record.get('best_score', 0)}",
+            f"profile: {record.get('profile', '')}",
+            f"候选图数量: {len(variants)}",
+            "",
+            "tags:",
+            self._short_text(record.get('tags', '')),
+        ]
+        if record.get('prefilter'):
+            lines.extend(["", "prefilter:", json.dumps(record.get('prefilter', {}), ensure_ascii=False, indent=2)])
+        if variants:
+            variant_lines = []
+            for variant in variants[:4]:
+                chunk = [f"- idx={variant.get('idx', 0)} score={variant.get('score', 0)} preset={variant.get('preset', 'unknown')}"]
+                if variant.get('thresholds'):
+                    chunk.append(f"  thresholds={variant.get('thresholds')}")
+                if variant.get('warning'):
+                    chunk.append(f"  warning={variant.get('warning')}")
+                if variant.get('metrics'):
+                    chunk.append(f"  metrics={variant.get('metrics')}")
+                variant_lines.extend(chunk)
+            lines.extend(["", "variants:", "\n".join(variant_lines)])
+        return "\n".join(lines).strip()
+
+    def _format_live_review_summary(
+        self,
+        *,
+        basename: str,
+        control_type: str,
+        tags: str,
+        variants: list,
+        best_score: float,
+        profile: str,
+        prefilter: Optional[dict],
+        next_revision: int,
+    ) -> str:
+        lines = [
+            f"revision: {next_revision}",
+            "time: 当前这次",
+            f"type: {control_type}",
+            f"score: {best_score}",
+            f"profile: {profile}",
+            f"候选图数量: {len(variants or [])}",
+            "",
+            "tags:",
+            self._short_text(tags),
+        ]
+        if prefilter:
+            lines.extend(["", "prefilter:", json.dumps(prefilter, ensure_ascii=False, indent=2)])
+        if variants:
+            variant_lines = []
+            for idx, variant in enumerate((variants or [])[:4]):
+                chunk = [f"- idx={idx} score={variant.get('score', 0)} preset={variant.get('preset', 'unknown')}"]
+                if variant.get('thresholds'):
+                    chunk.append(f"  thresholds={variant.get('thresholds')}")
+                if variant.get('warning'):
+                    chunk.append(f"  warning={variant.get('warning')}")
+                if variant.get('metrics'):
+                    chunk.append(f"  metrics={variant.get('metrics')}")
+                variant_lines.extend(chunk)
+            lines.extend(["", "variants:", "\n".join(variant_lines)])
+        return "\n".join(lines).strip()
 
     def run(self):
         """Continuously process images from data source."""
@@ -276,6 +386,20 @@ class ProcessingThread(QThread):
             os.makedirs(os.path.join(base_dir, 'accepted'), exist_ok=True)
             os.makedirs(os.path.join(base_dir, 'rejected'), exist_ok=True)
             os.makedirs(os.path.join(base_dir, 'reviewed'), exist_ok=True)
+
+            # Unattended mode: save review-needed items to disk inbox, do not enqueue images into GUI.
+            processing_cfg = self.settings.get('processing', {}) or {}
+            self.unattended_mode = bool(processing_cfg.get('unattended_mode', False))
+            self.review_inbox = None
+            if self.unattended_mode:
+                policy = ReviewInboxPolicy(
+                    max_mb=int(processing_cfg.get('unattended_inbox_max_mb', 2048)),
+                    on_full=str(processing_cfg.get('unattended_inbox_full_action', 'pause')).lower(),
+                )
+                self.review_inbox = ReviewInbox(base_dir, policy=policy)
+                with QMutexLocker(self.mutex):
+                    self.stats['inbox_pending'] = len(self.review_inbox.iter_pending())
+                self.stats_updated.emit(self.stats.copy())
 
             # Use the data_source passed in constructor (respects custom directory setting)
             image_dir = self.data_source.image_dir
@@ -356,6 +480,32 @@ class ProcessingThread(QThread):
                     # No valid control type, skip this image
                     continue
 
+                def _variants_for_review_src(_control_type: str, _control_result: dict):
+                    variants = list((_control_result or {}).get('variants', []) or [])
+                    if _control_type == 'canny':
+                        best_by_preset = {}
+                        for v in variants:
+                            preset = v.get('preset')
+                            if preset is None:
+                                continue
+                            if preset not in best_by_preset or float(v.get('score', 0)) > float(best_by_preset[preset].get('score', 0)):
+                                best_by_preset[preset] = v
+
+                        order = {'light': 0, 'medium': 1, 'clean': 2, 'strong': 3}
+                        selected = list(best_by_preset.values())
+                        selected.sort(key=lambda v: order.get(v.get('preset'), 999))
+
+                        # If we have fewer than 4 (unexpected), fill with next best remaining.
+                        if len(selected) < 4 and variants:
+                            used = set(id(x) for x in selected)
+                            rest = [v for v in variants if id(v) not in used]
+                            rest.sort(key=lambda v: float(v.get('score', 0)), reverse=True)
+                            selected.extend(rest[: max(0, 4 - len(selected))])
+
+                        return selected[:4]
+
+                    return variants[:4]
+
                 # Create one row for each control type
                 for control_type, control_result in control_types_to_display:
                     best_score = control_result.get('best_score', 0)
@@ -425,11 +575,12 @@ class ProcessingThread(QThread):
                         'best_score': best_score,  # Raw score (0-100)
                         'control_10_score': control_10_score,  # 1-10 score
                         'profile': active_profile
-                        }
+                    }
 
                     # Convert variants to GUI format
                     from PIL import Image as PILImage
-                    for variant in control_result.get('variants', []):
+                    variants_src = _variants_for_review_src(control_type, control_result)
+                    for variant in variants_src:
                         # Load and copy image to ensure it persists after file close
                         variant_img = PILImage.open(variant['path']).convert("RGB").copy()
 
@@ -459,6 +610,7 @@ class ProcessingThread(QThread):
 
                         gui_data['variants'].append({
                             'image': variant_img,
+                            'path': variant.get('path'),
                             'preset': preset_info,
                             'preset_name': preset_name,
                             'score': variant['score'],  # Raw score (0-100)
@@ -515,7 +667,6 @@ class ProcessingThread(QThread):
                         else:
                             # Need review - don't mark as processed yet
                             print(f"[DEBUG] NEED REVIEW: {basename} - {control_type}")
-                            self.stats['need_review'] += 1
                             gui_data['auto_action'] = None
 
                     # Send statistics update
@@ -527,23 +678,98 @@ class ProcessingThread(QThread):
 
                     # Decide whether to add to review queue
                     if auto_reject_th < best_score < auto_accept_th:
-                        # Needs review - retry with short timeouts so stop/exit can interrupt cleanly.
-                        while self.running:
+                        if getattr(self, 'unattended_mode', False) and self.review_inbox is not None:
+                            duplicate_mode = 'reuse'
+                            duplicate_info = self.review_inbox.inspect_duplicate(
+                                progress_key=progress_key,
+                                basename=basename,
+                                control_type=control_type,
+                                original_path=image_path,
+                                tag_text=result.get('tags', ''),
+                                variants=variants_src,
+                                best_score=best_score,
+                                profile=active_profile,
+                                prefilter=prefilter_result,
+                            )
+                            if duplicate_info.get('status') == 'duplicate':
+                                duplicate_mode = self._request_duplicate_resolution({
+                                    'kind': 'controlnet_review',
+                                    'basename': basename,
+                                    'control_type': control_type,
+                                    'existing_revision': int(duplicate_info.get('record', {}).get('revision', 0) or 0),
+                                    'next_revision': int(duplicate_info.get('next_revision', 0) or 0),
+                                    'record_count': int(duplicate_info.get('record_count', 0) or 0),
+                                    'existing_summary': self._format_existing_review_summary(duplicate_info.get('record', {}) or {}),
+                                    'new_summary': self._format_live_review_summary(
+                                        basename=basename,
+                                        control_type=control_type,
+                                        tags=result.get('tags', ''),
+                                        variants=variants_src,
+                                        best_score=best_score,
+                                        profile=active_profile,
+                                        prefilter=prefilter_result,
+                                        next_revision=int(duplicate_info.get('next_revision', 0) or 0),
+                                    ),
+                                })
+                            stored, info = self.review_inbox.add_item(
+                                progress_key=progress_key,
+                                basename=basename,
+                                control_type=control_type,
+                                original_path=image_path,
+                                tag_text=result.get('tags', ''),
+                                variants=variants_src,
+                                best_score=best_score,
+                                profile=active_profile,
+                                prefilter=prefilter_result,
+                                duplicate_mode=duplicate_mode,
+                            )
+
+                            if stored:
+                                pending_delta = int(info.get('pending_delta', 0) or 0)
+                                if pending_delta > 0:
+                                    with QMutexLocker(self.mutex):
+                                        self.stats['need_review'] += pending_delta
+                                        self.stats['inbox_pending'] = int(self.stats.get('inbox_pending', 0)) + pending_delta
+                                        self.stats['in_queue'] = self.review_queue.qsize()
+                                    self.stats_updated.emit(self.stats.copy())
+
+                                # Mark as processed so restarts don't re-add duplicates; user can import inbox later.
+                                if self.progress_manager:
+                                    self.progress_manager.mark_processed(progress_key)
+                            else:
+                                # Inbox full: auto pause/stop.
+                                current_mb = info.get('current_mb', 0)
+                                max_mb = info.get('max_mb', 0)
+                                self.progress_updated.emit(
+                                    f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
+                                )
+                                on_full = str(info.get('on_full', 'pause')).lower()
+                                if on_full == 'stop':
+                                    self.running = False
+                                    break
+                                self.paused = True
+                        else:
+                            # Needs review - retry with short timeouts so stop/exit can interrupt cleanly.
+                            while self.running:
+                                try:
+                                    self.review_queue.put(gui_data, timeout=0.1)
+                                    enqueued = True
+                                    break
+                                except Full:
+                                    continue
+                            if enqueued:
+                                with QMutexLocker(self.mutex):
+                                    self.stats['need_review'] += 1
+                            if not enqueued and not self.running:
+                                break
+                    elif not auto_pass_no_review:
+                        # Setting disabled - show all auto items for review
+                        if not getattr(self, 'unattended_mode', False):
                             try:
                                 self.review_queue.put(gui_data, timeout=0.1)
                                 enqueued = True
-                                break
                             except Full:
-                                continue
-                        if not enqueued and not self.running:
-                            break
-                    elif not auto_pass_no_review:
-                        # Setting disabled - show all auto items for review
-                        try:
-                            self.review_queue.put(gui_data, timeout=0.1)
-                            enqueued = True
-                        except Full:
-                            pass
+                                pass
                     # else: auto_pass_no_review enabled - skip adding auto items to queue displaying this auto item
 
                     with QMutexLocker(self.mutex):
@@ -672,15 +898,16 @@ class ProcessingThread(QThread):
             print(f"[DEBUG] base_dir: {base_dir}")
             print(f"[DEBUG] control_type: {control_type}")
 
-            # Get tags
-            image_dir = os.path.dirname(image_path)
-            extract_dir = os.path.dirname(image_dir)
-            tag_file = os.path.join(extract_dir, 'tags', f"{basename}.txt")
-
-            hint_prompt = ""
-            if os.path.exists(tag_file):
-                with open(tag_file, 'r', encoding='utf-8') as f:
-                    hint_prompt = f.read().strip()
+            # Prefer already-loaded tags (includes custom tags) and fall back to sidecar tag file.
+            hint_prompt = (result.get('tags') or '').strip()
+            if not hint_prompt:
+                try:
+                    tag_file = os.path.join(os.path.dirname(image_path), f"{basename}.txt")
+                    if os.path.exists(tag_file):
+                        with open(tag_file, 'r', encoding='utf-8') as f:
+                            hint_prompt = f.read().strip()
+                except Exception:
+                    pass
 
             use_single_jsona = self.settings.get('processing', {}).get('single_jsona', False)
             control_map = {
@@ -714,6 +941,25 @@ class ProcessingThread(QThread):
                     self.settings_panel._update_jsona_statistics()
             else:
                 print(f"[DEBUG] Control path doesn't exist: {control_path}")
+
+            # Always write tag/nl/xml JSONA as separate files (never merged into metadata.jsona).
+            if hint_prompt:
+                try:
+                    xml_config = (self.settings.get('processing', {}) or {}).get('xml_mapping', {})
+                    tag_entry = self._create_jsona_entry(source_image_path, hint_prompt, source_image_path, 'tag')
+                    nl_entry = self._create_jsona_entry(source_image_path, build_nl_prompt(hint_prompt), source_image_path, 'nl')
+                    xml_fragment = build_xml_fragment(hint_prompt, xml_config)
+                    if xml_fragment:
+                        xml_entry = self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')
+                    else:
+                        xml_entry = None
+
+                    self.processor._append_to_json_file(base_dir, 'tag', [tag_entry])
+                    self.processor._append_to_json_file(base_dir, 'nl', [nl_entry])
+                    if xml_entry:
+                        self.processor._append_to_json_file(base_dir, 'xml', [xml_entry])
+                except Exception as e:
+                    print(f"[WARNING] Failed to write tag/nl/xml jsona: {e}")
 
         except Exception as e:
             print(f"[ERROR] Failed to write JSONA metadata: {e}")
@@ -810,8 +1056,12 @@ class MainWindow(QMainWindow):
             'auto_accept': 0,
             'auto_reject': 0,
             'need_review': 0,
+            'inbox_pending': 0,
             'in_queue': 0
         }
+        # Offline/manual review queue populated from review_inbox (when processing thread is not running).
+        self._inbox_review_queue: Queue = Queue()
+        self._review_inbox_manager: Optional[ReviewInbox] = None
         self.max_display_rows = 20  # Max rows displayed in GUI
         self._auto_expanding_window = False
         self.lang_manager = get_lang_manager()
@@ -1086,6 +1336,14 @@ class MainWindow(QMainWindow):
         self.jsona_checker_action.triggered.connect(self._open_jsona_checker)
         self.tools_menu.addAction(self.jsona_checker_action)
 
+        self.review_inbox_import_action = QAction('导入审核箱 (需要人工审核)', self)
+        self.review_inbox_import_action.triggered.connect(self._import_review_inbox)
+        self.tools_menu.addAction(self.review_inbox_import_action)
+
+        self.vlm_tag_action = QAction('VLM 核对 Tag 并输出 NL', self)
+        self.vlm_tag_action.triggered.connect(self._open_vlm_tag_dialog)
+        self.tools_menu.addAction(self.vlm_tag_action)
+
         self.tools_menu.addSeparator()
 
         self.install_all_deps_action = QAction(tr('install_all_dependencies'), self)
@@ -1127,17 +1385,45 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         """Connect signals and slots."""
-        # Settings panel signals
+        self._bind_settings_panel_signals()
+
+        # Image list signals
+        self.image_list.variant_selected.connect(self._on_variant_selected)
+        self.image_list.variant_confirmed.connect(self._on_variant_confirmed)
+        self.image_list.row_discarded.connect(self._on_row_discarded)
+
+    def _bind_settings_panel_signals(self):
+        """Connect signals from the current settings panel instance."""
         self.settings_panel.settings_changed.connect(self._on_settings_changed)
         self.settings_panel.start_processing.connect(self._start_processing)
         self.settings_panel.extraction_finished.connect(self._on_extraction_finished)
         self.settings_panel.btn_pause.clicked.connect(self._toggle_pause)
         self.settings_panel.btn_stop.clicked.connect(self._stop_processing)
 
-        # Image list signals
-        self.image_list.variant_selected.connect(self._on_variant_selected)
-        self.image_list.variant_confirmed.connect(self._on_variant_confirmed)
-        self.image_list.row_discarded.connect(self._on_row_discarded)
+    def _sync_settings_panel_runtime_state(self):
+        """Keep the recreated settings panel buttons in sync with current runtime state."""
+        is_running = bool(self.processing_thread and self.processing_thread.isRunning())
+
+        self.settings_panel.btn_pause.setEnabled(is_running)
+        self.settings_panel.btn_stop.setEnabled(is_running)
+
+        if is_running and self.processing_thread.paused:
+            self.settings_panel.btn_pause.setText(tr('resume_processing'))
+        else:
+            self.settings_panel.btn_pause.setText(tr('pause_processing'))
+
+    def _replace_settings_panel(self, new_panel):
+        """Replace the settings panel while preserving the outer scroll container."""
+        old_panel = getattr(self, 'settings_panel', None)
+        self.settings_panel = new_panel
+        self.settings_panel.setMinimumWidth(340)
+        self.settings_panel.setMaximumWidth(460)
+        self.settings_scroll.setWidget(self.settings_panel)
+        self._bind_settings_panel_signals()
+        self._sync_settings_panel_runtime_state()
+
+        if old_panel is not None:
+            old_panel.deleteLater()
 
     def _is_text_input_focused(self) -> bool:
         """Avoid hijacking keyboard when user is typing in form inputs."""
@@ -1264,7 +1550,6 @@ class MainWindow(QMainWindow):
     def _on_settings_changed(self, settings: dict):
         """Handle settings changes."""
         self.config = settings
-        self.status_bar.showMessage("Settings updated")
 
     def _on_extraction_finished(self, count: int):
         """Handle data extraction completion"""
@@ -1420,6 +1705,7 @@ class MainWindow(QMainWindow):
             self.processing_thread.error_occurred.connect(self._on_processing_error)
             self.processing_thread.stats_updated.connect(self._on_stats_updated)
             self.processing_thread.progress_updated.connect(self._on_progress_updated)
+            self.processing_thread.duplicate_resolution_needed.connect(self._on_review_inbox_duplicate_resolution)
             self.processing_thread.start()
 
             # Enable pause and stop buttons
@@ -1447,6 +1733,15 @@ class MainWindow(QMainWindow):
 
     def _on_progress_updated(self, progress_text: str):
         """Update status bar with current progress and statistics."""
+        # Keep pause button text in sync even when pause is triggered automatically (e.g. unattended inbox full).
+        if self.processing_thread and self.processing_thread.isRunning():
+            if self.processing_thread.paused:
+                self.pause_action.setText(tr('resume_processing'))
+                self.settings_panel.btn_pause.setText(tr('resume_processing'))
+            else:
+                self.pause_action.setText(tr('pause_processing'))
+                self.settings_panel.btn_pause.setText(tr('pause_processing'))
+
         if hasattr(self, 'current_stats'):
             stats = self.current_stats
             msg = (f"{progress_text} | "
@@ -1454,6 +1749,7 @@ class MainWindow(QMainWindow):
                    f"{tr('auto_accepted')}: {stats['auto_accept']} | "
                    f"{tr('auto_rejected')}: {stats['auto_reject']} | "
                    f"{tr('need_review')}: {stats['need_review']} | "
+                   f"{tr('inbox_pending')}: {stats.get('inbox_pending', 0)} | "
                    f"{tr('in_queue')}: {stats.get('in_queue', 0)} | "
                    f"{tr('displaying')}: {len(self.image_list._rows)}")
         else:
@@ -1485,6 +1781,28 @@ class MainWindow(QMainWindow):
             f"{tr('need_review')}: {self.current_stats['need_review']}\n"
             f"{tr('displaying')}: {len(self.image_list._rows)}"
         )
+
+    def _on_review_inbox_duplicate_resolution(self, payload: dict):
+        dialog = DuplicateResolutionDialog(
+            title='重复审核项',
+            intro=(
+                "检测到同一张图已有历史审核记录。\n"
+                "左侧是旧记录，右侧是这次准备写入的新记录，请选择处理方式。"
+            ),
+            old_title='旧记录',
+            old_text=payload.get('existing_summary', ''),
+            new_title='新记录',
+            new_text=payload.get('new_summary', ''),
+            overwrite_label='最新记录覆盖旧记录',
+            separate_label='加入审查窗口单独审查',
+            apply_all_label='对本次剩余重复项都使用这个选择',
+            parent=self,
+        )
+        dialog.exec_()
+        action, apply_all = dialog.result_data()
+
+        if self.processing_thread:
+            self.processing_thread.resolve_duplicate_decision(action, apply_all)
 
     def _on_processing_error(self, error: str):
         """Handle processing error."""
@@ -1521,14 +1839,19 @@ class MainWindow(QMainWindow):
 
     def _refill_display(self):
         """Refill GUI display from queue"""
-        if not self.processing_thread:
-            return
-
         self._ensure_review_area_width()
+
+        def _next_item():
+            if self.processing_thread and self.processing_thread.isRunning():
+                return self.processing_thread.get_next_image()
+            try:
+                return self._inbox_review_queue.get_nowait()
+            except Empty:
+                return None
 
         # Continuously get images from queue until max display count reached
         while len(self.image_list._rows) < self.max_display_rows:
-            next_image = self.processing_thread.get_next_image()
+            next_image = _next_item()
             if next_image is None:
                 break  # Queue empty
             self.image_list.add_row(next_image)
@@ -1602,9 +1925,33 @@ class MainWindow(QMainWindow):
                             if hasattr(self, 'settings_panel'):
                                 self.settings_panel._update_jsona_statistics()
 
+                            # Also write tag/nl/xml jsona for this accepted item.
+                            if tags:
+                                try:
+                                    xml_config = (settings.get('processing', {}) or {}).get('xml_mapping', {})
+                                    tag_entry = self._create_jsona_entry(source_image_path, tags, source_image_path, 'tag')
+                                    nl_entry = self._create_jsona_entry(source_image_path, build_nl_prompt(tags), source_image_path, 'nl')
+                                    xml_fragment = build_xml_fragment(tags, xml_config)
+                                    xml_entry = (
+                                        self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')
+                                        if xml_fragment else None
+                                    )
+                                    self.processor._append_to_json_file(base_dir, 'tag', [tag_entry])
+                                    self.processor._append_to_json_file(base_dir, 'nl', [nl_entry])
+                                    if xml_entry:
+                                        self.processor._append_to_json_file(base_dir, 'xml', [xml_entry])
+                                except Exception as e:
+                                    print(f"[WARNING] Failed to write tag/nl/xml jsona (manual): {e}")
+
                 if self.progress_manager:
                     self.progress_manager.mark_processed(progress_key)
                     self.progress_manager.mark_accepted(progress_key, auto=False)
+                    review_record_id = data.get('review_record_id', '')
+                    if self._review_inbox_manager:
+                        if review_record_id:
+                            self._review_inbox_manager.mark_done_by_id(review_record_id)
+                        elif progress_key:
+                            self._review_inbox_manager.mark_done(progress_key)
 
         except Exception as e:
             QMessageBox.warning(self, tr('save_failed'), f"{tr('cannot_save_image')}: {str(e)}")
@@ -1625,6 +1972,12 @@ class MainWindow(QMainWindow):
         if self.progress_manager:
             self.progress_manager.mark_processed(progress_key)
             self.progress_manager.mark_rejected(progress_key, auto=False)
+            review_record_id = data.get('review_record_id', '')
+            if self._review_inbox_manager:
+                if review_record_id:
+                    self._review_inbox_manager.mark_done_by_id(review_record_id)
+                elif progress_key:
+                    self._review_inbox_manager.mark_done(progress_key)
 
         self.image_list.remove_row(row_index)
         self.preview_panel.clear()
@@ -1732,20 +2085,14 @@ class MainWindow(QMainWindow):
         self.jsona_manager_action.setText('JSONA 管理')
         self.jsona_import_action.setText('导入 JSONA')
         self.jsona_checker_action.setText('JSONA 核对检查器')
+        self.review_inbox_import_action.setText('导入审核箱 (需要人工审核)')
+        self.vlm_tag_action.setText('VLM 核对 Tag 并输出 NL')
 
         # Update image list
         self.image_list.update_language()
 
         # Recreate settings panel with new language
-        old_settings = self.settings_panel.get_settings()
-        self.settings_panel.deleteLater()
-        self.settings_panel = SettingsPanel(self.config)
-        self.settings_panel.settings_changed.connect(self._on_settings_changed)
-        self.settings_panel.start_processing.connect(self._start_processing)
-
-        # Replace in splitter
-        splitter = self.centralWidget().layout().itemAt(0).widget()
-        splitter.replaceWidget(0, self.settings_panel)
+        self._replace_settings_panel(SettingsPanel(self.config))
 
     def _clear_images(self):
         """Clear all images."""
@@ -1877,18 +2224,7 @@ class MainWindow(QMainWindow):
                     self.config = json.load(f)
 
                 # Recreate settings panel with new config
-                old_settings = self.settings_panel
-                self.settings_panel = SettingsPanel(self.config)
-
-                # Reconnect signals
-                self.settings_panel.settings_changed.connect(self._on_settings_changed)
-                self.settings_panel.start_processing.connect(self._start_processing)
-                self.settings_panel.extraction_finished.connect(self._on_extraction_finished)
-
-                # Replace in splitter
-                splitter = self.centralWidget().layout().itemAt(0).widget()
-                splitter.replaceWidget(0, self.settings_panel)
-                old_settings.deleteLater()
+                self._replace_settings_panel(SettingsPanel(self.config))
 
                 self.status_bar.showMessage(f"Loaded config from {path}")
             except Exception as e:
@@ -2280,6 +2616,189 @@ class MainWindow(QMainWindow):
     def _open_jsona_checker(self):
         """Open the JSONA dialog and run checker for the selected file."""
         self._show_jsona_dialog(initial_action='check')
+
+    def _open_vlm_tag_dialog(self):
+        """Open VLM dialog for tag verification and NL rewrite."""
+        settings = self.settings_panel.get_settings()
+        output_config = settings.get('output', {}) or {}
+        base_dir = output_config.get('base_dir', './output')
+        os.makedirs(base_dir, exist_ok=True)
+
+        allow_mutation = not (self.processing_thread and self.processing_thread.isRunning())
+        if not allow_mutation:
+            QMessageBox.information(
+                self,
+                'VLM 推理',
+                '当前任务正在运行。为了避免输出文件写入冲突，请先停止任务或等待任务结束后再运行 VLM 推理。'
+            )
+            return
+
+        vlm_cfg = settings.get('vlm', {}) or {}
+        initial = VlmConfig(
+            backend=str(vlm_cfg.get('backend', 'openai') or 'openai'),
+            base_url=str(vlm_cfg.get('base_url', 'http://127.0.0.1:1234') or 'http://127.0.0.1:1234'),
+            api_key=str(vlm_cfg.get('api_key', '') or ''),
+            model=str(vlm_cfg.get('model', '') or ''),
+            timeout_seconds=int(vlm_cfg.get('timeout_seconds', 120) or 120),
+        )
+        dialog = VlmTagDialog(base_dir, self._create_jsona_backup_manager(), initial_cfg=initial, parent=self)
+        dialog.exec_()
+
+    def _import_review_inbox(self):
+        """Import pending unattended-review items from output/review_inbox into the existing manual review UI."""
+        try:
+            settings = self.settings_panel.get_settings()
+            output_config = settings.get('output', {}) or {}
+            base_dir = output_config.get('base_dir', './output')
+
+            processing_cfg = settings.get('processing', {}) or {}
+            policy = ReviewInboxPolicy(
+                max_mb=int(processing_cfg.get('unattended_inbox_max_mb', 2048)),
+                on_full=str(processing_cfg.get('unattended_inbox_full_action', 'pause')).lower(),
+            )
+
+            inbox = ReviewInbox(base_dir, policy=policy)
+            pending = inbox.iter_pending()
+            if not pending:
+                QMessageBox.information(self, '导入审核箱', '审核箱没有待处理条目。')
+                return
+
+            # Ensure required services exist for saving user decisions.
+            if self.processor is None:
+                self.processor = ControlNetProcessor(settings)
+            if self.progress_manager is None:
+                progress_config = settings.get('progress', {}) or {}
+                progress_file = progress_config.get('progress_file', '.progress.json')
+                self.progress_manager = ProgressManager(progress_file)
+
+            self._review_inbox_manager = inbox
+
+            # Reset current display and queue.
+            self.image_list.clear()
+            self.preview_panel.clear()
+            try:
+                while True:
+                    self._inbox_review_queue.get_nowait()
+            except Empty:
+                pass
+
+            from PIL import Image as PILImage
+
+            loaded = 0
+            skipped = 0
+            for rec in pending:
+                try:
+                    stored = rec.get('stored', {}) or {}
+                    orig_rel = stored.get('original')
+                    if not orig_rel:
+                        skipped += 1
+                        continue
+
+                    orig_path = os.path.join(inbox.root, orig_rel)
+                    if not os.path.exists(orig_path):
+                        skipped += 1
+                        continue
+
+                    control_type = rec.get('control_type', 'canny')
+                    variants_rec = list(stored.get('variants', []) or [])
+                    variants_rec.sort(key=lambda v: int(v.get('idx', 0)))
+                    variants_rec = variants_rec[:4]
+
+                    variants = []
+                    for vrec in variants_rec:
+                        v_rel = vrec.get('path')
+                        if not v_rel:
+                            continue
+                        v_path = os.path.join(inbox.root, v_rel)
+                        if not os.path.exists(v_path):
+                            continue
+
+                        with PILImage.open(v_path) as _im:
+                            v_img = _im.convert("RGB").copy()
+
+                        raw_score = float(vrec.get('score', 0))
+                        preset_name = vrec.get('preset', 'unknown')
+
+                        if control_type == 'canny':
+                            preset_info = vrec.get('thresholds') or {}
+                            score_10 = canny_to_10_scale(raw_score)
+                        elif control_type == 'openpose':
+                            preset_info = {'warning': vrec.get('warning')}
+                            score_10 = openpose_to_10_scale(
+                                float(vrec.get('visibility_ratio', 0) or 0),
+                                raw_score >= 60,
+                                vrec.get('warning'),
+                                is_vitpose=bool(vrec.get('is_vitpose', False)),
+                            )
+                        elif control_type == 'depth':
+                            preset_info = vrec.get('metrics') or {}
+                            score_10 = depth_to_10_scale(
+                                preset_info,
+                                raw_score >= 60,
+                                vrec.get('warning'),
+                            )
+                        else:
+                            preset_info = {}
+                            score_10 = 1.0
+
+                        variants.append({
+                            'image': v_img,
+                            'path': v_path,
+                            'preset': preset_info,
+                            'preset_name': preset_name,
+                            'score': raw_score,
+                            'score_10': score_10,
+                        })
+
+                    if not variants:
+                        skipped += 1
+                        continue
+
+                    best_i = max(range(len(variants)), key=lambda i: variants[i].get('score', 0))
+                    for i in range(len(variants)):
+                        variants[i]['is_best'] = (i == best_i)
+
+                    with PILImage.open(orig_path) as _im:
+                        orig_img = _im.convert("RGB").copy()
+
+                    gui_data = {
+                        'original_image': orig_img,
+                        'original_path': rec.get('original_src') or orig_path,
+                        'image_path': rec.get('original_src') or rec.get('original_path') or orig_path,
+                        'basename': rec.get('basename', 'unknown'),
+                        'tags': rec.get('tags', ''),
+                        'prefilter': rec.get('prefilter', {}),
+                        'control_type': control_type,
+                        'progress_key': rec.get('progress_key'),
+                        'variants': variants,
+                        'best_score': float(rec.get('best_score', variants[best_i].get('score', 0))),
+                        'control_10_score': float(variants[best_i].get('score_10', 1.0)),
+                        'profile': rec.get('profile', 'general'),
+                        'auto_action': None,
+                        'review_record_id': rec.get('id', ''),
+                    }
+
+                    self._inbox_review_queue.put(gui_data)
+                    loaded += 1
+                except Exception:
+                    skipped += 1
+                    continue
+
+            self._refill_display()
+            self.status_bar.showMessage(f"已导入审核箱: {loaded} 条，跳过: {skipped} 条")
+        except Exception as e:
+            QMessageBox.warning(self, '导入审核箱', f"导入失败: {str(e)}")
+
+    def _create_jsona_entry(self, image_path: str, hint_prompt: str, control_path: str, task_id: str) -> dict:
+        """Create a JSONA entry with stable absolute paths (MainWindow helper)."""
+        hint_image_path = os.path.abspath(image_path).replace('\\', '/')
+        control_hints_path = os.path.abspath(control_path).replace('\\', '/')
+        return {
+            "hint_image_path": hint_image_path,
+            "hint_prompt": hint_prompt or "",
+            "control_hints_path": control_hints_path,
+            "task_id": task_id,
+        }
 
     def _show_about(self):
         """Show about dialog."""

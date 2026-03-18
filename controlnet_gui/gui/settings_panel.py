@@ -5,16 +5,20 @@ Data source selection, thread count, output path configuration
 
 import os
 import json
+import xml.etree.ElementTree as ET
+from copy import deepcopy
+from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QSpinBox, QComboBox,
     QCheckBox, QFileDialog, QFormLayout, QListWidget, QTextEdit, QProgressBar,
-    QDialog, QDialogButtonBox, QListWidgetItem, QMessageBox, QScrollArea, QRadioButton
+    QDialog, QDialogButtonBox, QListWidgetItem, QMessageBox, QRadioButton, QApplication
 )
 from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot, Qt
 from ..language import tr
 from ..core.parquet_source import ParquetDataSource, StreamingDataSource
 from ..core.jsona_backup import JsonaBackupManager
+from ..core.tag_formats import build_xml_fragment
 
 
 class SplitSelectionDialog(QDialog):
@@ -63,6 +67,159 @@ class SplitSelectionDialog(QDialog):
             if item.checkState() == Qt.Checked:
                 selected.append(item.text())
         return selected
+
+
+class TextImportDialog(QDialog):
+    """Simple text import dialog for pasted settings bundles."""
+
+    def __init__(self, title: str, note: str, initial_text: str = '', parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(680, 420)
+
+        layout = QVBoxLayout(self)
+
+        label = QLabel(note)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setPlainText(initial_text)
+        layout.addWidget(self.text_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def get_text(self) -> str:
+        return self.text_edit.toPlainText()
+
+
+class SettingsHistoryDialog(QDialog):
+    """History viewer for settings changes."""
+
+    def __init__(self, entries: list, field_labels: dict, parent=None):
+        super().__init__(parent)
+        self.entries = entries or []
+        self.field_labels = field_labels or {}
+        self._selected_entry = None
+
+        self.setWindowTitle('参数修改历史')
+        self.resize(860, 520)
+
+        layout = QHBoxLayout(self)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setMinimumWidth(280)
+        layout.addWidget(self.list_widget)
+
+        right_layout = QVBoxLayout()
+        layout.addLayout(right_layout, 1)
+
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        right_layout.addWidget(self.detail_text, 1)
+
+        button_row = QHBoxLayout()
+        self.btn_copy_snapshot = QPushButton('复制该次历史快照')
+        self.btn_copy_snapshot.clicked.connect(self._copy_snapshot)
+        button_row.addWidget(self.btn_copy_snapshot)
+
+        self.btn_restore = QPushButton('恢复选中记录')
+        self.btn_restore.clicked.connect(self._restore_selected)
+        button_row.addWidget(self.btn_restore)
+
+        button_row.addStretch()
+
+        btn_close = QPushButton('关闭')
+        btn_close.clicked.connect(self.reject)
+        button_row.addWidget(btn_close)
+        right_layout.addLayout(button_row)
+
+        self.list_widget.currentRowChanged.connect(self._on_row_changed)
+        self._populate_entries()
+
+    def _populate_entries(self):
+        if not self.entries:
+            self.list_widget.addItem('暂无历史记录')
+            self.list_widget.setEnabled(False)
+            self.btn_copy_snapshot.setEnabled(False)
+            self.btn_restore.setEnabled(False)
+            self.detail_text.setPlainText('还没有检测到设置变更历史。')
+            return
+
+        for entry in reversed(self.entries):
+            timestamp = str(entry.get('timestamp', ''))
+            changed_keys = entry.get('changed_keys', [])
+            preview_names = [self.field_labels.get(key, key) for key in changed_keys[:3]]
+            preview_text = '、'.join(preview_names) if preview_names else '未识别字段'
+            if len(changed_keys) > 3:
+                preview_text += f' 等 {len(changed_keys)} 项'
+            reason = str(entry.get('reason_label', '') or '')
+            label = f"{timestamp}  {reason}".strip()
+            if preview_text:
+                label = f"{label}\n{preview_text}"
+            self.list_widget.addItem(label)
+
+        self.list_widget.setCurrentRow(0)
+
+    def _format_value(self, key: str, value):
+        if key in {'hf_token', 'vlm_api_key'} and value:
+            return '***'
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        return str(value)
+
+    def _on_row_changed(self, row: int):
+        if row < 0 or not self.entries:
+            self._selected_entry = None
+            self.detail_text.clear()
+            return
+
+        entry = list(reversed(self.entries))[row]
+        self._selected_entry = entry
+
+        lines = [
+            f"时间: {entry.get('timestamp', '')}",
+            f"类型: {entry.get('reason_label', entry.get('reason', 'edit'))}",
+        ]
+        started_at = str(entry.get('started_at', '') or '').strip()
+        if started_at:
+            lines.append(f"开始时间: {started_at}")
+        lines.append('')
+        lines.append('变更字段:')
+
+        changes = entry.get('changes', {})
+        if not changes:
+            lines.append('无具体差异，使用的是完整快照恢复或导入。')
+        else:
+            for key in entry.get('changed_keys', []):
+                change = changes.get(key, {})
+                label = self.field_labels.get(key, key)
+                before_text = self._format_value(key, change.get('before'))
+                after_text = self._format_value(key, change.get('after'))
+                lines.append(f"[{label}]")
+                lines.append(f"  之前: {before_text}")
+                lines.append(f"  现在: {after_text}")
+                lines.append('')
+
+        self.detail_text.setPlainText('\n'.join(lines).strip())
+
+    def _copy_snapshot(self):
+        if not self._selected_entry:
+            return
+        snapshot = self._selected_entry.get('snapshot', {})
+        QApplication.clipboard().setText(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        QMessageBox.information(self, '参数修改历史', '选中记录的历史快照已复制到剪贴板。\n\n敏感字段不会包含在内。')
+
+    def _restore_selected(self):
+        if not self._selected_entry:
+            return
+        self.accept()
+
+    def get_selected_entry(self):
+        return self._selected_entry
 
 
 class ExtractionThread(QThread):
@@ -232,6 +389,11 @@ class SettingsPanel(QWidget):
         self.config = config
         self.extraction_thread = None
         self.streaming_thread = None
+        self._xml_custom_mapping_rows = []
+        self._xml_field_options = ['artist', 'character_1', 'character_2']
+        self._settings_tracking_suspended = True
+        self._settings_history_limit = 500
+        self._last_saved_flat_settings = None
 
         # Track if we've already checked dependencies/models this session
         self._vitpose_deps_checked = False
@@ -245,9 +407,12 @@ class SettingsPanel(QWidget):
 
         # Connect signals to auto-save
         self._connect_autosave_signals()
+        self._last_saved_flat_settings = deepcopy(self._collect_flat_settings())
+        self._settings_tracking_suspended = False
 
         # Update JSONA statistics
         self._update_jsona_statistics()
+        self._update_settings_history_status()
 
     def _setup_ui(self):
         """Setup UI layout"""
@@ -665,11 +830,25 @@ class SettingsPanel(QWidget):
 
         return group
 
-    def save_settings(self):
-        """Save current settings to config file"""
-        config = {
-            # Data source
+    def _get_repo_root(self) -> str:
+        return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+    def _get_settings_file_path(self) -> str:
+        return os.path.join(self._get_repo_root(), 'settings.json')
+
+    def _get_settings_history_file_path(self) -> str:
+        return os.path.join(self._get_repo_root(), 'settings_history.jsonl')
+
+    def _collect_flat_settings(self) -> dict:
+        unattended_action = 'pause' if self.combo_unattended_inbox_full_action.currentIndex() == 0 else 'stop'
+        local_parquet_files = [
+            self.list_parquet_files.item(i).text()
+            for i in range(self.list_parquet_files.count())
+        ]
+        return {
             'data_source_type': self.combo_source_type.currentIndex(),
+            'local_parquet_files': local_parquet_files,
+            'local_num_samples': self.spin_local_samples.value(),
             'dataset_id': self.edit_dataset_id.text(),
             'split': self.edit_split.text(),
             'hf_token': self.edit_hf_token.text(),
@@ -680,19 +859,13 @@ class SettingsPanel(QWidget):
             'thread_count': self.spin_thread_count.value(),
             'streaming_extract_dir': self.edit_streaming_extract_dir.text(),
             'local_extract_dir': self.edit_extract_dir.text(),
-
-            # Processing settings
             'use_custom_dir': self.radio_use_custom_dir.isChecked(),
             'custom_input_dir': self.edit_custom_input_dir.text(),
             'processing_threads': self.spin_processing_threads.value(),
             'preload_count': self.spin_preload_count.value(),
-
-            # Control types
             'canny_enabled': self.check_canny.isChecked(),
             'openpose_enabled': self.check_openpose.isChecked(),
             'depth_enabled': self.check_depth.isChecked(),
-
-            # Quality profile and thresholds
             'quality_profile': self.combo_quality_profile.currentText(),
             'canny_accept': self.spin_canny_accept.value(),
             'canny_reject': self.spin_canny_reject.value(),
@@ -700,48 +873,285 @@ class SettingsPanel(QWidget):
             'pose_reject': self.spin_pose_reject.value(),
             'depth_accept': self.spin_depth_accept.value(),
             'depth_reject': self.spin_depth_reject.value(),
-
-            # Model settings
             'openpose_model': self.combo_openpose_model.currentText(),
             'openpose_yolo_version': self.combo_yolo_version.currentText(),
             'openpose_yolo_model_type': self.combo_yolo_model_type.currentText(),
             'openpose_custom_path': self.edit_openpose_path.text(),
             'depth_model': self.combo_depth_model.currentText(),
             'depth_custom_path': self.edit_depth_path.text(),
-
-            # Advanced settings
             'parallel_threads': self.spin_parallel_threads.value(),
             'auto_pass_no_review': self.check_auto_pass_no_review.isChecked(),
             'single_jsona': self.check_single_jsona.isChecked(),
             'jsona_backup_every_entries': self.spin_jsona_backup_every_entries.value(),
             'jsona_backup_every_seconds': self.spin_jsona_backup_every_seconds.value(),
             'jsona_backup_keep': self.spin_jsona_backup_keep.value(),
+            'unattended_mode': self.check_unattended_mode.isChecked(),
+            'unattended_inbox_max_mb': self.spin_unattended_inbox_max_mb.value(),
+            'unattended_inbox_full_action': unattended_action,
+            'vlm_backend': self.combo_vlm_backend.currentText(),
+            'vlm_base_url': self.edit_vlm_base_url.text(),
+            'vlm_model': self.edit_vlm_model.text(),
+            'vlm_api_key': self.edit_vlm_api_key.text(),
+            'vlm_timeout_seconds': self.spin_vlm_timeout.value(),
+            'xml_template_path': self.edit_xml_template_path.text(),
+            'xml_artist_field_path': self.combo_xml_artist_field.currentText().strip(),
+            'xml_artist_tag_index': self.spin_xml_artist_tag_index.value(),
+            'xml_character1_field_path': self.combo_xml_character1_field.currentText().strip(),
+            'xml_character1_tag_index': self.spin_xml_character1_tag_index.value(),
+            'xml_character2_field_path': self.combo_xml_character2_field.currentText().strip(),
+            'xml_character2_tag_index': self.spin_xml_character2_tag_index.value(),
+            'xml_custom_mappings': self._serialize_xml_custom_mappings(),
             'enable_retry': self.check_enable_retry.isChecked(),
             'max_retries': self.spin_max_retries.value(),
-
-            # Custom tags
             'append_tags': self.check_append_tags.isChecked(),
             'custom_tags': self.edit_custom_tags.toPlainText(),
-
-            # Output
             'output_dir': self.edit_output_dir.text(),
             'discard_action': self.combo_discard_action.currentText(),
         }
 
-        config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'settings.json')
+    def _get_settings_field_labels(self) -> dict:
+        return {
+            'data_source_type': '数据源类型',
+            'local_parquet_files': 'Parquet 文件列表',
+            'local_num_samples': '本地样本数',
+            'dataset_id': '数据集 ID',
+            'split': '数据集 Split',
+            'hf_token': 'HF Token',
+            'num_samples': '拉取样本数',
+            'user_prefix': '用户前缀',
+            'skip_count': '跳过数量',
+            'enable_multithread': '启用多线程提取',
+            'thread_count': '提取线程数',
+            'streaming_extract_dir': '流式提取目录',
+            'local_extract_dir': '本地提取目录',
+            'use_custom_dir': '使用自定义输入目录',
+            'custom_input_dir': '自定义输入目录',
+            'processing_threads': '处理线程数',
+            'preload_count': '预加载数量',
+            'canny_enabled': '启用 Canny',
+            'openpose_enabled': '启用 Pose',
+            'depth_enabled': '启用 Depth',
+            'quality_profile': '质量预设',
+            'canny_accept': 'Canny 自动接受',
+            'canny_reject': 'Canny 自动拒绝',
+            'pose_accept': 'Pose 自动接受',
+            'pose_reject': 'Pose 自动拒绝',
+            'depth_accept': 'Depth 自动接受',
+            'depth_reject': 'Depth 自动拒绝',
+            'openpose_model': 'Pose 模型',
+            'openpose_yolo_version': 'YOLO 版本',
+            'openpose_yolo_model_type': 'Pose 检测器',
+            'openpose_custom_path': 'Pose 自定义路径',
+            'depth_model': 'Depth 模型',
+            'depth_custom_path': 'Depth 自定义路径',
+            'parallel_threads': '并行处理线程',
+            'auto_pass_no_review': '自动通过无需审核',
+            'single_jsona': '单个 JSONA',
+            'jsona_backup_every_entries': 'JSONA 条数备份',
+            'jsona_backup_every_seconds': 'JSONA 时间备份',
+            'jsona_backup_keep': 'JSONA 保留份数',
+            'unattended_mode': '无人值守模式',
+            'unattended_inbox_max_mb': '审核箱最大大小',
+            'unattended_inbox_full_action': '审核箱满额动作',
+            'vlm_backend': 'VLM 后端',
+            'vlm_base_url': 'VLM Base URL',
+            'vlm_model': 'VLM 模型',
+            'vlm_api_key': 'VLM API Key',
+            'vlm_timeout_seconds': 'VLM 超时',
+            'xml_template_path': 'XML 模板路径',
+            'xml_artist_field_path': 'XML artist 字段',
+            'xml_artist_tag_index': 'XML artist tag 序号',
+            'xml_character1_field_path': 'XML character_1 字段',
+            'xml_character1_tag_index': 'XML character_1 tag 序号',
+            'xml_character2_field_path': 'XML character_2 字段',
+            'xml_character2_tag_index': 'XML character_2 tag 序号',
+            'xml_custom_mappings': 'XML 自定义映射',
+            'enable_retry': '启用重试',
+            'max_retries': '最大重试次数',
+            'append_tags': '追加自定义标签',
+            'custom_tags': '自定义标签',
+            'output_dir': '输出目录',
+            'discard_action': '丢弃动作',
+        }
+
+    def _get_history_reason_label(self, reason: str) -> str:
+        mapping = {
+            'edit': '手动修改',
+            'import_key_params': '导入关键参数',
+            'restore_history': '从历史恢复',
+            'reset_defaults': '恢复默认设置',
+        }
+        return mapping.get(reason, reason or '手动修改')
+
+    def _get_sensitive_history_keys(self) -> set:
+        return {'hf_token', 'vlm_api_key'}
+
+    def _sanitize_history_value(self, key: str, value):
+        if key in self._get_sensitive_history_keys() and value:
+            return '***'
+        return deepcopy(value)
+
+    def _build_history_snapshot(self, current: dict) -> dict:
+        snapshot = {}
+        for key, value in (current or {}).items():
+            if key in self._get_sensitive_history_keys():
+                continue
+            snapshot[key] = deepcopy(value)
+        return snapshot
+
+    def _sanitize_history_entry(self, entry: dict) -> dict:
+        if not isinstance(entry, dict):
+            return {}
+
+        sanitized = deepcopy(entry)
+        changes = sanitized.get('changes', {})
+        if isinstance(changes, dict):
+            for key, change in list(changes.items()):
+                if not isinstance(change, dict):
+                    continue
+                if key in self._get_sensitive_history_keys():
+                    change['before'] = self._sanitize_history_value(key, change.get('before'))
+                    change['after'] = self._sanitize_history_value(key, change.get('after'))
+
+        snapshot = sanitized.get('snapshot', {})
+        if isinstance(snapshot, dict):
+            for key in self._get_sensitive_history_keys():
+                snapshot.pop(key, None)
+        return sanitized
+
+    def _read_settings_history_entries(self) -> list:
+        history_file = self._get_settings_history_file_path()
+        if not os.path.exists(history_file):
+            return []
+
+        entries = []
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entries.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            print(f"Failed to read settings history: {e}")
+        return entries
+
+    def _update_settings_history_status(self):
+        if not hasattr(self, 'label_settings_history_status'):
+            return
+        count = len(self._read_settings_history_entries())
+        self.label_settings_history_status.setText(f'历史记录: {count} 条')
+
+    def _append_settings_history_entry(self, entry: dict):
+        if not isinstance(entry, dict):
+            return
+
+        entries = [self._sanitize_history_entry(item) for item in self._read_settings_history_entries()]
+        entry_time = None
+        try:
+            entry_time = datetime.fromisoformat(str(entry.get('timestamp', '')))
+        except Exception:
+            pass
+
+        if entries and entry.get('reason') == 'edit':
+            last = entries[-1]
+            last_time = None
+            try:
+                last_time = datetime.fromisoformat(str(last.get('timestamp', '')))
+            except Exception:
+                pass
+
+            if last.get('reason') == 'edit' and last_time and entry_time and abs((entry_time - last_time).total_seconds()) <= 10:
+                merged = deepcopy(last)
+                merged['started_at'] = str(last.get('started_at') or last.get('timestamp') or '')
+                merged['timestamp'] = entry.get('timestamp', merged.get('timestamp'))
+                merged['snapshot'] = deepcopy(entry.get('snapshot', merged.get('snapshot', {})))
+
+                merged_changes = deepcopy(last.get('changes', {}))
+                for key, change in entry.get('changes', {}).items():
+                    if key in merged_changes:
+                        merged_changes[key]['after'] = change.get('after')
+                    else:
+                        merged_changes[key] = change
+                merged['changes'] = merged_changes
+                merged['changed_keys'] = sorted(merged_changes.keys())
+                merged['reason_label'] = self._get_history_reason_label('edit')
+                entries[-1] = self._sanitize_history_entry(merged)
+            else:
+                entries.append(self._sanitize_history_entry(entry))
+        else:
+            entries.append(self._sanitize_history_entry(entry))
+
+        entries = entries[-self._settings_history_limit:]
+        history_file = self._get_settings_history_file_path()
+        try:
+            with open(history_file, 'w', encoding='utf-8') as f:
+                for item in entries:
+                    f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"Failed to write settings history: {e}")
+            return
+
+        self._update_settings_history_status()
+
+    def _record_settings_history(self, previous: dict, current: dict, reason: str = 'edit', force_history: bool = False):
+        previous = previous or {}
+        current = current or {}
+
+        changed = {}
+        for key in sorted(set(previous.keys()) | set(current.keys())):
+            before = previous.get(key)
+            after = current.get(key)
+            if before != after:
+                changed[key] = {
+                    'before': self._sanitize_history_value(key, before),
+                    'after': self._sanitize_history_value(key, after),
+                }
+
+        if not changed and not force_history:
+            return
+
+        entry = {
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'reason': reason,
+            'reason_label': self._get_history_reason_label(reason),
+            'changed_keys': sorted(changed.keys()),
+            'changes': changed,
+            'snapshot': self._build_history_snapshot(current),
+        }
+        self._append_settings_history_entry(entry)
+
+    def save_settings(self, history_reason: str = 'edit', force_history: bool = False):
+        """Save current settings to config file"""
+        if self._settings_tracking_suspended:
+            return
+
+        config = self._collect_flat_settings()
+        previous = deepcopy(self._last_saved_flat_settings or {})
+        config_file = self._get_settings_file_path()
         try:
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"Failed to save settings: {e}")
+            return
+
+        self._record_settings_history(previous, config, reason=history_reason, force_history=force_history)
+        self._last_saved_flat_settings = deepcopy(config)
+        self.settings_changed.emit(self.get_settings())
 
     def load_settings(self):
         """Load settings from config file"""
-        config_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'settings.json')
+        config_file = self._get_settings_file_path()
 
         if not os.path.exists(config_file):
             return
 
+        previous_state = self._settings_tracking_suspended
+        self._settings_tracking_suspended = True
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
@@ -749,6 +1159,12 @@ class SettingsPanel(QWidget):
             # Restore settings
             if 'data_source_type' in config:
                 self.combo_source_type.setCurrentIndex(config['data_source_type'])
+            if 'local_parquet_files' in config:
+                self.list_parquet_files.clear()
+                for file_path in config.get('local_parquet_files') or []:
+                    self.list_parquet_files.addItem(str(file_path))
+            if 'local_num_samples' in config:
+                self.spin_local_samples.setValue(int(config['local_num_samples']))
             if 'dataset_id' in config:
                 self.edit_dataset_id.setText(config['dataset_id'])
             if 'split' in config:
@@ -841,6 +1257,49 @@ class SettingsPanel(QWidget):
                 self.spin_jsona_backup_every_seconds.setValue(config['jsona_backup_every_seconds'])
             if 'jsona_backup_keep' in config:
                 self.spin_jsona_backup_keep.setValue(config['jsona_backup_keep'])
+            if 'unattended_mode' in config:
+                self.check_unattended_mode.setChecked(bool(config['unattended_mode']))
+            if 'unattended_inbox_max_mb' in config:
+                try:
+                    self.spin_unattended_inbox_max_mb.setValue(int(config['unattended_inbox_max_mb']))
+                except Exception:
+                    pass
+            if 'unattended_inbox_full_action' in config:
+                act = str(config['unattended_inbox_full_action']).lower()
+                self.combo_unattended_inbox_full_action.setCurrentIndex(0 if act == 'pause' else 1)
+            if 'vlm_backend' in config:
+                self.combo_vlm_backend.setCurrentText(str(config['vlm_backend']))
+            if 'vlm_base_url' in config:
+                self.edit_vlm_base_url.setText(str(config['vlm_base_url']))
+            if 'vlm_model' in config:
+                self.edit_vlm_model.setText(str(config['vlm_model']))
+            if 'vlm_api_key' in config:
+                self.edit_vlm_api_key.setText(str(config['vlm_api_key']))
+            if 'vlm_timeout_seconds' in config:
+                try:
+                    self.spin_vlm_timeout.setValue(int(config['vlm_timeout_seconds']))
+                except Exception:
+                    pass
+            if 'xml_template_path' in config:
+                self.edit_xml_template_path.setText(str(config['xml_template_path']))
+                try:
+                    self._analyze_xml_template()
+                except Exception:
+                    pass
+            if 'xml_artist_field_path' in config:
+                self.combo_xml_artist_field.setCurrentText(str(config['xml_artist_field_path']))
+            if 'xml_artist_tag_index' in config:
+                self.spin_xml_artist_tag_index.setValue(int(config['xml_artist_tag_index']))
+            if 'xml_character1_field_path' in config:
+                self.combo_xml_character1_field.setCurrentText(str(config['xml_character1_field_path']))
+            if 'xml_character1_tag_index' in config:
+                self.spin_xml_character1_tag_index.setValue(int(config['xml_character1_tag_index']))
+            if 'xml_character2_field_path' in config:
+                self.combo_xml_character2_field.setCurrentText(str(config['xml_character2_field_path']))
+            if 'xml_character2_tag_index' in config:
+                self.spin_xml_character2_tag_index.setValue(int(config['xml_character2_tag_index']))
+            if 'xml_custom_mappings' in config:
+                self._load_xml_custom_mappings(config['xml_custom_mappings'])
             if 'enable_retry' in config:
                 self.check_enable_retry.setChecked(config['enable_retry'])
             if 'max_retries' in config:
@@ -860,6 +1319,160 @@ class SettingsPanel(QWidget):
 
         except Exception as e:
             print(f"Failed to load settings: {e}")
+        finally:
+            self._settings_tracking_suspended = previous_state
+
+    def _apply_flat_settings(self, config: dict):
+        if not isinstance(config, dict):
+            return
+
+        previous_state = self._settings_tracking_suspended
+        self._settings_tracking_suspended = True
+        try:
+            if 'data_source_type' in config:
+                self.combo_source_type.setCurrentIndex(int(config['data_source_type']))
+            if 'local_parquet_files' in config:
+                self.list_parquet_files.clear()
+                for file_path in config.get('local_parquet_files') or []:
+                    self.list_parquet_files.addItem(str(file_path))
+            if 'local_num_samples' in config:
+                self.spin_local_samples.setValue(int(config['local_num_samples']))
+            if 'dataset_id' in config:
+                self.edit_dataset_id.setText(str(config['dataset_id']))
+            if 'split' in config:
+                self.edit_split.setText(str(config['split']))
+            if 'hf_token' in config:
+                self.edit_hf_token.setText(str(config['hf_token']))
+            if 'num_samples' in config:
+                self.spin_num_samples.setValue(int(config['num_samples']))
+            if 'user_prefix' in config:
+                self.edit_user_prefix.setText(str(config['user_prefix']))
+            if 'skip_count' in config:
+                self.spin_skip_count.setValue(int(config['skip_count']))
+            if 'enable_multithread' in config:
+                self.check_multithread.setChecked(bool(config['enable_multithread']))
+            if 'thread_count' in config:
+                saved_threads = int(config['thread_count'])
+                if saved_threads < 2 and bool(config.get('enable_multithread', self.check_multithread.isChecked())):
+                    cpu_count = os.cpu_count() or 4
+                    saved_threads = max(2, cpu_count - 1)
+                self.spin_thread_count.setValue(saved_threads)
+            if 'streaming_extract_dir' in config:
+                self.edit_streaming_extract_dir.setText(str(config['streaming_extract_dir']))
+            if 'local_extract_dir' in config:
+                self.edit_extract_dir.setText(str(config['local_extract_dir']))
+            if 'use_custom_dir' in config:
+                use_custom_dir = bool(config['use_custom_dir'])
+                self.radio_use_custom_dir.setChecked(use_custom_dir)
+                self.radio_use_data_source.setChecked(not use_custom_dir)
+            if 'custom_input_dir' in config:
+                self.edit_custom_input_dir.setText(str(config['custom_input_dir']))
+            if 'processing_threads' in config:
+                self.spin_processing_threads.setValue(int(config['processing_threads']))
+            if 'preload_count' in config:
+                self.spin_preload_count.setValue(int(config['preload_count']))
+            if 'canny_enabled' in config:
+                self.check_canny.setChecked(bool(config['canny_enabled']))
+            if 'openpose_enabled' in config:
+                self.check_openpose.setChecked(bool(config['openpose_enabled']))
+            if 'depth_enabled' in config:
+                self.check_depth.setChecked(bool(config['depth_enabled']))
+            if 'openpose_model' in config:
+                self.combo_openpose_model.setCurrentText(str(config['openpose_model']))
+            if 'openpose_yolo_version' in config:
+                self.combo_yolo_version.setCurrentText(str(config['openpose_yolo_version']))
+            if 'openpose_yolo_model_type' in config:
+                self.combo_yolo_model_type.setCurrentText(str(config['openpose_yolo_model_type']))
+            if 'openpose_custom_path' in config:
+                self.edit_openpose_path.setText(str(config['openpose_custom_path']))
+            if 'depth_model' in config:
+                self.combo_depth_model.setCurrentText(str(config['depth_model']))
+            if 'depth_custom_path' in config:
+                self.edit_depth_path.setText(str(config['depth_custom_path']))
+            if 'quality_profile' in config:
+                self.combo_quality_profile.setCurrentText(str(config['quality_profile']))
+            if 'canny_accept' in config:
+                self.spin_canny_accept.setValue(int(config['canny_accept']))
+            if 'canny_reject' in config:
+                self.spin_canny_reject.setValue(int(config['canny_reject']))
+            if 'pose_accept' in config:
+                self.spin_pose_accept.setValue(int(config['pose_accept']))
+            if 'pose_reject' in config:
+                self.spin_pose_reject.setValue(int(config['pose_reject']))
+            if 'depth_accept' in config:
+                self.spin_depth_accept.setValue(int(config['depth_accept']))
+            if 'depth_reject' in config:
+                self.spin_depth_reject.setValue(int(config['depth_reject']))
+            if 'parallel_threads' in config:
+                self.spin_parallel_threads.setValue(int(config['parallel_threads']))
+            if 'auto_pass_no_review' in config:
+                self.check_auto_pass_no_review.setChecked(bool(config['auto_pass_no_review']))
+            if 'single_jsona' in config:
+                self.check_single_jsona.setChecked(bool(config['single_jsona']))
+            if 'jsona_backup_every_entries' in config:
+                self.spin_jsona_backup_every_entries.setValue(int(config['jsona_backup_every_entries']))
+            if 'jsona_backup_every_seconds' in config:
+                self.spin_jsona_backup_every_seconds.setValue(int(config['jsona_backup_every_seconds']))
+            if 'jsona_backup_keep' in config:
+                self.spin_jsona_backup_keep.setValue(int(config['jsona_backup_keep']))
+            if 'unattended_mode' in config:
+                self.check_unattended_mode.setChecked(bool(config['unattended_mode']))
+            if 'unattended_inbox_max_mb' in config:
+                self.spin_unattended_inbox_max_mb.setValue(int(config['unattended_inbox_max_mb']))
+            if 'unattended_inbox_full_action' in config:
+                action = str(config['unattended_inbox_full_action']).lower()
+                self.combo_unattended_inbox_full_action.setCurrentIndex(0 if action == 'pause' else 1)
+            if 'vlm_backend' in config:
+                self.combo_vlm_backend.setCurrentText(str(config['vlm_backend']))
+            if 'vlm_base_url' in config:
+                self.edit_vlm_base_url.setText(str(config['vlm_base_url']))
+            if 'vlm_model' in config:
+                self.edit_vlm_model.setText(str(config['vlm_model']))
+            if 'vlm_api_key' in config:
+                self.edit_vlm_api_key.setText(str(config['vlm_api_key']))
+            if 'vlm_timeout_seconds' in config:
+                self.spin_vlm_timeout.setValue(int(config['vlm_timeout_seconds']))
+            if 'xml_template_path' in config:
+                self.edit_xml_template_path.setText(str(config['xml_template_path']))
+                if self.edit_xml_template_path.text().strip():
+                    try:
+                        self._analyze_xml_template()
+                    except Exception:
+                        pass
+                else:
+                    self._refresh_xml_field_options([])
+                    self.label_xml_template_status.setText('未加载 XML 结构，当前使用默认字段。')
+            if 'xml_artist_field_path' in config:
+                self.combo_xml_artist_field.setCurrentText(str(config['xml_artist_field_path']))
+            if 'xml_artist_tag_index' in config:
+                self.spin_xml_artist_tag_index.setValue(int(config['xml_artist_tag_index']))
+            if 'xml_character1_field_path' in config:
+                self.combo_xml_character1_field.setCurrentText(str(config['xml_character1_field_path']))
+            if 'xml_character1_tag_index' in config:
+                self.spin_xml_character1_tag_index.setValue(int(config['xml_character1_tag_index']))
+            if 'xml_character2_field_path' in config:
+                self.combo_xml_character2_field.setCurrentText(str(config['xml_character2_field_path']))
+            if 'xml_character2_tag_index' in config:
+                self.spin_xml_character2_tag_index.setValue(int(config['xml_character2_tag_index']))
+            if 'xml_custom_mappings' in config:
+                self._load_xml_custom_mappings(config['xml_custom_mappings'])
+            if 'enable_retry' in config:
+                self.check_enable_retry.setChecked(bool(config['enable_retry']))
+            if 'max_retries' in config:
+                self.spin_max_retries.setValue(int(config['max_retries']))
+            if 'append_tags' in config:
+                self.check_append_tags.setChecked(bool(config['append_tags']))
+            if 'custom_tags' in config:
+                self.edit_custom_tags.setPlainText(str(config['custom_tags']))
+            if 'output_dir' in config:
+                self.edit_output_dir.setText(str(config['output_dir']))
+            if 'discard_action' in config:
+                self.combo_discard_action.setCurrentText(str(config['discard_action']))
+        finally:
+            self._settings_tracking_suspended = previous_state
+
+        self._refresh_xml_preview()
+        self._update_jsona_statistics()
 
     def _connect_autosave_signals(self):
         """Connect signals to auto-save settings when changed"""
@@ -869,6 +1482,7 @@ class SettingsPanel(QWidget):
         self.edit_split.textChanged.connect(lambda: self.save_settings())
         self.edit_hf_token.textChanged.connect(lambda: self.save_settings())
         self.spin_num_samples.valueChanged.connect(lambda: self.save_settings())
+        self.spin_local_samples.valueChanged.connect(lambda: self.save_settings())
         self.edit_user_prefix.textChanged.connect(lambda: self.save_settings())
         self.spin_skip_count.valueChanged.connect(lambda: self.save_settings())
         self.check_multithread.stateChanged.connect(lambda: self.save_settings())
@@ -904,6 +1518,29 @@ class SettingsPanel(QWidget):
         self.spin_jsona_backup_every_entries.valueChanged.connect(lambda: self.save_settings())
         self.spin_jsona_backup_every_seconds.valueChanged.connect(lambda: self.save_settings())
         self.spin_jsona_backup_keep.valueChanged.connect(lambda: self.save_settings())
+        self.check_unattended_mode.stateChanged.connect(lambda: self.save_settings())
+        self.spin_unattended_inbox_max_mb.valueChanged.connect(lambda: self.save_settings())
+        self.combo_unattended_inbox_full_action.currentIndexChanged.connect(lambda: self.save_settings())
+        self.combo_vlm_backend.currentIndexChanged.connect(lambda: self.save_settings())
+        self.edit_vlm_base_url.textChanged.connect(lambda: self.save_settings())
+        self.edit_vlm_model.textChanged.connect(lambda: self.save_settings())
+        self.edit_vlm_api_key.textChanged.connect(lambda: self.save_settings())
+        self.spin_vlm_timeout.valueChanged.connect(lambda: self.save_settings())
+        self.edit_xml_template_path.textChanged.connect(lambda: self.save_settings())
+        self.edit_xml_template_path.textChanged.connect(lambda: self._refresh_xml_preview())
+        self.combo_xml_artist_field.currentTextChanged.connect(lambda: self.save_settings())
+        self.combo_xml_artist_field.currentTextChanged.connect(lambda: self._refresh_xml_preview())
+        self.spin_xml_artist_tag_index.valueChanged.connect(lambda: self.save_settings())
+        self.spin_xml_artist_tag_index.valueChanged.connect(lambda: self._refresh_xml_preview())
+        self.combo_xml_character1_field.currentTextChanged.connect(lambda: self.save_settings())
+        self.combo_xml_character1_field.currentTextChanged.connect(lambda: self._refresh_xml_preview())
+        self.spin_xml_character1_tag_index.valueChanged.connect(lambda: self.save_settings())
+        self.spin_xml_character1_tag_index.valueChanged.connect(lambda: self._refresh_xml_preview())
+        self.combo_xml_character2_field.currentTextChanged.connect(lambda: self.save_settings())
+        self.combo_xml_character2_field.currentTextChanged.connect(lambda: self._refresh_xml_preview())
+        self.spin_xml_character2_tag_index.valueChanged.connect(lambda: self.save_settings())
+        self.spin_xml_character2_tag_index.valueChanged.connect(lambda: self._refresh_xml_preview())
+        self.edit_xml_preview_tags.textChanged.connect(self._refresh_xml_preview)
 
         # Threshold spinboxes
         self.spin_canny_accept.valueChanged.connect(lambda: self.save_settings())
@@ -1043,6 +1680,65 @@ class SettingsPanel(QWidget):
 
         left_layout.addWidget(jsona_backup_group)
 
+        # Unattended mode (disk-backed review inbox)
+        unattended_group = QGroupBox('无人值守 (审核箱)')
+        unattended_layout = QFormLayout(unattended_group)
+
+        self.check_unattended_mode = QCheckBox('无人值守模式 (不显示中间审核图片)')
+        self.check_unattended_mode.setToolTip(
+            '开启后：需要人工审核的条目会保存到 output/review_inbox，界面不再堆积图片，适合挂机跑一整晚。'
+        )
+        unattended_layout.addRow(self.check_unattended_mode)
+
+        self.spin_unattended_inbox_max_mb = QSpinBox()
+        self.spin_unattended_inbox_max_mb.setRange(100, 102400)
+        self.spin_unattended_inbox_max_mb.setValue(2048)
+        self.spin_unattended_inbox_max_mb.setSingleStep(100)
+        self.spin_unattended_inbox_max_mb.setSuffix(' MB')
+        self.spin_unattended_inbox_max_mb.setToolTip('审核箱临时文件夹最大大小，超过后会按“满额动作”处理。')
+        unattended_layout.addRow('最大大小:', self.spin_unattended_inbox_max_mb)
+
+        self.combo_unattended_inbox_full_action = QComboBox()
+        self.combo_unattended_inbox_full_action.addItems(['自动暂停', '自动停止'])
+        self.combo_unattended_inbox_full_action.setToolTip('审核箱达到最大大小后的处理方式。')
+        unattended_layout.addRow('满额动作:', self.combo_unattended_inbox_full_action)
+
+        left_layout.addWidget(unattended_group)
+
+        # VLM config (for tag verification + NL rewrite tool)
+        vlm_group = QGroupBox('VLM 推理 (Tag 核对 / NL 重写)')
+        vlm_layout = QFormLayout(vlm_group)
+
+        self.combo_vlm_backend = QComboBox()
+        self.combo_vlm_backend.addItems(['openai', 'ollama'])
+        self.combo_vlm_backend.setToolTip(
+            'openai: 兼容 OpenAI 的本地/在线接口 (例如 LM Studio / vLLM 等)\n'
+            'ollama: 使用 Ollama 的本地接口 (/api/chat)\n'
+            'CPU/GPU 由你选择的后端决定 (本工具只负责调用)。'
+        )
+        vlm_layout.addRow('后端:', self.combo_vlm_backend)
+
+        self.edit_vlm_base_url = QLineEdit('http://127.0.0.1:1234')
+        self.edit_vlm_base_url.setToolTip('例如: http://127.0.0.1:1234 (LM Studio) 或 http://127.0.0.1:11434 (Ollama)')
+        vlm_layout.addRow('Base URL:', self.edit_vlm_base_url)
+
+        self.edit_vlm_model = QLineEdit('')
+        self.edit_vlm_model.setToolTip('模型名由后端决定，例如 qwen2.5-vl、llava 等')
+        vlm_layout.addRow('Model:', self.edit_vlm_model)
+
+        self.edit_vlm_api_key = QLineEdit('')
+        self.edit_vlm_api_key.setEchoMode(QLineEdit.Password)
+        self.edit_vlm_api_key.setToolTip('仅 openai 后端需要 (本地后端通常可留空)')
+        vlm_layout.addRow('API Key:', self.edit_vlm_api_key)
+
+        self.spin_vlm_timeout = QSpinBox()
+        self.spin_vlm_timeout.setRange(10, 600)
+        self.spin_vlm_timeout.setValue(120)
+        self.spin_vlm_timeout.setSuffix(' 秒')
+        vlm_layout.addRow('超时:', self.spin_vlm_timeout)
+
+        left_layout.addWidget(vlm_group)
+
         # Custom tags
         tags_layout = QVBoxLayout()
         self.check_append_tags = QCheckBox(tr('append_tags'))
@@ -1055,6 +1751,90 @@ class SettingsPanel(QWidget):
         self.check_append_tags.toggled.connect(self.edit_custom_tags.setEnabled)
         tags_layout.addWidget(self.edit_custom_tags)
         left_layout.addLayout(tags_layout)
+
+        xml_group = QGroupBox('XML 配置')
+        xml_layout = QVBoxLayout(xml_group)
+
+        xml_template_row = QHBoxLayout()
+        xml_template_row.addStretch()
+        btn_browse_xml_template = QPushButton('从XML文件加载结构')
+        btn_browse_xml_template.clicked.connect(self._browse_xml_template)
+        xml_template_row.addWidget(btn_browse_xml_template)
+        xml_layout.addLayout(xml_template_row)
+
+        self.edit_xml_template_path = QLineEdit('')
+        self.edit_xml_template_path.setVisible(False)
+        xml_layout.addWidget(self.edit_xml_template_path)
+
+        self.label_xml_template_status = QLabel('未加载 XML 结构，当前使用默认字段。')
+        self.label_xml_template_status.setWordWrap(True)
+        self.label_xml_template_status.setStyleSheet('color: #999;')
+        xml_layout.addWidget(self.label_xml_template_status)
+
+        self.label_xml_fields_hint = QLabel('可选字段: artist, character_1, character_2')
+        self.label_xml_fields_hint.setWordWrap(True)
+        self.label_xml_fields_hint.setStyleSheet('color: #999;')
+        xml_layout.addWidget(self.label_xml_fields_hint)
+
+        standard_form = QFormLayout()
+        self.combo_xml_artist_field = self._create_xml_field_combo('artist')
+        self.spin_xml_artist_tag_index = self._create_xml_tag_index_spin(1)
+        standard_form.addRow('artist:', self._create_xml_mapping_widget(self.combo_xml_artist_field, self.spin_xml_artist_tag_index))
+
+        self.combo_xml_character1_field = self._create_xml_field_combo('character_1')
+        self.spin_xml_character1_tag_index = self._create_xml_tag_index_spin(2)
+        standard_form.addRow('character_1:', self._create_xml_mapping_widget(self.combo_xml_character1_field, self.spin_xml_character1_tag_index))
+
+        self.combo_xml_character2_field = self._create_xml_field_combo('character_2')
+        self.spin_xml_character2_tag_index = self._create_xml_tag_index_spin(3)
+        standard_form.addRow('character_2:', self._create_xml_mapping_widget(self.combo_xml_character2_field, self.spin_xml_character2_tag_index))
+        xml_layout.addLayout(standard_form)
+
+        xml_custom_group = QGroupBox('自定义 XML 字段映射')
+        xml_custom_layout = QVBoxLayout(xml_custom_group)
+        xml_custom_note = QLabel('从上面的可选字段里选择，或直接手动输入字段路径。索引从 1 开始。')
+        xml_custom_note.setWordWrap(True)
+        xml_custom_note.setStyleSheet('color: #999;')
+        xml_custom_layout.addWidget(xml_custom_note)
+
+        self.xml_custom_map_layout = QVBoxLayout()
+        xml_custom_layout.addLayout(self.xml_custom_map_layout)
+
+        xml_custom_btn_row = QHBoxLayout()
+        btn_add_xml_mapping = QPushButton('新增映射')
+        btn_add_xml_mapping.clicked.connect(lambda: self._add_xml_custom_mapping_row())
+        xml_custom_btn_row.addWidget(btn_add_xml_mapping)
+        xml_custom_btn_row.addStretch()
+        xml_custom_layout.addLayout(xml_custom_btn_row)
+        xml_layout.addWidget(xml_custom_group)
+
+        xml_preview_group = QGroupBox('XML 预览')
+        xml_preview_layout = QVBoxLayout(xml_preview_group)
+        xml_preview_note = QLabel('在这里输入一串 tag，下面会按当前 XML 映射配置实时生成预览。')
+        xml_preview_note.setWordWrap(True)
+        xml_preview_note.setStyleSheet('color: #999;')
+        xml_preview_layout.addWidget(xml_preview_note)
+
+        self.edit_xml_preview_tags = QTextEdit()
+        self.edit_xml_preview_tags.setMaximumHeight(72)
+        self.edit_xml_preview_tags.setPlaceholderText('例如: artist_name, character_a, character_b, copyright_name')
+        xml_preview_layout.addWidget(self.edit_xml_preview_tags)
+
+        self.edit_xml_preview_output = QTextEdit()
+        self.edit_xml_preview_output.setReadOnly(True)
+        self.edit_xml_preview_output.setMinimumHeight(120)
+        self.edit_xml_preview_output.setPlaceholderText('这里会显示 XML 片段预览')
+        xml_preview_layout.addWidget(self.edit_xml_preview_output)
+
+        xml_preview_btn_row = QHBoxLayout()
+        xml_preview_btn_row.addStretch()
+        btn_copy_xml_preview = QPushButton('复制结果')
+        btn_copy_xml_preview.clicked.connect(self._copy_xml_preview_output)
+        xml_preview_btn_row.addWidget(btn_copy_xml_preview)
+        xml_preview_layout.addLayout(xml_preview_btn_row)
+        xml_layout.addWidget(xml_preview_group)
+
+        left_layout.addWidget(xml_group)
 
         main_layout.addLayout(left_layout)
 
@@ -1103,6 +1883,34 @@ class SettingsPanel(QWidget):
         metadata_stat_layout.addWidget(self.btn_reset_metadata_jsona)
         stats_layout.addLayout(metadata_stat_layout)
 
+        # Tag/NL/XML statistics
+        tag_stat_layout = QHBoxLayout()
+        self.label_tag_count = QLabel('Tag: 0 条')
+        tag_stat_layout.addWidget(self.label_tag_count)
+        self.btn_reset_tag_jsona = QPushButton('重置')
+        self.btn_reset_tag_jsona.setMaximumWidth(60)
+        self.btn_reset_tag_jsona.clicked.connect(lambda: self._reset_jsona_file('tag'))
+        tag_stat_layout.addWidget(self.btn_reset_tag_jsona)
+        stats_layout.addLayout(tag_stat_layout)
+
+        nl_stat_layout = QHBoxLayout()
+        self.label_nl_count = QLabel('NL: 0 条')
+        nl_stat_layout.addWidget(self.label_nl_count)
+        self.btn_reset_nl_jsona = QPushButton('重置')
+        self.btn_reset_nl_jsona.setMaximumWidth(60)
+        self.btn_reset_nl_jsona.clicked.connect(lambda: self._reset_jsona_file('nl'))
+        nl_stat_layout.addWidget(self.btn_reset_nl_jsona)
+        stats_layout.addLayout(nl_stat_layout)
+
+        xml_stat_layout = QHBoxLayout()
+        self.label_xml_count = QLabel('XML: 0 条')
+        xml_stat_layout.addWidget(self.label_xml_count)
+        self.btn_reset_xml_jsona = QPushButton('重置')
+        self.btn_reset_xml_jsona.setMaximumWidth(60)
+        self.btn_reset_xml_jsona.clicked.connect(lambda: self._reset_jsona_file('xml'))
+        xml_stat_layout.addWidget(self.btn_reset_xml_jsona)
+        stats_layout.addLayout(xml_stat_layout)
+
         self.label_jsona_mode = QLabel('当前模式: 分类型 JSONA')
         self.label_jsona_mode.setStyleSheet('color: #888; font-size: 11px;')
         stats_layout.addWidget(self.label_jsona_mode)
@@ -1112,7 +1920,32 @@ class SettingsPanel(QWidget):
         btn_refresh_stats.clicked.connect(self._update_jsona_statistics)
         stats_layout.addWidget(btn_refresh_stats)
 
-        stats_layout.addStretch()
+        share_group = QGroupBox('参数工具')
+        share_layout = QVBoxLayout(share_group)
+
+        share_note = QLabel('复制关键参数给别人粘贴导入，并保留带时间戳的设置修改历史。')
+        share_note.setWordWrap(True)
+        share_note.setStyleSheet('color: #888;')
+        share_layout.addWidget(share_note)
+
+        btn_copy_key_params = QPushButton('复制关键参数')
+        btn_copy_key_params.clicked.connect(self._copy_key_parameters)
+        share_layout.addWidget(btn_copy_key_params)
+
+        btn_import_key_params = QPushButton('导入关键参数')
+        btn_import_key_params.clicked.connect(self._import_key_parameters)
+        share_layout.addWidget(btn_import_key_params)
+
+        btn_view_history = QPushButton('查看参数历史')
+        btn_view_history.clicked.connect(self._show_settings_history)
+        share_layout.addWidget(btn_view_history)
+
+        self.label_settings_history_status = QLabel('历史记录: 0 条')
+        self.label_settings_history_status.setStyleSheet('color: #888; font-size: 11px;')
+        share_layout.addWidget(self.label_settings_history_status)
+
+        share_layout.addStretch()
+        right_layout.addWidget(share_group)
         right_layout.addWidget(stats_group)
         right_layout.addStretch()
 
@@ -1336,6 +2169,401 @@ class SettingsPanel(QWidget):
 
         return group
 
+    def _create_xml_field_combo(self, default_text: str = '') -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.addItems(self._xml_field_options)
+        if default_text:
+            combo.setCurrentText(default_text)
+        return combo
+
+    def _create_xml_tag_index_spin(self, default_value: int) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(1, 999)
+        spin.setValue(default_value)
+        spin.setToolTip('索引从 1 开始，例如 1 表示第一个 tag。')
+        return spin
+
+    def _create_xml_mapping_widget(self, field_combo: QComboBox, index_spin: QSpinBox) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel('字段:'))
+        layout.addWidget(field_combo, 1)
+        layout.addWidget(QLabel('第'))
+        layout.addWidget(index_spin)
+        layout.addWidget(QLabel('个 tag'))
+        return container
+
+    def _browse_xml_template(self):
+        path, _ = QFileDialog.getOpenFileName(self, '选择 XML 文件', self.edit_output_dir.text() or '.', 'XML Files (*.xml);;All Files (*.*)')
+        if path:
+            self.edit_xml_template_path.setText(path)
+            self._analyze_xml_template()
+
+    def _collect_xml_field_paths(self, element, prefix: str = '') -> list:
+        children = [child for child in list(element) if isinstance(child.tag, str)]
+        current = f"{prefix}/{element.tag}" if prefix else str(element.tag)
+        if not children:
+            return [current]
+        results = []
+        for child in children:
+            results.extend(self._collect_xml_field_paths(child, current))
+        return results
+
+    def _parse_xml_field_paths(self, file_path: str) -> list:
+        if not file_path or not os.path.exists(file_path):
+            return []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            raw = f.read().strip()
+        if not raw:
+            return []
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            root = ET.fromstring(f"<root>{raw}</root>")
+        raw_paths = self._collect_xml_field_paths(root)
+        cleaned = []
+        for path in raw_paths:
+            parts = [p for p in str(path).split('/') if p]
+            if parts and parts[0] == 'root':
+                parts = parts[1:]
+            cleaned_path = '/'.join(parts)
+            if cleaned_path and cleaned_path not in cleaned:
+                cleaned.append(cleaned_path)
+        return cleaned
+
+    def _refresh_xml_field_options(self, field_paths: list = None):
+        base_defaults = ['artist', 'character_1', 'character_2']
+        options = []
+        for item in base_defaults + list(field_paths or []):
+            token = str(item or '').strip()
+            if token and token not in options:
+                options.append(token)
+        self._xml_field_options = options or base_defaults
+
+        combos = [
+            getattr(self, 'combo_xml_artist_field', None),
+            getattr(self, 'combo_xml_character1_field', None),
+            getattr(self, 'combo_xml_character2_field', None),
+        ]
+        for row in self._xml_custom_mapping_rows:
+            combos.append(row.get('field_combo'))
+
+        for combo in combos:
+            if combo is None:
+                continue
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(self._xml_field_options)
+            combo.setCurrentText(current)
+            combo.blockSignals(False)
+
+        self.label_xml_fields_hint.setText('可选字段: ' + ', '.join(self._xml_field_options))
+        self._refresh_xml_preview()
+
+    def _analyze_xml_template(self):
+        path = self.edit_xml_template_path.text().strip()
+        if not path:
+            self._refresh_xml_field_options([])
+            self.label_xml_template_status.setText('未加载 XML 结构，当前使用默认字段。')
+            return
+        if not os.path.exists(path):
+            self._refresh_xml_field_options([])
+            self.label_xml_template_status.setText(f'XML 文件不存在: {path}')
+            self.label_xml_fields_hint.setText('可选字段: artist, character_1, character_2')
+            return
+        try:
+            field_paths = self._parse_xml_field_paths(path)
+            self._refresh_xml_field_options(field_paths)
+            if field_paths:
+                self.label_xml_template_status.setText(f'已加载结构: {os.path.basename(path)}')
+                self.label_xml_fields_hint.setText('可选字段: ' + ', '.join(field_paths))
+            else:
+                self.label_xml_template_status.setText(f'已加载结构: {os.path.basename(path)}')
+                self.label_xml_fields_hint.setText('没有解析到可用字段，将继续使用默认字段。')
+            self.save_settings()
+        except Exception as e:
+            QMessageBox.warning(self, 'XML 配置', f'XML 字段分析失败:\n{e}')
+
+    def _add_xml_custom_mapping_row(self, field_path: str = '', tag_index: int = 1):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+
+        field_combo = self._create_xml_field_combo(field_path)
+        row_layout.addWidget(QLabel('字段:'))
+        row_layout.addWidget(field_combo, 1)
+
+        index_spin = self._create_xml_tag_index_spin(tag_index)
+        row_layout.addWidget(QLabel('第'))
+        row_layout.addWidget(index_spin)
+        row_layout.addWidget(QLabel('个 tag'))
+
+        btn_remove = QPushButton('删除')
+        btn_remove.setMaximumWidth(60)
+        row_layout.addWidget(btn_remove)
+
+        row = {
+            'widget': row_widget,
+            'field_combo': field_combo,
+            'index_spin': index_spin,
+        }
+        btn_remove.clicked.connect(lambda: self._remove_xml_custom_mapping_row(row))
+        field_combo.currentTextChanged.connect(lambda _=None: self.save_settings())
+        field_combo.currentTextChanged.connect(lambda _=None: self._refresh_xml_preview())
+        index_spin.valueChanged.connect(lambda _=None: self.save_settings())
+        index_spin.valueChanged.connect(lambda _=None: self._refresh_xml_preview())
+
+        self._xml_custom_mapping_rows.append(row)
+        self.xml_custom_map_layout.addWidget(row_widget)
+
+    def _remove_xml_custom_mapping_row(self, row: dict):
+        if row not in self._xml_custom_mapping_rows:
+            return
+        self._xml_custom_mapping_rows.remove(row)
+        widget = row.get('widget')
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+        self.save_settings()
+        self._refresh_xml_preview()
+
+    def _serialize_xml_custom_mappings(self) -> list:
+        results = []
+        for row in self._xml_custom_mapping_rows:
+            field_combo = row.get('field_combo')
+            index_spin = row.get('index_spin')
+            if field_combo is None or index_spin is None:
+                continue
+            field_path = field_combo.currentText().strip()
+            if not field_path:
+                continue
+            results.append({
+                'field_path': field_path,
+                'tag_index': int(index_spin.value()),
+            })
+        return results
+
+    def _clear_xml_custom_mapping_rows(self):
+        for row in list(self._xml_custom_mapping_rows):
+            widget = row.get('widget')
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._xml_custom_mapping_rows = []
+
+    def _load_xml_custom_mappings(self, rows: list):
+        self._clear_xml_custom_mapping_rows()
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            self._add_xml_custom_mapping_row(
+                field_path=str(row.get('field_path', '') or ''),
+                tag_index=int(row.get('tag_index', 1) or 1),
+            )
+        self._refresh_xml_preview()
+
+    def _build_xml_mapping_config(self) -> dict:
+        return {
+            'template_path': self.edit_xml_template_path.text().strip(),
+            'artist_field_path': self.combo_xml_artist_field.currentText().strip() or 'artist',
+            'artist_tag_index': int(self.spin_xml_artist_tag_index.value()),
+            'character_1_field_path': self.combo_xml_character1_field.currentText().strip() or 'character_1',
+            'character_1_tag_index': int(self.spin_xml_character1_tag_index.value()),
+            'character_2_field_path': self.combo_xml_character2_field.currentText().strip() or 'character_2',
+            'character_2_tag_index': int(self.spin_xml_character2_tag_index.value()),
+            'custom_mappings': self._serialize_xml_custom_mappings(),
+        }
+
+    def _refresh_xml_preview(self):
+        if not hasattr(self, 'edit_xml_preview_output'):
+            return
+        tag_text = self.edit_xml_preview_tags.toPlainText().strip()
+        if not tag_text:
+            self.edit_xml_preview_output.clear()
+            return
+        try:
+            xml_fragment = build_xml_fragment(tag_text, self._build_xml_mapping_config())
+            self.edit_xml_preview_output.setPlainText(xml_fragment or '(当前配置下没有生成任何 XML 字段)')
+        except Exception as e:
+            self.edit_xml_preview_output.setPlainText(f'XML 预览生成失败:\n{e}')
+
+    def _copy_xml_preview_output(self):
+        text = self.edit_xml_preview_output.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, 'XML 预览', '当前没有可复制的 XML 预览内容。')
+            return
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, 'XML 预览', 'XML 预览结果已复制到剪贴板。')
+
+    def _get_shareable_setting_keys(self) -> list:
+        return [
+            'processing_threads',
+            'preload_count',
+            'canny_enabled',
+            'openpose_enabled',
+            'depth_enabled',
+            'quality_profile',
+            'canny_accept',
+            'canny_reject',
+            'pose_accept',
+            'pose_reject',
+            'depth_accept',
+            'depth_reject',
+            'openpose_model',
+            'openpose_yolo_version',
+            'openpose_yolo_model_type',
+            'depth_model',
+            'parallel_threads',
+            'auto_pass_no_review',
+            'single_jsona',
+            'jsona_backup_every_entries',
+            'jsona_backup_every_seconds',
+            'jsona_backup_keep',
+            'unattended_mode',
+            'unattended_inbox_max_mb',
+            'unattended_inbox_full_action',
+            'vlm_backend',
+            'vlm_model',
+            'vlm_timeout_seconds',
+            'xml_artist_field_path',
+            'xml_artist_tag_index',
+            'xml_character1_field_path',
+            'xml_character1_tag_index',
+            'xml_character2_field_path',
+            'xml_character2_tag_index',
+            'xml_custom_mappings',
+            'enable_retry',
+            'max_retries',
+            'append_tags',
+            'custom_tags',
+            'discard_action',
+        ]
+
+    def _copy_key_parameters(self):
+        flat_settings = self._collect_flat_settings()
+        shareable = {
+            key: deepcopy(flat_settings.get(key))
+            for key in self._get_shareable_setting_keys()
+            if key in flat_settings
+        }
+        payload = {
+            'format': 'controlnet_gui_key_params',
+            'version': 1,
+            'exported_at': datetime.now().isoformat(timespec='seconds'),
+            'params': shareable,
+        }
+        QApplication.clipboard().setText(json.dumps(payload, ensure_ascii=False, indent=2))
+        QMessageBox.information(
+            self,
+            '关键参数',
+            '关键参数已复制到剪贴板。\n\n已自动排除路径、Token、API Key 等机器相关信息。'
+        )
+
+    def _import_key_parameters(self):
+        clipboard_text = QApplication.clipboard().text().strip()
+        initial_text = clipboard_text if clipboard_text.startswith('{') else ''
+        dialog = TextImportDialog(
+            '导入关键参数',
+            '把别人发来的关键参数 JSON 粘贴到这里。支持直接粘贴“复制关键参数”生成的内容。',
+            initial_text=initial_text,
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        raw_text = dialog.get_text().strip()
+        if not raw_text:
+            QMessageBox.warning(self, '导入关键参数', '没有检测到可导入的内容。')
+            return
+
+        try:
+            data = json.loads(raw_text)
+        except Exception as e:
+            QMessageBox.warning(self, '导入关键参数', f'JSON 解析失败:\n{e}')
+            return
+
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, '导入关键参数', '导入内容必须是 JSON 对象。')
+            return
+
+        if 'params' in data and isinstance(data.get('params'), dict):
+            config = data.get('params', {})
+        else:
+            config = data
+
+        allowed_keys = set(self._get_shareable_setting_keys())
+        filtered_config = {key: value for key, value in config.items() if key in allowed_keys}
+        if not filtered_config:
+            QMessageBox.warning(self, '导入关键参数', '未找到可识别的关键参数字段。')
+            return
+
+        skipped_labels = []
+        openpose_model = str(filtered_config.get('openpose_model', '') or '')
+        if openpose_model == 'Custom Path':
+            filtered_config.pop('openpose_model', None)
+            skipped_labels.append('Pose 模型(Custom Path)')
+
+        depth_model = str(filtered_config.get('depth_model', '') or '')
+        if depth_model == 'Custom Path':
+            filtered_config.pop('depth_model', None)
+            skipped_labels.append('Depth 模型(Custom Path)')
+
+        if not filtered_config:
+            QMessageBox.warning(
+                self,
+                '导入关键参数',
+                '导入内容只包含 Custom Path 模型选择，但关键参数不会携带机器路径。\n\n为避免导入后模型状态与路径不一致，本次未应用这些字段。'
+            )
+            return
+
+        self._apply_flat_settings(filtered_config)
+        self.save_settings(history_reason='import_key_params', force_history=True)
+
+        field_labels = self._get_settings_field_labels()
+        changed_labels = [field_labels.get(key, key) for key in filtered_config.keys()]
+        preview = '、'.join(changed_labels[:6])
+        if len(changed_labels) > 6:
+            preview += f' 等 {len(changed_labels)} 项'
+        message = f'关键参数已导入。\n\n涉及字段: {preview}'
+        if skipped_labels:
+            message += (
+                '\n\n以下字段未导入: ' + '、'.join(skipped_labels) +
+                '\n原因: 关键参数不会携带本机自定义模型路径，已自动跳过以避免状态不一致。'
+            )
+        QMessageBox.information(self, '导入关键参数', message)
+
+    def _show_settings_history(self):
+        entries = self._read_settings_history_entries()
+        dialog = SettingsHistoryDialog(entries, self._get_settings_field_labels(), parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        entry = dialog.get_selected_entry()
+        if not entry:
+            return
+
+        snapshot = entry.get('snapshot')
+        if not isinstance(snapshot, dict):
+            QMessageBox.warning(self, '参数修改历史', '该条历史记录没有可恢复的快照。')
+            return
+
+        reply = QMessageBox.question(
+            self,
+            '参数修改历史',
+            '确定要恢复到这条历史记录对应的参数吗？\n\n当前面板参数会被覆盖。',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._apply_flat_settings(snapshot)
+        self.save_settings(history_reason='restore_history', force_history=True)
+        QMessageBox.information(self, '参数修改历史', '已恢复选中的参数快照。')
+
     def _create_output_group(self) -> QGroupBox:
         """Create output settings group"""
         group = QGroupBox(tr('output'))
@@ -1377,12 +2605,14 @@ class SettingsPanel(QWidget):
         if files:
             for file in files:
                 self.list_parquet_files.addItem(file)
+            self.save_settings()
 
     def _remove_parquet_file(self):
         """Remove selected parquet file from list"""
         current_row = self.list_parquet_files.currentRow()
         if current_row >= 0:
             self.list_parquet_files.takeItem(current_row)
+            self.save_settings()
 
     def _extract_parquet_data(self):
         """Extract data from parquet files with multi-threading"""
@@ -2109,6 +3339,7 @@ class SettingsPanel(QWidget):
             self.combo_source_type.setCurrentText(tr('local_parquet'))
             local_config = data_source.get('local_parquet', {})
             parquet_files = local_config.get('parquet_files', [])
+            self.list_parquet_files.clear()
             for file in parquet_files:
                 self.list_parquet_files.addItem(file)
             self.edit_extract_dir.setText(local_config.get('extract_dir', './extracted'))
@@ -2164,6 +3395,20 @@ class SettingsPanel(QWidget):
         self.spin_jsona_backup_every_entries.setValue(processing.get('jsona_backup_every_entries', 200))
         self.spin_jsona_backup_every_seconds.setValue(processing.get('jsona_backup_every_seconds', 600))
         self.spin_jsona_backup_keep.setValue(processing.get('jsona_backup_keep', 10))
+        xml_mapping = processing.get('xml_mapping', {})
+        self.edit_xml_template_path.setText(str(xml_mapping.get('template_path', '') or ''))
+        if self.edit_xml_template_path.text().strip():
+            try:
+                self._analyze_xml_template()
+            except Exception:
+                pass
+        self.combo_xml_artist_field.setCurrentText(str(xml_mapping.get('artist_field_path', 'artist') or 'artist'))
+        self.spin_xml_artist_tag_index.setValue(int(xml_mapping.get('artist_tag_index', 1) or 1))
+        self.combo_xml_character1_field.setCurrentText(str(xml_mapping.get('character_1_field_path', 'character_1') or 'character_1'))
+        self.spin_xml_character1_tag_index.setValue(int(xml_mapping.get('character_1_tag_index', 2) or 2))
+        self.combo_xml_character2_field.setCurrentText(str(xml_mapping.get('character_2_field_path', 'character_2') or 'character_2'))
+        self.spin_xml_character2_tag_index.setValue(int(xml_mapping.get('character_2_tag_index', 3) or 3))
+        self._load_xml_custom_mappings(xml_mapping.get('custom_mappings', []))
 
         # Custom tags
         custom_tags = self.config.get('custom_tags', {})
@@ -2184,6 +3429,7 @@ class SettingsPanel(QWidget):
         settings = {
             'data_source': {},
             'processing': {},
+            'vlm': {},
             'custom_tags': {},
             'output': {},
             'prefilter': self.config.get('prefilter', {}),
@@ -2250,7 +3496,21 @@ class SettingsPanel(QWidget):
             'single_jsona': self.check_single_jsona.isChecked(),
             'jsona_backup_every_entries': self.spin_jsona_backup_every_entries.value(),
             'jsona_backup_every_seconds': self.spin_jsona_backup_every_seconds.value(),
-            'jsona_backup_keep': self.spin_jsona_backup_keep.value()
+            'jsona_backup_keep': self.spin_jsona_backup_keep.value(),
+            'xml_mapping': self._build_xml_mapping_config(),
+            'unattended_mode': self.check_unattended_mode.isChecked(),
+            'unattended_inbox_max_mb': self.spin_unattended_inbox_max_mb.value(),
+            'unattended_inbox_full_action': (
+                'pause' if self.combo_unattended_inbox_full_action.currentIndex() == 0 else 'stop'
+            ),
+        }
+
+        settings['vlm'] = {
+            'backend': self.combo_vlm_backend.currentText(),
+            'base_url': self.edit_vlm_base_url.text().strip(),
+            'model': self.edit_vlm_model.text().strip(),
+            'api_key': self.edit_vlm_api_key.text(),
+            'timeout_seconds': int(self.spin_vlm_timeout.value()),
         }
 
         # Apply selected quality profile
@@ -2317,8 +3577,7 @@ class SettingsPanel(QWidget):
 
         if reply == QMessageBox.Yes:
             # Delete settings.json to force reload from config.json
-            import os
-            settings_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'settings.json')
+            settings_file = self._get_settings_file_path()
             if os.path.exists(settings_file):
                 try:
                     os.remove(settings_file)
@@ -2326,7 +3585,14 @@ class SettingsPanel(QWidget):
                     print(f"Failed to delete settings file: {e}")
 
             # Reload config
-            self._load_config()
+            previous_state = self._settings_tracking_suspended
+            self._settings_tracking_suspended = True
+            try:
+                self._load_config()
+            finally:
+                self._settings_tracking_suspended = previous_state
+
+            self.save_settings(history_reason='reset_defaults', force_history=True)
 
             QMessageBox.information(
                 self,
@@ -2345,12 +3611,18 @@ class SettingsPanel(QWidget):
         pose_count = self._count_jsona_entries(os.path.join(output_dir, 'pose.jsona'), expected_name='pose')
         depth_count = self._count_jsona_entries(os.path.join(output_dir, 'depth.jsona'), expected_name='depth')
         metadata_count = self._count_jsona_entries(os.path.join(output_dir, 'metadata.jsona'), expected_name='metadata')
+        tag_count = self._count_jsona_entries(os.path.join(output_dir, 'tag.jsona'), expected_name='tag')
+        nl_count = self._count_jsona_entries(os.path.join(output_dir, 'nl.jsona'), expected_name='nl')
+        xml_count = self._count_jsona_entries(os.path.join(output_dir, 'xml.jsona'), expected_name='xml')
 
         # Update labels and active mode hint.
         self.label_canny_count.setText(f'Canny: {canny_count} 张图')
         self.label_pose_count.setText(f'Pose: {pose_count} 张图')
         self.label_depth_count.setText(f'Depth: {depth_count} 张图')
         self.label_metadata_count.setText(f'Metadata: {metadata_count} 条')
+        self.label_tag_count.setText(f'Tag: {tag_count} 条')
+        self.label_nl_count.setText(f'NL: {nl_count} 条')
+        self.label_xml_count.setText(f'XML: {xml_count} 条')
 
         if use_single_jsona:
             self.label_jsona_mode.setText('当前模式: 合并写入 metadata.jsona')
@@ -2358,12 +3630,18 @@ class SettingsPanel(QWidget):
             self.btn_reset_canny_jsona.setEnabled(False)
             self.btn_reset_pose_jsona.setEnabled(False)
             self.btn_reset_depth_jsona.setEnabled(False)
+            self.btn_reset_tag_jsona.setEnabled(True)
+            self.btn_reset_nl_jsona.setEnabled(True)
+            self.btn_reset_xml_jsona.setEnabled(True)
         else:
             self.label_jsona_mode.setText('当前模式: 分类型 JSONA')
             self.btn_reset_metadata_jsona.setEnabled(False)
             self.btn_reset_canny_jsona.setEnabled(True)
             self.btn_reset_pose_jsona.setEnabled(True)
             self.btn_reset_depth_jsona.setEnabled(True)
+            self.btn_reset_tag_jsona.setEnabled(True)
+            self.btn_reset_nl_jsona.setEnabled(True)
+            self.btn_reset_xml_jsona.setEnabled(True)
 
     def _count_jsona_entries(self, jsona_path: str, expected_name: str = None) -> int:
         """Count valid entries in a JSONA file."""
@@ -2400,6 +3678,12 @@ class SettingsPanel(QWidget):
                 jsona_file = 'depth.jsona'
             elif control_type == 'metadata':
                 jsona_file = 'metadata.jsona'
+            elif control_type == 'tag':
+                jsona_file = 'tag.jsona'
+            elif control_type == 'nl':
+                jsona_file = 'nl.jsona'
+            elif control_type == 'xml':
+                jsona_file = 'xml.jsona'
             else:
                 return
 
