@@ -199,6 +199,24 @@ Supported operations:
 - 从备份恢复
 - 对异常或重复条目进行保守修复
 
+## Recent Updates | 最近更新
+
+Recent workflow additions:
+
+- separate image scoring mode tab from the ControlNet generation workflow
+- local score-model support for image prefiltering
+- score dependency and model management UI
+- processed-count display and score progress reset support
+- startup logic fix to avoid incorrect ViTPose missing-model prompts during settings restore
+
+最近新增内容：
+
+- 将图片评分模式与 ControlNet 图生成流程拆分为独立 tab
+- 新增本地评分模型支持，用于原图预筛选
+- 新增评分依赖与模型管理界面
+- 新增已处理计数显示与评分进度重置支持
+- 修复启动恢复设置时误弹 ViTPose 缺失模型提示的问题
+
 ## Project Status | 项目状态
 
 This is an actively iterated practical tool.
