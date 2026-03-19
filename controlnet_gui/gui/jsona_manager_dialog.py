@@ -59,6 +59,10 @@ class JsonaManagerDialog(QDialog):
         self.import_button.clicked.connect(self.import_jsona)
         top_row.addWidget(self.import_button)
 
+        self.merge_button = QPushButton('合并多个 JSONA')
+        self.merge_button.clicked.connect(self.merge_jsona)
+        top_row.addWidget(self.merge_button)
+
         self.check_button = QPushButton('核对选中项')
         self.check_button.clicked.connect(self.check_selected)
         top_row.addWidget(self.check_button)
@@ -95,6 +99,7 @@ class JsonaManagerDialog(QDialog):
         if not self.allow_mutation:
             for button in [
                 self.import_button,
+                self.merge_button,
                 self.backup_button,
                 self.restore_button,
                 self.remove_missing_button,
@@ -157,7 +162,8 @@ class JsonaManagerDialog(QDialog):
             f"结构异常: {report.get('invalid_entry_count', 0)} | "
             f"重复: {report.get('duplicate_count', 0)} | "
             f"缺文件: {report.get('missing_file_count', 0)} | "
-            f"类型冲突: {report.get('type_mismatch_count', 0)}"
+            f"类型冲突: {report.get('type_mismatch_count', 0)} | "
+            f"文本冲突: {report.get('prompt_conflict_count', 0)}"
         )
 
     def _remember_report(self, key: str, report: dict):
@@ -199,12 +205,20 @@ class JsonaManagerDialog(QDialog):
             f"导入完成。\n\n"
             f"目标文件: {target_file}\n"
             f"新增条目: {report.get('imported_count', 0)}\n"
+            f"合并重复: {report.get('merge_duplicate_count', 0)}\n"
+            f"合并文本冲突: {report.get('merge_prompt_conflict_count', 0)}\n"
             f"目标类型: {report.get('target_name', 'unknown')}\n\n"
             f"{self._format_report_summary(report)}"
         )
         QMessageBox.information(self, '导入 JSONA', message)
 
-        if report.get('missing_file_count', 0) > 0 or report.get('invalid_entry_count', 0) > 0 or report.get('duplicate_count', 0) > 0:
+        if (
+            report.get('missing_file_count', 0) > 0
+            or report.get('invalid_entry_count', 0) > 0
+            or report.get('duplicate_count', 0) > 0
+            or report.get('prompt_conflict_count', 0) > 0
+            or report.get('merge_prompt_conflict_count', 0) > 0
+        ):
             reply = QMessageBox.question(
                 self,
                 '导出问题项',
@@ -219,6 +233,63 @@ class JsonaManagerDialog(QDialog):
                     f"已导出报告:\n{exported['summary']}"
                     + (f"\n\n问题条目:\n{exported['issues']}" if exported['issues'] else ''),
                 )
+
+    def merge_jsona(self):
+        source_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            '选择要合并的 JSONA 文件',
+            self.output_dir,
+            'JSONA Files (*.jsona *.json);;All Files (*.*)',
+        )
+        if not source_paths:
+            return
+
+        verify = QMessageBox.question(
+            self,
+            '合并 JSONA',
+            '是否在合并前核对 JSONA 中的路径是否存在?',
+            QMessageBox.Yes | QMessageBox.No,
+        ) == QMessageBox.Yes
+
+        try:
+            report = self.backup_manager.merge_jsona_files(source_paths, self.output_dir, verify_files=verify)
+        except Exception as exc:
+            QMessageBox.warning(self, '合并 JSONA', f'合并失败:\n{exc}')
+            return
+
+        self.refresh_table()
+
+        for group in report.get('groups', []):
+            self._remember_report(group['target_file'], group)
+
+        groups = report.get('groups', [])
+        if groups:
+            first_target = groups[0]['target_file']
+            for row, info in enumerate(self._file_rows):
+                if info['path'] == first_target:
+                    self.table.selectRow(row)
+                    break
+
+        lines = [
+            f"已处理文件: {report.get('file_count', 0)}",
+            f"合并目标数: {report.get('group_count', 0)}",
+            "",
+        ]
+        for group in groups:
+            lines.append(
+                f"{group.get('target_name', 'unknown')} -> {group.get('target_file', '')}\n"
+                f"来源文件: {len(group.get('source_files', []))} | "
+                f"结构有效: {group.get('valid_entry_count', 0)} | "
+                f"新增写入: {group.get('imported_count', 0)} | "
+                f"合并重复: {group.get('merge_duplicate_count', 0)} | "
+                f"合并文本冲突: {group.get('merge_prompt_conflict_count', 0)} | "
+                f"结构异常: {group.get('invalid_entry_count', 0)} | "
+                f"重复: {group.get('duplicate_count', 0)} | "
+                f"缺文件: {group.get('missing_file_count', 0)}"
+            )
+            lines.append("")
+
+        QMessageBox.information(self, '合并 JSONA', '\n'.join(lines).strip())
 
     def check_selected(self):
         info = self._selected_info()
@@ -240,7 +311,13 @@ class JsonaManagerDialog(QDialog):
             return
 
         report = self._reports.get(info['path'])
-        if report is None:
+        if (
+            report is None
+            or 'problem_entries' not in report
+            or 'missing_entries' not in report
+            or 'duplicate_entries' not in report
+            or 'prompt_conflicts' not in report
+        ):
             report = self.backup_manager.inspect_jsona_file(info['path'], expected_name=info['name'], check_files=True)
             self._remember_report(info['path'], report)
 

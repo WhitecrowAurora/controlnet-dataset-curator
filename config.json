@@ -67,6 +67,15 @@
       "enabled": true,
       "laplacian_threshold_high": 100.0,
       "laplacian_threshold_medium": 50.0
+    },
+    "score_filter": {
+      "enabled": false,
+      "checkpoint_path": "./models/score/5kdataset.safetensors",
+      "cache_root": "./models/score",
+      "device": "auto",
+      "min_aesthetic_score": 2.5,
+      "require_in_domain": true,
+      "min_in_domain_prob": 0.5
     }
   },
   "scoring": {

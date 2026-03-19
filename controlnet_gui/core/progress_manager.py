@@ -96,6 +96,14 @@ class ProgressManager:
         with self._lock:
             return item_key in self.data['processed']
 
+    def is_rejected(self, item_key: str) -> bool:
+        """Check if a review item was rejected automatically or manually."""
+        with self._lock:
+            return (
+                item_key in self.data.get('rejected', [])
+                or item_key in self.data.get('user_discarded', [])
+            )
+
     def mark_processed(self, item_key: str):
         """Mark a review item as processed."""
         with self._lock:
@@ -154,6 +162,55 @@ class ProgressManager:
         """Get set of processed review item keys."""
         with self._lock:
             return set(self.data['processed'])
+
+    def _rebuild_statistics_locked(self):
+        stats = self.data.setdefault('statistics', {})
+        stats['total_processed'] = len(self.data.get('processed', []))
+        stats['auto_accepted'] = len(self.data.get('accepted', []))
+        stats['auto_rejected'] = len(self.data.get('rejected', []))
+        stats['user_confirmed'] = len(self.data.get('user_confirmed', []))
+        stats['user_discarded'] = len(self.data.get('user_discarded', []))
+        stats['failed'] = len(self.data.get('failed', []))
+        stats.setdefault('retry_count', 0)
+
+    def count_for_control_type(self, control_type: str) -> int:
+        """Count processed records for a given logical control type."""
+        suffix = f"::{str(control_type or '').strip()}"
+        if suffix == "::":
+            return 0
+        with self._lock:
+            return sum(
+                1
+                for key in self.data.get('processed', [])
+                if isinstance(key, str) and key.endswith(suffix)
+            )
+
+    def reset_for_control_type(self, control_type: str) -> int:
+        """Remove progress records for a given logical control type."""
+        suffix = f"::{str(control_type or '').strip()}"
+        if suffix == "::":
+            return 0
+
+        with self._lock:
+            removed = {
+                key
+                for key in self.data.get('processed', [])
+                if isinstance(key, str) and key.endswith(suffix)
+            }
+            if not removed:
+                return 0
+
+            for field in ('processed', 'accepted', 'rejected', 'user_confirmed', 'user_discarded', 'failed'):
+                self.data[field] = [
+                    key for key in self.data.get(field, [])
+                    if key not in removed
+                ]
+
+            self._rebuild_statistics_locked()
+            self.save_counter = 0
+
+        self.save(force=True)
+        return len(removed)
 
     def reset(self):
         """Reset progress (start fresh)."""

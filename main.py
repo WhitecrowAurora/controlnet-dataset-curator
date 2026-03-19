@@ -93,7 +93,7 @@ print("\nAll required dependencies satisfied.")
 
 print("Importing PyQt5...")
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 print("Importing main window...")
 from controlnet_gui.gui.main_window import MainWindow
@@ -115,8 +115,22 @@ def main():
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
     window = MainWindow(config_path)
 
+    def _bring_window_to_front():
+        try:
+            if window.isMinimized():
+                window.showNormal()
+            window.show()
+            window.raise_()
+            window.activateWindow()
+            app.setActiveWindow(window)
+        except Exception as e:
+            print(f"[WARN] Failed to activate main window: {e}")
+
     print("Showing window...")
-    window.show()
+    _bring_window_to_front()
+    QTimer.singleShot(0, _bring_window_to_front)
+    QTimer.singleShot(250, _bring_window_to_front)
+    QTimer.singleShot(800, _bring_window_to_front)
 
     print("Starting event loop...")
     sys.exit(app.exec_())

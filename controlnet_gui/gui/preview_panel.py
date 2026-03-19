@@ -213,7 +213,8 @@ class PreviewPanel(QWidget):
         control_type_name = {
             'canny': 'Canny',
             'openpose': 'OpenPose',
-            'depth': 'Depth'
+            'depth': 'Depth',
+            'prefilter_score': '原图评分',
         }.get(control_type, control_type)
 
         self.lbl_canny_score.setText(
@@ -249,6 +250,25 @@ class PreviewPanel(QWidget):
 动态范围: {dynamic_range:.1f}
 梯度均值: {grad_mean:.2f}
             """.strip()
+        elif control_type == 'prefilter_score':
+            auto_accept_aesthetic = preset.get('auto_accept_aesthetic', 'N/A')
+            min_aesthetic_score = preset.get('min_aesthetic_score', 'N/A')
+            require_in_domain = bool(preset.get('require_in_domain', False))
+            min_in_domain_prob = preset.get('min_in_domain_prob', 'N/A')
+            domain_rule = f">= {min_in_domain_prob}" if require_in_domain else '未启用'
+            details = f"""
+美学分: {preset.get('aesthetic', 'N/A')}
+构图分: {preset.get('composition', 'N/A')}
+色彩分: {preset.get('color', 'N/A')}
+性感分: {preset.get('sexual', 'N/A')}
+目标域概率: {preset.get('in_domain_prob', 'N/A')}
+目标域判定: {preset.get('in_domain_pred', 'N/A')}
+最低美学分: {min_aesthetic_score}
+自动通过阈值: {auto_accept_aesthetic}
+目标域要求: {domain_rule}
+设备: {preset.get('device', 'N/A')}
+说明: {preset.get('reason', '') or '无'}
+            """.strip()
         else:
             details = f"预设: {preset_name}\n评分: {variant_10_score:.1f}/10"
 
@@ -262,7 +282,25 @@ class PreviewPanel(QWidget):
         self.lbl_total_score.setText(f"评分: {variant_10_score:.1f}/10")
 
         # 质量等级
-        if variant_10_score >= 8.0:
+        if control_type == 'prefilter_score':
+            try:
+                auto_accept_aesthetic = float(preset.get('auto_accept_aesthetic', 4.0) or 4.0)
+            except Exception:
+                auto_accept_aesthetic = 4.0
+            try:
+                aesthetic_value = float(preset.get('aesthetic'))
+            except Exception:
+                aesthetic_value = None
+            if not preset.get('passed', True):
+                quality_level = 'auto_reject'
+                reason = '低于原图评分阈值，自动拒绝'
+            elif aesthetic_value is not None and aesthetic_value >= auto_accept_aesthetic:
+                quality_level = 'auto_accept'
+                reason = '原图评分较高，自动通过'
+            else:
+                quality_level = 'need_review'
+                reason = '原图评分处于人工审核区间'
+        elif variant_10_score >= 8.0:
             quality_level = 'auto_accept'
             reason = '高质量，自动通过'
         elif variant_10_score <= 4.0:

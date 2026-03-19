@@ -13,7 +13,7 @@ from PyQt5.QtGui import QIcon
 import json
 import os
 import threading
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from queue import Queue, Empty, Full
 
 from .settings_panel import SettingsPanel
@@ -43,6 +43,92 @@ def build_progress_key(image_path: str, control_type: str, basename: str = '') -
     else:
         normalized_path = basename
     return f"{normalized_path}::{control_type}"
+
+
+def score_filter_to_10_scale(aesthetic) -> float:
+    try:
+        return max(0.0, min(10.0, float(aesthetic or 0) * 2.0))
+    except Exception:
+        return 0.0
+
+
+def score_filter_to_100_scale(aesthetic) -> float:
+    try:
+        return max(0.0, min(100.0, float(aesthetic or 0) * 20.0))
+    except Exception:
+        return 0.0
+
+
+def save_score_mode_accept(
+    base_dir: str,
+    basename: str,
+    original_image,
+    image_path: str,
+    tags: str = '',
+    prefilter: Optional[dict] = None,
+    profile: str = '',
+    review_source: str = '',
+) -> str:
+    import shutil
+    from PIL import Image as PILImage
+
+    out_dir = os.path.join(base_dir, 'score_accepted')
+    os.makedirs(out_dir, exist_ok=True)
+
+    image_save_path = os.path.join(out_dir, f"{basename}.png")
+    if original_image is not None:
+        original_image.save(image_save_path)
+    elif image_path and os.path.exists(image_path):
+        try:
+            with PILImage.open(image_path) as _im:
+                _im.convert("RGB").save(image_save_path)
+        except Exception:
+            shutil.copy2(image_path, image_save_path)
+
+    if tags:
+        with open(os.path.join(out_dir, f"{basename}.txt"), 'w', encoding='utf-8') as f:
+            f.write(tags)
+
+    meta_path = os.path.join(out_dir, f"{basename}_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+    else:
+        meta = {}
+
+    meta.update({
+        'basename': basename,
+        'profile': profile,
+        'processing_mode': 'image_score',
+        'original_path': image_path,
+    })
+    if review_source:
+        meta['accepted_from'] = review_source
+
+    prefilter = prefilter or {}
+    if prefilter.get('quality_warning', False):
+        meta['prefilter_warning'] = prefilter.get('sharpness_level', 'unknown')
+
+    score_filter = prefilter.get('score_filter', {}) if isinstance(prefilter, dict) else {}
+    if score_filter:
+        meta['score_filter'] = {
+            'aesthetic': score_filter.get('aesthetic'),
+            'composition': score_filter.get('composition'),
+            'color': score_filter.get('color'),
+            'sexual': score_filter.get('sexual'),
+            'in_domain_prob': score_filter.get('in_domain_prob'),
+            'in_domain_pred': score_filter.get('in_domain_pred'),
+            'reason': score_filter.get('reason', ''),
+            'device': score_filter.get('device'),
+        }
+
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return image_save_path
 
 
 class InstallProgressDialog(QDialog):
@@ -283,7 +369,9 @@ class ProcessingThread(QThread):
         self._duplicate_resolution_event = threading.Event()
         self._duplicate_resolution_result = {'action': 'new_revision', 'apply_all': False}
         self.duplicate_resolution_needed.emit(payload)
-        self._duplicate_resolution_event.wait()
+        while self.running:
+            if self._duplicate_resolution_event.wait(0.2):
+                break
         result = self._duplicate_resolution_result or {'action': 'new_revision', 'apply_all': False}
         action = str(result.get('action') or 'new_revision')
         if result.get('apply_all'):
@@ -376,19 +464,94 @@ class ProcessingThread(QThread):
             lines.extend(["", "variants:", "\n".join(variant_lines)])
         return "\n".join(lines).strip()
 
+    def _score_mode_accept_threshold(self) -> float:
+        processing_cfg = self.settings.get('processing', {}) or {}
+        try:
+            value = float(processing_cfg.get('score_mode_auto_accept', 4.0))
+        except Exception:
+            value = 4.0
+        return max(0.0, min(5.0, value))
+
+    def _build_score_mode_gui_data(
+        self,
+        *,
+        img,
+        image_path: str,
+        basename: str,
+        tags: str,
+        prefilter_result: dict,
+        progress_key: str,
+    ) -> dict:
+        score_filter = prefilter_result.get('score_filter', {}) or {}
+        score_filter_cfg = ((self.settings.get('prefilter', {}) or {}).get('score_filter', {}) or {})
+        aesthetic = score_filter.get('aesthetic')
+        score_10 = score_filter_to_10_scale(aesthetic)
+        raw_score = score_filter_to_100_scale(aesthetic)
+        try:
+            min_aesthetic_score = float(score_filter_cfg.get('min_aesthetic_score', 2.5))
+        except Exception:
+            min_aesthetic_score = 2.5
+        try:
+            min_in_domain_prob = float(score_filter_cfg.get('min_in_domain_prob', 0.5))
+        except Exception:
+            min_in_domain_prob = 0.5
+        auto_accept_aesthetic = self._score_mode_accept_threshold()
+        variant = {
+            'image': img.copy(),
+            'path': image_path,
+            'preset': {
+                'aesthetic': score_filter.get('aesthetic'),
+                'composition': score_filter.get('composition'),
+                'color': score_filter.get('color'),
+                'sexual': score_filter.get('sexual'),
+                'in_domain_prob': score_filter.get('in_domain_prob'),
+                'in_domain_pred': score_filter.get('in_domain_pred'),
+                'reason': score_filter.get('reason', ''),
+                'device': score_filter.get('device'),
+                'passed': score_filter.get('passed', True),
+                'auto_accept_aesthetic': auto_accept_aesthetic,
+                'min_aesthetic_score': min_aesthetic_score,
+                'require_in_domain': bool(score_filter_cfg.get('require_in_domain', True)),
+                'min_in_domain_prob': min_in_domain_prob,
+            },
+            'preset_name': '原图评分',
+            'score': raw_score,
+            'score_10': score_10,
+            'is_best': True,
+        }
+        return {
+            'original_image': img,
+            'original_path': image_path,
+            'image_path': image_path,
+            'basename': basename,
+            'tags': tags,
+            'prefilter': prefilter_result,
+            'control_type': 'prefilter_score',
+            'progress_key': progress_key,
+            'variants': [variant],
+            'best_score': raw_score,
+            'control_10_score': score_10,
+            'profile': 'image_score',
+            'processing_mode': 'image_score',
+        }
+
     def run(self):
         """Continuously process images from data source."""
         try:
             output_config = self.settings.get('output', {})
             base_dir = output_config.get('base_dir', './output')
+            processing_cfg = self.settings.get('processing', {}) or {}
+            processing_mode = str(processing_cfg.get('mode', 'controlnet') or 'controlnet').strip().lower()
+            if processing_mode not in {'controlnet', 'image_score'}:
+                processing_mode = 'controlnet'
 
             # Create output directories
             os.makedirs(os.path.join(base_dir, 'accepted'), exist_ok=True)
             os.makedirs(os.path.join(base_dir, 'rejected'), exist_ok=True)
             os.makedirs(os.path.join(base_dir, 'reviewed'), exist_ok=True)
+            os.makedirs(os.path.join(base_dir, 'score_accepted'), exist_ok=True)
 
             # Unattended mode: save review-needed items to disk inbox, do not enqueue images into GUI.
-            processing_cfg = self.settings.get('processing', {}) or {}
             self.unattended_mode = bool(processing_cfg.get('unattended_mode', False))
             self.review_inbox = None
             if self.unattended_mode:
@@ -433,12 +596,214 @@ class ProcessingThread(QThread):
                 self.progress_updated.emit(f"正在处理: {basename} ({processed_count}/{total_images})")
 
                 image_path = os.path.join(image_dir, filename)
+                prefilter_progress_key = build_progress_key(image_path, 'prefilter_score', basename)
+                if (
+                    self.prefilter.has_active_score_filter()
+                    and self.progress_manager
+                    and (
+                        (processing_mode == 'image_score' and self.progress_manager.is_processed(prefilter_progress_key))
+                        or (processing_mode == 'controlnet' and self.progress_manager.is_rejected(prefilter_progress_key))
+                    )
+                ):
+                    continue
 
                 # Apply pre-filter (blur detection)
                 from PIL import Image
                 with Image.open(image_path) as _im:
                     img = _im.convert("RGB")
                 prefilter_result = self.prefilter.evaluate(img)
+
+                tag_file = os.path.join(tag_dir, f"{basename}.txt")
+                tags = ''
+                if os.path.exists(tag_file):
+                    with open(tag_file, 'r', encoding='utf-8') as f:
+                        tags = f.read().strip()
+
+                # Append custom tags if enabled
+                custom_tags_config = self.settings.get('custom_tags', {})
+                if custom_tags_config.get('enabled', False):
+                    custom_tags = custom_tags_config.get('tags', '').strip()
+                    if custom_tags:
+                        tags = f"{tags}, {custom_tags}" if tags else custom_tags
+
+                if processing_mode == 'image_score':
+                    score_filter = prefilter_result.get('score_filter', {}) or {}
+                    gui_data = self._build_score_mode_gui_data(
+                        img=img,
+                        image_path=image_path,
+                        basename=basename,
+                        tags=tags,
+                        prefilter_result=prefilter_result,
+                        progress_key=prefilter_progress_key,
+                    )
+                    best_score = float(gui_data.get('best_score', 0) or 0)
+                    auto_accept_th = score_filter_to_100_scale(self._score_mode_accept_threshold())
+                    gui_preset = (((gui_data.get('variants') or [{}])[0]).get('preset', {}) or {})
+                    variants_src = [{
+                        'path': image_path,
+                        'score': best_score,
+                        'preset': '原图评分',
+                        'metrics': {
+                            'aesthetic': score_filter.get('aesthetic'),
+                            'composition': score_filter.get('composition'),
+                            'color': score_filter.get('color'),
+                            'sexual': score_filter.get('sexual'),
+                            'in_domain_prob': score_filter.get('in_domain_prob'),
+                            'in_domain_pred': score_filter.get('in_domain_pred'),
+                            'device': score_filter.get('device'),
+                            'reason': score_filter.get('reason', ''),
+                            'auto_accept_aesthetic': gui_preset.get('auto_accept_aesthetic'),
+                            'min_aesthetic_score': gui_preset.get('min_aesthetic_score'),
+                            'require_in_domain': gui_preset.get('require_in_domain'),
+                            'min_in_domain_prob': gui_preset.get('min_in_domain_prob'),
+                        },
+                    }]
+
+                    with QMutexLocker(self.mutex):
+                        self.stats['total'] += 1
+
+                        if prefilter_result.get('skip_processing') or score_filter.get('should_reject', False):
+                            self.stats['auto_reject'] += 1
+                            gui_data['auto_action'] = 'reject'
+                            reject_result = {
+                                'basename': basename,
+                                'image_path': image_path,
+                                'control_type': 'prefilter_score',
+                                'best_score': best_score,
+                                'prefilter': prefilter_result,
+                                'reject_reason': score_filter.get('reason', ''),
+                            }
+                            self._handle_rejected(reject_result, output_config)
+                            if self.progress_manager:
+                                self.progress_manager.mark_processed(prefilter_progress_key)
+                                self.progress_manager.mark_rejected(prefilter_progress_key, auto=True)
+                        elif best_score >= auto_accept_th:
+                            self.stats['auto_accept'] += 1
+                            gui_data['auto_action'] = 'accept'
+                            self._save_accepted(gui_data, base_dir)
+                            if self.progress_manager:
+                                self.progress_manager.mark_processed(prefilter_progress_key)
+                                self.progress_manager.mark_accepted(prefilter_progress_key, auto=True)
+                        else:
+                            gui_data['auto_action'] = None
+
+                    self.stats_updated.emit(self.stats.copy())
+
+                    enqueued = False
+                    if gui_data.get('auto_action') is None:
+                        if getattr(self, 'unattended_mode', False) and self.review_inbox is not None:
+                            duplicate_mode = 'reuse'
+                            duplicate_info = self.review_inbox.inspect_duplicate(
+                                progress_key=prefilter_progress_key,
+                                basename=basename,
+                                control_type='prefilter_score',
+                                original_path=image_path,
+                                tag_text=tags,
+                                variants=variants_src,
+                                best_score=best_score,
+                                profile='image_score',
+                                prefilter=prefilter_result,
+                            )
+                            if duplicate_info.get('status') == 'duplicate':
+                                duplicate_mode = self._request_duplicate_resolution({
+                                    'kind': 'image_score_review',
+                                    'basename': basename,
+                                    'control_type': 'prefilter_score',
+                                    'existing_revision': int(duplicate_info.get('record', {}).get('revision', 0) or 0),
+                                    'next_revision': int(duplicate_info.get('next_revision', 0) or 0),
+                                    'record_count': int(duplicate_info.get('record_count', 0) or 0),
+                                    'existing_summary': self._format_existing_review_summary(duplicate_info.get('record', {}) or {}),
+                                    'new_summary': self._format_live_review_summary(
+                                        basename=basename,
+                                        control_type='prefilter_score',
+                                        tags=tags,
+                                        variants=variants_src,
+                                        best_score=best_score,
+                                        profile='image_score',
+                                        prefilter=prefilter_result,
+                                        next_revision=int(duplicate_info.get('next_revision', 0) or 0),
+                                    ),
+                                })
+                            stored, info = self.review_inbox.add_item(
+                                progress_key=prefilter_progress_key,
+                                basename=basename,
+                                control_type='prefilter_score',
+                                original_path=image_path,
+                                tag_text=tags,
+                                variants=variants_src,
+                                best_score=best_score,
+                                profile='image_score',
+                                prefilter=prefilter_result,
+                                duplicate_mode=duplicate_mode,
+                            )
+                            if stored:
+                                pending_delta = int(info.get('pending_delta', 0) or 0)
+                                if pending_delta > 0:
+                                    with QMutexLocker(self.mutex):
+                                        self.stats['need_review'] += pending_delta
+                                        self.stats['inbox_pending'] = int(self.stats.get('inbox_pending', 0)) + pending_delta
+                                        self.stats['in_queue'] = self.review_queue.qsize()
+                                    self.stats_updated.emit(self.stats.copy())
+                                if self.progress_manager:
+                                    self.progress_manager.mark_processed(prefilter_progress_key)
+                            else:
+                                current_mb = info.get('current_mb', 0)
+                                max_mb = info.get('max_mb', 0)
+                                self.progress_updated.emit(
+                                    f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
+                                )
+                                on_full = str(info.get('on_full', 'pause')).lower()
+                                if on_full == 'stop':
+                                    self.running = False
+                                    break
+                                self.paused = True
+                        else:
+                            while self.running:
+                                try:
+                                    self.review_queue.put(gui_data, timeout=0.1)
+                                    enqueued = True
+                                    break
+                                except Full:
+                                    continue
+                            if enqueued:
+                                with QMutexLocker(self.mutex):
+                                    self.stats['need_review'] += 1
+                            if not enqueued and not self.running:
+                                break
+                    elif not self.settings.get('processing', {}).get('auto_pass_no_review', True):
+                        if not getattr(self, 'unattended_mode', False):
+                            try:
+                                self.review_queue.put(gui_data, timeout=0.1)
+                                enqueued = True
+                            except Full:
+                                pass
+
+                    with QMutexLocker(self.mutex):
+                        self.stats['in_queue'] = self.review_queue.qsize()
+                    self.stats_updated.emit(self.stats.copy())
+                    if enqueued:
+                        self.image_ready.emit()
+                    continue
+
+                if prefilter_result.get('skip_processing'):
+                    score_filter = prefilter_result.get('score_filter', {}) or {}
+                    reject_result = {
+                        'basename': basename,
+                        'image_path': image_path,
+                        'control_type': 'prefilter_score',
+                        'best_score': score_filter_to_100_scale(score_filter.get('aesthetic')),
+                        'prefilter': prefilter_result,
+                        'reject_reason': score_filter.get('reason', ''),
+                    }
+                    with QMutexLocker(self.mutex):
+                        self.stats['total'] += 1
+                        self.stats['auto_reject'] += 1
+                    self._handle_rejected(reject_result, output_config)
+                    if self.progress_manager:
+                        self.progress_manager.mark_processed(prefilter_progress_key)
+                        self.progress_manager.mark_rejected(prefilter_progress_key, auto=True)
+                    self.stats_updated.emit(self.stats.copy())
+                    continue
 
                 # Process image with ControlNet
                 result = self.processor.process_image(image_path, base_dir, basename)
@@ -448,19 +813,7 @@ class ProcessingThread(QThread):
                 result['basename'] = basename
                 result['image_path'] = image_path
 
-                # Load tags if available
-                tag_file = os.path.join(tag_dir, f"{basename}.txt")
-                if os.path.exists(tag_file):
-                    with open(tag_file, 'r', encoding='utf-8') as f:
-                        result['tags'] = f.read().strip()
-
-                # Append custom tags if enabled
-                custom_tags_config = self.settings.get('custom_tags', {})
-                if custom_tags_config.get('enabled', False):
-                    custom_tags = custom_tags_config.get('tags', '').strip()
-                    if custom_tags:
-                        existing_tags = result.get('tags', '')
-                        result['tags'] = f"{existing_tags}, {custom_tags}" if existing_tags else custom_tags
+                result['tags'] = tags
 
                 # Generate multiple rows - one for each enabled control type
                 # Extract control results from the result dict
@@ -810,6 +1163,19 @@ class ProcessingThread(QThread):
 
             print(f"[DEBUG] _save_accepted called: basename={basename}, control_type={control_type}, variants={len(variants)}")
 
+            if control_type == 'prefilter_score':
+                save_score_mode_accept(
+                    base_dir=base_dir,
+                    basename=basename,
+                    original_image=result.get('original_image'),
+                    image_path=result.get('image_path', ''),
+                    tags=result.get('tags', ''),
+                    prefilter=result.get('prefilter', {}),
+                    profile=result.get('profile', 'image_score'),
+                    review_source='auto_accept',
+                )
+                return
+
             if not variants:
                 print(f"[DEBUG] No variants, skipping save")
                 return
@@ -882,6 +1248,54 @@ class ProcessingThread(QThread):
         except Exception as e:
             print(f"Failed to save auto-accepted image: {e}")
 
+    def _create_jsona_backup_manager(self):
+        processing_config = self.settings.get('processing', {}) or {}
+        if self.processor and hasattr(self.processor, 'jsona_backup_manager'):
+            return self.processor.jsona_backup_manager
+        return JsonaBackupManager(
+            backup_interval_entries=processing_config.get('jsona_backup_every_entries', 200),
+            rolling_keep=processing_config.get('jsona_backup_keep', 10),
+            backup_interval_seconds=processing_config.get('jsona_backup_every_seconds', 600),
+        )
+
+    def _write_jsona_entries(self, base_dir: str, target_name: str, entries: List[dict]) -> Dict[str, int]:
+        if not entries:
+            return {'added': 0, 'updated': 0}
+        os.makedirs(base_dir, exist_ok=True)
+        jsona_path = os.path.join(base_dir, f"{target_name}.jsona")
+        backup_manager = self._create_jsona_backup_manager()
+        if target_name in {'tag', 'nl', 'xml'}:
+            return backup_manager.upsert_entries(jsona_path, entries)
+        added = backup_manager.append_entries(jsona_path, entries)
+        return {'added': added, 'updated': 0}
+
+    def _write_text_jsona_entries(self, base_dir: str, source_image_path: str, tag_text: str) -> Dict[str, Dict[str, int]]:
+        prompt = (tag_text or '').strip()
+        if not prompt or not source_image_path:
+            return {}
+
+        xml_config = (self.settings.get('processing', {}) or {}).get('xml_mapping', {})
+        results = {
+            'tag': self._write_jsona_entries(
+                base_dir,
+                'tag',
+                [self._create_jsona_entry(source_image_path, prompt, source_image_path, 'tag')],
+            ),
+            'nl': self._write_jsona_entries(
+                base_dir,
+                'nl',
+                [self._create_jsona_entry(source_image_path, build_nl_prompt(prompt), source_image_path, 'nl')],
+            ),
+        }
+        xml_fragment = build_xml_fragment(prompt, xml_config)
+        if xml_fragment:
+            results['xml'] = self._write_jsona_entries(
+                base_dir,
+                'xml',
+                [self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')],
+            )
+        return results
+
     def _write_jsona_metadata(self, result: dict, base_dir: str, extra: Optional[dict] = None):
         """Write JSONA metadata for accepted image (both auto and manual)"""
         try:
@@ -931,11 +1345,9 @@ class ProcessingThread(QThread):
                 entry = self._create_jsona_entry(source_image_path, hint_prompt, control_path, folder_name)
                 print(f"[DEBUG] Created {control_type} entry: {entry}")
 
-                if use_single_jsona:
-                    self.processor._append_to_json_file(base_dir, 'metadata', [entry])
-                else:
-                    self.processor._append_to_json_file(base_dir, folder_name, [entry])
-                print(f"[DEBUG] Successfully wrote to {folder_name}.jsona")
+                target_name = 'metadata' if use_single_jsona else folder_name
+                self._write_jsona_entries(base_dir, target_name, [entry])
+                print(f"[DEBUG] Successfully wrote to {target_name}.jsona")
 
                 if hasattr(self, 'settings_panel'):
                     self.settings_panel._update_jsona_statistics()
@@ -945,19 +1357,7 @@ class ProcessingThread(QThread):
             # Always write tag/nl/xml JSONA as separate files (never merged into metadata.jsona).
             if hint_prompt:
                 try:
-                    xml_config = (self.settings.get('processing', {}) or {}).get('xml_mapping', {})
-                    tag_entry = self._create_jsona_entry(source_image_path, hint_prompt, source_image_path, 'tag')
-                    nl_entry = self._create_jsona_entry(source_image_path, build_nl_prompt(hint_prompt), source_image_path, 'nl')
-                    xml_fragment = build_xml_fragment(hint_prompt, xml_config)
-                    if xml_fragment:
-                        xml_entry = self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')
-                    else:
-                        xml_entry = None
-
-                    self.processor._append_to_json_file(base_dir, 'tag', [tag_entry])
-                    self.processor._append_to_json_file(base_dir, 'nl', [nl_entry])
-                    if xml_entry:
-                        self.processor._append_to_json_file(base_dir, 'xml', [xml_entry])
+                    self._write_text_jsona_entries(base_dir, source_image_path, hint_prompt)
                 except Exception as e:
                     print(f"[WARNING] Failed to write tag/nl/xml jsona: {e}")
 
@@ -990,34 +1390,56 @@ class ProcessingThread(QThread):
         os.makedirs(delete_dir, exist_ok=True)
 
         try:
+            deleted_at = datetime.now()
+            safe_basename = ''.join('_' if ch in '<>:"/\\|?*' else ch for ch in str(basename or 'unknown')).strip() or 'unknown'
+            record_id = f"{safe_basename}_{control_type}_{deleted_at.strftime('%Y%m%d_%H%M%S_%f')}"
             image_path = result.get('image_path')
+            copied_files = []
             if image_path and os.path.exists(image_path):
                 # Keep the source image in place so other control types can still finish review.
-                dest_image = os.path.join(delete_dir, os.path.basename(image_path))
-                if not os.path.exists(dest_image):
-                    shutil.copy2(image_path, dest_image)
+                image_ext = os.path.splitext(image_path)[1] or '.png'
+                dest_image_name = f"{record_id}{image_ext}"
+                dest_image = os.path.join(delete_dir, dest_image_name)
+                shutil.copy2(image_path, dest_image)
+                copied_files.append(dest_image_name)
 
                 # Copy tag file if it exists.
                 tag_path = image_path.replace('/images/', '/tags/').replace('\\images\\', '\\tags\\')
                 tag_path = os.path.splitext(tag_path)[0] + '.txt'
                 if os.path.exists(tag_path):
-                    dest_tag = os.path.join(delete_dir, os.path.basename(tag_path))
-                    if not os.path.exists(dest_tag):
-                        shutil.copy2(tag_path, dest_tag)
+                    dest_tag_name = f"{record_id}.txt"
+                    dest_tag = os.path.join(delete_dir, dest_tag_name)
+                    shutil.copy2(tag_path, dest_tag)
+                    copied_files.append(dest_tag_name)
 
             metadata = {
+                'record_id': record_id,
                 'basename': basename,
-                'deleted_at': datetime.now().isoformat(),
-                'reason': f"Low quality score: {result.get('best_score', 0)}",
+                'deleted_at': deleted_at.isoformat(),
+                'reason': str(result.get('reject_reason', '') or '').strip()
+                or f"Low quality score: {result.get('best_score', 0)}",
                 'control_type': control_type,
-                'original_path': image_path
+                'original_path': image_path,
+                'copied_files': copied_files,
             }
 
             prefilter = result.get('prefilter', {})
             if prefilter.get('quality_warning', False):
                 metadata['prefilter_warning'] = prefilter.get('sharpness_level', 'unknown')
+            score_filter = prefilter.get('score_filter', {}) if isinstance(prefilter, dict) else {}
+            if score_filter:
+                metadata['score_filter'] = {
+                    'aesthetic': score_filter.get('aesthetic'),
+                    'composition': score_filter.get('composition'),
+                    'color': score_filter.get('color'),
+                    'sexual': score_filter.get('sexual'),
+                    'in_domain_prob': score_filter.get('in_domain_prob'),
+                    'in_domain_pred': score_filter.get('in_domain_pred'),
+                    'reason': score_filter.get('reason', ''),
+                    'device': score_filter.get('device'),
+                }
 
-            metadata_file = os.path.join(delete_dir, f"{basename}_{control_type}_meta.json")
+            metadata_file = os.path.join(delete_dir, f"{record_id}_meta.json")
             with open(metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
 
@@ -1036,6 +1458,8 @@ class ProcessingThread(QThread):
         """Stop processing"""
         self.running = False
         self.paused = False
+        if self._duplicate_resolution_event is not None:
+            self.resolve_duplicate_decision('new_revision', apply_all=False)
 
 
 class MainWindow(QMainWindow):
@@ -1051,6 +1475,8 @@ class MainWindow(QMainWindow):
         self.prefilter = None
         self.progress_manager = None
         self.delete_behavior = '7days'  # Default: keep for 7 days
+        self._standalone_jsona_backup_manager = None
+        self._standalone_jsona_backup_manager_key = None
         self.current_stats = {
             'total': 0,
             'auto_accept': 0,
@@ -1322,6 +1748,18 @@ class MainWindow(QMainWindow):
         self.install_depth_anything_action.triggered.connect(self._install_depth_anything)
         self.tools_menu.addAction(self.install_depth_anything_action)
 
+        self.install_score_dependencies_action = QAction("安装评分依赖", self)
+        self.install_score_dependencies_action.triggered.connect(self._install_score_dependencies)
+        self.tools_menu.addAction(self.install_score_dependencies_action)
+
+        self.score_model_manager_action = QAction("评分模型管理", self)
+        self.score_model_manager_action.triggered.connect(self._open_score_model_manager)
+        self.tools_menu.addAction(self.score_model_manager_action)
+
+        self.open_score_model_dir_action = QAction("打开评分模型目录", self)
+        self.open_score_model_dir_action.triggered.connect(self._open_score_model_directory)
+        self.tools_menu.addAction(self.open_score_model_dir_action)
+
         self.tools_menu.addSeparator()
 
         self.jsona_manager_action = QAction('JSONA 管理', self)
@@ -1572,6 +2010,9 @@ class MainWindow(QMainWindow):
         # Determine input directory based on user selection
         try:
             processing_config = settings.get('processing', {})
+            processing_mode = str(processing_config.get('mode', 'controlnet') or 'controlnet').strip().lower()
+            if processing_mode not in {'controlnet', 'image_score'}:
+                processing_mode = 'controlnet'
             use_custom_dir = processing_config.get('use_custom_dir', False)
 
             print(f"[DEBUG] use_custom_dir: {use_custom_dir}")
@@ -1616,55 +2057,79 @@ class MainWindow(QMainWindow):
                 tag_dir=tag_dir
             )
 
-            # Validate that at least one control type is selected
-            processing_config = settings.get('processing', {})
-            control_types = processing_config.get('control_types', {})
-            if not any(control_types.values()):
-                QMessageBox.warning(
+            # Create prefilter
+            prefilter_config = settings.get('prefilter', {})
+            self.prefilter = ImagePreFilter(prefilter_config)
+            if processing_mode == 'image_score' and not self.prefilter.has_active_score_filter():
+                QMessageBox.critical(
                     self,
-                    "No Control Type Selected",
-                    "Please select at least one control type (Canny, OpenPose, or Depth) in Processing Settings."
+                    '评分模式不可用',
+                    '当前已切换到图片评分模式，但原图评分筛选没有启用。\n\n'
+                    '请先启用“原图评分筛选”，再开始处理。'
                 )
                 return
-
-            # Fix torch DLL loading before creating processor
-            import sys
-            torch_lib_path = os.path.join(os.path.dirname(sys.executable), 'Lib', 'site-packages', 'torch', 'lib')
-            if os.path.exists(torch_lib_path):
-                # Add to PATH if not already there
-                if torch_lib_path not in os.environ.get('PATH', ''):
-                    os.environ['PATH'] = torch_lib_path + os.pathsep + os.environ.get('PATH', '')
-                # Add DLL directory for Python 3.8+
-                if hasattr(os, 'add_dll_directory'):
-                    try:
-                        os.add_dll_directory(torch_lib_path)
-                    except Exception:
-                        pass
-
-            # Check if depth is enabled and depth-anything-v2 is installed
-            processing_config = settings.get('processing', {})
-            control_types = processing_config.get('control_types', {})
-            if control_types.get('depth', False):
-                try:
-                    import depth_anything_v2
-                except ImportError:
-                    # Depth Anything V2 not installed, ask user to install
-                    reply = QMessageBox.question(
+            if self.prefilter.has_active_score_filter():
+                score_filter_status = self.prefilter.get_score_filter_status(force_refresh=True)
+                if not score_filter_status.get('available', False):
+                    QMessageBox.critical(
                         self,
-                        "需要安装 Depth Anything V2",
-                        "您启用了 Depth 处理，但未安装 depth-anything-v2 库。\n\n"
-                        "这是高质量深度图生成所必需的。\n\n"
-                        "安装过程中程序会自动关闭，安装完成后请手动重启。\n\n"
-                        "是否现在安装？",
-                        QMessageBox.Yes | QMessageBox.No
+                        '评分筛选不可用',
+                        '原图评分筛选已启用，但当前环境不可用。\n\n'
+                        + str(score_filter_status.get('message', ''))
                     )
+                    return
+                ok, score_error = self.prefilter.prepare_score_filter()
+                if not ok:
+                    QMessageBox.critical(
+                        self,
+                        '评分筛选初始化失败',
+                        '原图评分筛选初始化失败。\n\n' + str(score_error)
+                    )
+                    return
 
-                    if reply == QMessageBox.Yes:
-                        # Use external installation to avoid file lock issues
-                        self._install_package_external(['depth-anything-v2'], '安装 Depth Anything V2')
-                        return
-                    else:
-                        # User declined, don't start processing
+            output_config = settings.get('output', {})
+            base_dir = output_config.get('base_dir', './output')
+
+            if processing_mode == 'controlnet':
+                control_types = processing_config.get('control_types', {})
+                if not any(control_types.values()):
+                    QMessageBox.warning(
+                        self,
+                        "No Control Type Selected",
+                        "Please select at least one control type (Canny, OpenPose, or Depth) in Processing Settings."
+                    )
+                    return
+
+                # Fix torch DLL loading before creating processor
+                import sys
+                torch_lib_path = os.path.join(os.path.dirname(sys.executable), 'Lib', 'site-packages', 'torch', 'lib')
+                if os.path.exists(torch_lib_path):
+                    if torch_lib_path not in os.environ.get('PATH', ''):
+                        os.environ['PATH'] = torch_lib_path + os.pathsep + os.environ.get('PATH', '')
+                    if hasattr(os, 'add_dll_directory'):
+                        try:
+                            os.add_dll_directory(torch_lib_path)
+                        except Exception:
+                            pass
+
+                if control_types.get('depth', False):
+                    try:
+                        import depth_anything_v2
+                    except ImportError:
+                        reply = QMessageBox.question(
+                            self,
+                            "需要安装 Depth Anything V2",
+                            "您启用了 Depth 处理，但未安装 depth-anything-v2 库。\n\n"
+                            "这是高质量深度图生成所必需的。\n\n"
+                            "安装过程中程序会自动关闭，安装完成后请手动重启。\n\n"
+                            "是否现在安装？",
+                            QMessageBox.Yes | QMessageBox.No
+                        )
+
+                        if reply == QMessageBox.Yes:
+                            self._install_package_external(['depth-anything-v2'], '安装 Depth Anything V2')
+                            return
+
                         QMessageBox.warning(
                             self,
                             "无法继续",
@@ -1673,16 +2138,10 @@ class MainWindow(QMainWindow):
                         )
                         return
 
-            # Create processor
-            self.processor = ControlNetProcessor(settings)
-
-            output_config = settings.get('output', {})
-            base_dir = output_config.get('base_dir', './output')
-            self.processor.jsona_backup_manager.prepare_output_backups(base_dir)
-
-            # Create prefilter
-            prefilter_config = settings.get('prefilter', {})
-            self.prefilter = ImagePreFilter(prefilter_config)
+                self.processor = ControlNetProcessor(settings)
+                self.processor.jsona_backup_manager.prepare_output_backups(base_dir)
+            else:
+                self.processor = None
 
             # Create progress manager
             progress_config = settings.get('progress', {})
@@ -1715,7 +2174,10 @@ class MainWindow(QMainWindow):
             self.settings_panel.btn_pause.setEnabled(True)
             self.settings_panel.btn_stop.setEnabled(True)
 
-            self.status_bar.showMessage(tr('processing_started'))
+            if processing_mode == 'image_score':
+                self.status_bar.showMessage('图片评分模式已启动')
+            else:
+                self.status_bar.showMessage(tr('processing_started'))
 
         except Exception as e:
             import traceback
@@ -1893,17 +2355,29 @@ class MainWindow(QMainWindow):
                         f.write(tags)
                     print(f"[DEBUG] Saved tags to: {tag_path}")
 
-                control_img = variant.get('image')
-                if control_img:
-                    suffix_map = {
-                        'canny': '_canny.png',
-                        'openpose': '_openpose.png',
-                        'depth': '_depth.png'
-                    }
-                    suffix = suffix_map.get(control_type, f'_{control_type}.png')
-                    control_save_path = os.path.join(review_dir, f"{basename}{suffix}")
-                    control_img.save(control_save_path)
-                    print(f"[DEBUG] Saved control image to: {control_save_path}")
+                if control_type == 'prefilter_score':
+                    save_score_mode_accept(
+                        base_dir=base_dir,
+                        basename=basename,
+                        original_image=orig_img,
+                        image_path=image_path,
+                        tags=tags,
+                        prefilter=data.get('prefilter', {}),
+                        profile=data.get('profile', 'image_score'),
+                        review_source='manual_review',
+                    )
+                else:
+                    control_img = variant.get('image')
+                    if control_img:
+                        suffix_map = {
+                            'canny': '_canny.png',
+                            'openpose': '_openpose.png',
+                            'depth': '_depth.png'
+                        }
+                        suffix = suffix_map.get(control_type, f'_{control_type}.png')
+                        control_save_path = os.path.join(review_dir, f"{basename}{suffix}")
+                        control_img.save(control_save_path)
+                        print(f"[DEBUG] Saved control image to: {control_save_path}")
 
                     source_image_path = orig_save_path if os.path.exists(orig_save_path) else image_path
                     if source_image_path:
@@ -1917,31 +2391,20 @@ class MainWindow(QMainWindow):
 
                         print(f"[DEBUG] Created jsona entry: {entry}")
 
-                        if self.processor:
-                            use_single_jsona = settings.get('processing', {}).get('single_jsona', False)
-                            target_file = 'metadata' if use_single_jsona else folder_name
-                            self.processor._append_to_json_file(base_dir, target_file, [entry])
-                            print(f"[DEBUG] Successfully wrote to {target_file}.jsona")
-                            if hasattr(self, 'settings_panel'):
-                                self.settings_panel._update_jsona_statistics()
+                        use_single_jsona = settings.get('processing', {}).get('single_jsona', False)
+                        target_file = 'metadata' if use_single_jsona else folder_name
+                        self._write_jsona_entries(base_dir, target_file, [entry])
+                        print(f"[DEBUG] Successfully wrote to {target_file}.jsona")
 
-                            # Also write tag/nl/xml jsona for this accepted item.
-                            if tags:
-                                try:
-                                    xml_config = (settings.get('processing', {}) or {}).get('xml_mapping', {})
-                                    tag_entry = self._create_jsona_entry(source_image_path, tags, source_image_path, 'tag')
-                                    nl_entry = self._create_jsona_entry(source_image_path, build_nl_prompt(tags), source_image_path, 'nl')
-                                    xml_fragment = build_xml_fragment(tags, xml_config)
-                                    xml_entry = (
-                                        self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')
-                                        if xml_fragment else None
-                                    )
-                                    self.processor._append_to_json_file(base_dir, 'tag', [tag_entry])
-                                    self.processor._append_to_json_file(base_dir, 'nl', [nl_entry])
-                                    if xml_entry:
-                                        self.processor._append_to_json_file(base_dir, 'xml', [xml_entry])
-                                except Exception as e:
-                                    print(f"[WARNING] Failed to write tag/nl/xml jsona (manual): {e}")
+                        # Also write tag/nl/xml jsona for this accepted item.
+                        if tags:
+                            try:
+                                self._write_text_jsona_entries(base_dir, source_image_path, tags, settings=settings)
+                            except Exception as e:
+                                print(f"[WARNING] Failed to write tag/nl/xml jsona (manual): {e}")
+
+                        if hasattr(self, 'settings_panel'):
+                            self.settings_panel._update_jsona_statistics()
 
                 if self.progress_manager:
                     self.progress_manager.mark_processed(progress_key)
@@ -2120,8 +2583,7 @@ class MainWindow(QMainWindow):
 
     def _cleanup_delete_folder(self):
         """Clean up .delete folder based on retention policy"""
-        from datetime import datetime, timedelta
-        import shutil
+        from datetime import datetime
 
         if not hasattr(self, 'delete_behavior'):
             self.delete_behavior = '7days'
@@ -2156,6 +2618,7 @@ class MainWindow(QMainWindow):
         # Count files to delete
         now = datetime.now()
         files_to_delete = []
+        all_meta_records = []
 
         for filename in os.listdir(delete_dir):
             if filename.endswith('_meta.json'):
@@ -2166,10 +2629,19 @@ class MainWindow(QMainWindow):
 
                     deleted_at = datetime.fromisoformat(metadata.get('deleted_at', ''))
                     age_days = (now - deleted_at).days
+                    copied_files = metadata.get('copied_files', [])
+                    if not isinstance(copied_files, list):
+                        copied_files = []
+
+                    record = {
+                        'basename': str(metadata.get('basename', '') or ''),
+                        'meta_path': meta_path,
+                        'copied_files': [str(item) for item in copied_files if str(item or '').strip()],
+                    }
+                    all_meta_records.append(record)
 
                     if age_days >= retention_days:
-                        basename = metadata.get('basename', '')
-                        files_to_delete.append(basename)
+                        files_to_delete.append(record)
                 except Exception as e:
                     print(f"Error reading metadata {filename}: {e}")
 
@@ -2192,16 +2664,44 @@ class MainWindow(QMainWindow):
 
         if reply == QMessageBox.Yes:
             deleted_count = 0
-            for basename in files_to_delete:
+            delete_meta_paths = {
+                str(item.get('meta_path', '') or '')
+                for item in files_to_delete
+            }
+            surviving_basenames = {}
+            for record in all_meta_records:
+                record_meta_path = str(record.get('meta_path', '') or '')
+                basename = str(record.get('basename', '') or '')
+                if record_meta_path and record_meta_path not in delete_meta_paths and basename:
+                    surviving_basenames[basename] = surviving_basenames.get(basename, 0) + 1
+            cleaned_fallback_basenames = set()
+
+            for item in files_to_delete:
+                basename = str(item.get('basename', '') or '')
+                meta_path = item.get('meta_path')
+                copied_files = [
+                    str(name or '').strip()
+                    for name in item.get('copied_files', []) or []
+                    if str(name or '').strip()
+                ]
                 try:
-                    # Delete image, tag, and metadata files
-                    for ext in ['.png', '.jpg', '.jpeg', '.webp', '.txt', '_meta.json']:
-                        file_path = os.path.join(delete_dir, f"{basename}{ext}")
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
+                    if copied_files:
+                        for copied_name in copied_files:
+                            file_path = copied_name if os.path.isabs(copied_name) else os.path.join(delete_dir, copied_name)
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                    elif basename and surviving_basenames.get(basename, 0) <= 0 and basename not in cleaned_fallback_basenames:
+                        # Backward compatibility for older metadata records without copied_files.
+                        for ext in ['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.txt']:
+                            file_path = os.path.join(delete_dir, f"{basename}{ext}")
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                        cleaned_fallback_basenames.add(basename)
+                    if meta_path and os.path.exists(meta_path):
+                        os.remove(meta_path)
                     deleted_count += 1
                 except Exception as e:
-                    print(f"Error deleting {basename}: {e}")
+                    print(f"Error deleting {meta_path or basename}: {e}")
 
             QMessageBox.information(
                 self,
@@ -2373,6 +2873,100 @@ class MainWindow(QMainWindow):
             packages = ['torch', 'torchvision', 'datasets', 'controlnet-aux', 'opencv-python']
             self._run_pip_install(packages, tr('installing_all_dependencies'))
 
+    def _get_missing_score_dependency_packages(self):
+        import importlib.util
+
+        torch_missing = (
+            importlib.util.find_spec('torch') is None
+            or importlib.util.find_spec('torchvision') is None
+        )
+        required = [
+            ('transformers', 'transformers>=4.44.0'),
+            ('huggingface_hub', 'huggingface-hub>=0.26.0'),
+            ('open_clip', 'open-clip-torch>=2.26.1'),
+            ('timm', 'timm>=1.0.12'),
+            ('safetensors', 'safetensors>=0.4.5'),
+            ('yaml', 'PyYAML>=6.0.2'),
+            ('tqdm', 'tqdm>=4.66.5'),
+            ('einops', 'einops>=0.7.0'),
+        ]
+        packages = []
+        for module_name, package_name in required:
+            if importlib.util.find_spec(module_name) is None:
+                packages.append(package_name)
+        return torch_missing, packages
+
+    def _install_score_dependencies(self, skip_confirm: bool = False):
+        """Install dependencies required by the original-image score filter."""
+        import importlib.util
+        import sys
+
+        torch_missing, packages = self._get_missing_score_dependency_packages()
+        if torch_missing:
+            if not skip_confirm:
+                reply = QMessageBox.question(
+                    self,
+                    '安装评分依赖',
+                    '评分筛选依赖 PyTorch / torchvision。\n\n'
+                    '这部分建议继续使用现有的 PyTorch 安装器选择 CPU / CUDA 版本，'
+                    '避免直接装错版本。\n\n'
+                    '是否现在打开 PyTorch 安装器？\n'
+                    '安装完成后，再点一次“安装评分依赖”即可继续安装剩余依赖。',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            self._install_torch()
+            return
+
+        if not packages:
+            QMessageBox.information(
+                self,
+                '安装评分依赖',
+                '当前检测到评分依赖已经齐全，无需安装。'
+            )
+            return
+
+        if not skip_confirm:
+            package_preview = '\n'.join(f'  - {item}' for item in packages)
+            reply = QMessageBox.question(
+                self,
+                '安装评分依赖',
+                '将安装当前缺失的评分依赖:\n\n'
+                f'{package_preview}\n\n'
+                '是否继续？',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        loaded_modules = {'torch', 'transformers', 'open_clip', 'timm'} & set(sys.modules.keys())
+        if loaded_modules:
+            self._install_package_external(packages, '安装评分依赖')
+        else:
+            self._run_pip_install(packages, '安装评分依赖')
+
+    def _refresh_dependency_sensitive_ui(self):
+        """Refresh UI elements that depend on newly installed packages."""
+        try:
+            self._check_device_info()
+        except Exception:
+            pass
+
+        settings_panel = getattr(self, 'settings_panel', None)
+        if settings_panel is None:
+            return
+
+        for method_name in ('_check_torch_availability', '_refresh_score_filter_status'):
+            method = getattr(settings_panel, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except Exception:
+                    pass
+
     def _run_pip_install(self, packages: list, title: str, reinstall: bool = False):
         """Run pip install in a separate process with real-time output"""
         # Show installation dialog
@@ -2381,6 +2975,8 @@ class MainWindow(QMainWindow):
 
         # Check if installation was successful
         if dialog.success:
+            self._refresh_dependency_sensitive_ui()
+
             # Ask if user wants to restart
             reply = QMessageBox.question(
                 self,
@@ -2406,8 +3002,7 @@ class MainWindow(QMainWindow):
 
         # Check if installation was successful
         if dialog.success:
-            # Update device info
-            self._check_device_info()
+            self._refresh_dependency_sensitive_ui()
 
             # Ask if user wants to restart
             reply = QMessageBox.question(
@@ -2576,11 +3171,67 @@ class MainWindow(QMainWindow):
         processing_config = settings.get('processing', {})
         if self.processor and hasattr(self.processor, 'jsona_backup_manager'):
             return self.processor.jsona_backup_manager
-        return JsonaBackupManager(
-            backup_interval_entries=processing_config.get('jsona_backup_every_entries', 200),
-            rolling_keep=processing_config.get('jsona_backup_keep', 10),
-            backup_interval_seconds=processing_config.get('jsona_backup_every_seconds', 600),
+        manager_key = (
+            processing_config.get('jsona_backup_every_entries', 200),
+            processing_config.get('jsona_backup_keep', 10),
+            processing_config.get('jsona_backup_every_seconds', 600),
         )
+        if (
+            self._standalone_jsona_backup_manager is None
+            or self._standalone_jsona_backup_manager_key != manager_key
+        ):
+            self._standalone_jsona_backup_manager = JsonaBackupManager(
+                backup_interval_entries=manager_key[0],
+                rolling_keep=manager_key[1],
+                backup_interval_seconds=manager_key[2],
+            )
+            self._standalone_jsona_backup_manager_key = manager_key
+        return self._standalone_jsona_backup_manager
+
+    def _write_jsona_entries(self, base_dir: str, target_name: str, entries: List[dict]) -> Dict[str, int]:
+        if not entries:
+            return {'added': 0, 'updated': 0}
+        os.makedirs(base_dir, exist_ok=True)
+        jsona_path = os.path.join(base_dir, f"{target_name}.jsona")
+        backup_manager = self._create_jsona_backup_manager()
+        if target_name in {'tag', 'nl', 'xml'}:
+            return backup_manager.upsert_entries(jsona_path, entries)
+        added = backup_manager.append_entries(jsona_path, entries)
+        return {'added': added, 'updated': 0}
+
+    def _write_text_jsona_entries(
+        self,
+        base_dir: str,
+        source_image_path: str,
+        tag_text: str,
+        settings: Optional[dict] = None,
+    ) -> Dict[str, Dict[str, int]]:
+        prompt = (tag_text or '').strip()
+        if not prompt or not source_image_path:
+            return {}
+
+        resolved_settings = settings or self.settings_panel.get_settings()
+        xml_config = (resolved_settings.get('processing', {}) or {}).get('xml_mapping', {})
+        results = {
+            'tag': self._write_jsona_entries(
+                base_dir,
+                'tag',
+                [self._create_jsona_entry(source_image_path, prompt, source_image_path, 'tag')],
+            ),
+            'nl': self._write_jsona_entries(
+                base_dir,
+                'nl',
+                [self._create_jsona_entry(source_image_path, build_nl_prompt(prompt), source_image_path, 'nl')],
+            ),
+        }
+        xml_fragment = build_xml_fragment(prompt, xml_config)
+        if xml_fragment:
+            results['xml'] = self._write_jsona_entries(
+                base_dir,
+                'xml',
+                [self._create_jsona_entry(source_image_path, xml_fragment, source_image_path, 'xml')],
+            )
+        return results
 
     def _show_jsona_dialog(self, initial_action: str = ''):
         """Open the JSONA dialog, optionally triggering an initial action."""
@@ -2604,6 +3255,16 @@ class MainWindow(QMainWindow):
         elif initial_action == 'check':
             dialog.check_selected()
         dialog.exec_()
+
+    def _open_score_model_manager(self):
+        settings_panel = getattr(self, 'settings_panel', None)
+        if settings_panel is not None and hasattr(settings_panel, '_show_score_model_manager'):
+            settings_panel._show_score_model_manager()
+
+    def _open_score_model_directory(self):
+        settings_panel = getattr(self, 'settings_panel', None)
+        if settings_panel is not None and hasattr(settings_panel, '_open_score_filter_cache_root'):
+            settings_panel._open_score_filter_cache_root()
 
     def _open_jsona_manager(self):
         """Open the JSONA manager dialog."""
@@ -2664,8 +3325,6 @@ class MainWindow(QMainWindow):
                 return
 
             # Ensure required services exist for saving user decisions.
-            if self.processor is None:
-                self.processor = ControlNetProcessor(settings)
             if self.progress_manager is None:
                 progress_config = settings.get('progress', {}) or {}
                 progress_file = progress_config.get('progress_file', '.progress.json')
@@ -2737,6 +3396,10 @@ class MainWindow(QMainWindow):
                                 raw_score >= 60,
                                 vrec.get('warning'),
                             )
+                        elif control_type == 'prefilter_score':
+                            preset_info = vrec.get('metrics') or {}
+                            aesthetic = preset_info.get('aesthetic')
+                            score_10 = score_filter_to_10_scale(aesthetic if aesthetic is not None else (raw_score / 20.0))
                         else:
                             preset_info = {}
                             score_10 = 1.0

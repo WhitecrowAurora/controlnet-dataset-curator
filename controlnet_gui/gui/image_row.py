@@ -297,6 +297,9 @@ class ImageRowWidget(QWidget):
         # 显示变体
         variants = data.get('variants', [])
 
+        for container in self.variant_containers:
+            container.show()
+
         for i, variant in enumerate(variants[:4]):
             if variant.get('image'):
                 self._set_image(self.variant_labels[i], variant['image'])
@@ -314,10 +317,20 @@ class ImageRowWidget(QWidget):
             if is_best:
                 self._best_index = i
 
+        for i in range(len(variants[:4]), len(self.variant_containers)):
+            self.variant_labels[i].clear()
+            self.score_labels[i].clear()
+            self.preset_labels[i].clear()
+            self.variant_containers[i].hide()
+
         # 如果没有变体被标记为最佳，找出分数最高的
         if self._best_index == -1 and variants:
             scores = [v.get('score_10', 1.0) for v in variants[:4]]
             self._best_index = scores.index(max(scores)) if scores else -1
+
+        # Only one candidate means no real choice; preselect it for faster review.
+        if self.get_variant_count() == 1:
+            self._selected_index = 0
 
         self._refresh_variant_highlights()
     

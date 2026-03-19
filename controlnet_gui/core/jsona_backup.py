@@ -12,8 +12,10 @@ from typing import Dict, List, Optional, Tuple
 class JsonaBackupManager:
     """Manage JSONA backups and maintenance operations."""
 
-    DEFAULT_NAMES = ('canny', 'pose', 'depth', 'metadata')
-    KNOWN_TASKS = ('canny', 'pose', 'depth')
+    DEFAULT_NAMES = ('canny', 'pose', 'depth', 'metadata', 'tag', 'nl', 'xml')
+    CONTROL_TASKS = ('canny', 'pose', 'depth')
+    TEXT_TASKS = ('tag', 'nl', 'xml')
+    KNOWN_TASKS = CONTROL_TASKS + TEXT_TASKS
     TOP_LEVEL_KEYS = ('entries', 'items', 'data', 'records')
 
     def __init__(self, backup_interval_entries: int = 200, rolling_keep: int = 10, backup_interval_seconds: int = 600):
@@ -186,11 +188,29 @@ class JsonaBackupManager:
             entry.get('task_id', ''),
         )
 
+    def _merge_key(self, entry: Dict) -> Tuple[str, str, str]:
+        """Key used for import/merge conflict handling."""
+        task_id = entry.get('task_id', '')
+        if task_id in self.TEXT_TASKS:
+            return (
+                entry.get('hint_image_path', ''),
+                '',
+                task_id,
+            )
+        return self._entry_key(entry)
+
     def _target_name_to_expected(self, target_name: str) -> Optional[str]:
         if target_name in self.KNOWN_TASKS:
             return target_name
         if target_name == 'metadata':
             return 'metadata'
+        return None
+
+    def _allowed_tasks_for_expected(self, expected_name: Optional[str]) -> Optional[Tuple[str, ...]]:
+        if expected_name in self.KNOWN_TASKS:
+            return (expected_name,)
+        if expected_name == 'metadata':
+            return self.CONTROL_TASKS
         return None
 
     def _normalize_entry(self, item, expected_name: Optional[str] = None) -> Tuple[Optional[Dict], List[str], int]:
@@ -212,13 +232,20 @@ class JsonaBackupManager:
 
         task_id = self._normalize_task_id(entry.get('task_id', ''))
         inferred_task = self._infer_task_id_from_path(control_path)
+        allowed_tasks = self._allowed_tasks_for_expected(expected_name)
 
         if not task_id:
-            if expected_name in self.KNOWN_TASKS:
+            if allowed_tasks and len(allowed_tasks) == 1 and allowed_tasks[0] in self.KNOWN_TASKS:
                 task_id = expected_name
                 fixes += 1
             elif inferred_task:
                 task_id = inferred_task
+                fixes += 1
+
+        # For text-only tasks, allow missing control_hints_path by defaulting to the image itself.
+        if not control_path and hint_path:
+            if (task_id in self.TEXT_TASKS) or (expected_name in self.TEXT_TASKS):
+                control_path = hint_path
                 fixes += 1
 
         if not hint_path:
@@ -229,7 +256,7 @@ class JsonaBackupManager:
             issues.append('missing_task_id')
         elif task_id not in self.KNOWN_TASKS:
             issues.append('invalid_task_id')
-        elif expected_name in self.KNOWN_TASKS and task_id != expected_name:
+        elif allowed_tasks and task_id not in allowed_tasks:
             issues.append('task_id_mismatch')
 
         if issues:
@@ -258,7 +285,10 @@ class JsonaBackupManager:
         if len(task_ids) == 1:
             return next(iter(task_ids))
         if len(task_ids) > 1:
-            return 'metadata'
+            # Only treat as "metadata" when it's a mix of control tasks.
+            if task_ids.issubset(set(self.CONTROL_TASKS)):
+                return 'metadata'
+            return None
 
         inferred = set()
         for item in entries:
@@ -274,12 +304,13 @@ class JsonaBackupManager:
 
     def analyze_entries(self, entries: List, expected_name: Optional[str] = None, check_files: bool = False, source_path: str = '') -> Dict:
         expected_name = self._target_name_to_expected(expected_name) or expected_name
-        seen = set()
+        seen: Dict[Tuple[str, str, str], Dict] = {}
         valid_entries: List[Dict] = []
         existing_entries: List[Dict] = []
         problems: List[Dict] = []
         duplicates: List[Dict] = []
         missing_files: List[Dict] = []
+        prompt_conflicts: List[Dict] = []
         type_mismatch_count = 0
         fixed_fields = 0
 
@@ -296,15 +327,27 @@ class JsonaBackupManager:
                 })
                 continue
 
-            entry_key = self._entry_key(normalized)
+            entry_key = self._merge_key(normalized)
             if entry_key in seen:
-                duplicates.append({
-                    'index': index,
-                    'reason': 'duplicate_entry',
-                    'entry': normalized,
-                })
+                existing = seen[entry_key]
+                if (
+                    normalized.get('task_id') in self.TEXT_TASKS
+                    and (existing.get('hint_prompt', '') != normalized.get('hint_prompt', ''))
+                ):
+                    prompt_conflicts.append({
+                        'index': index,
+                        'reason': 'prompt_conflict',
+                        'entry': normalized,
+                        'existing_entry': deepcopy(existing),
+                    })
+                else:
+                    duplicates.append({
+                        'index': index,
+                        'reason': 'duplicate_entry',
+                        'entry': normalized,
+                    })
                 continue
-            seen.add(entry_key)
+            seen[entry_key] = normalized
             valid_entries.append(normalized)
 
             if check_files:
@@ -333,6 +376,7 @@ class JsonaBackupManager:
             'invalid_entry_count': len(problems),
             'duplicate_count': len(duplicates),
             'missing_file_count': len(missing_files),
+            'prompt_conflict_count': len(prompt_conflicts),
             'type_mismatch_count': type_mismatch_count,
             'fixed_field_count': fixed_fields,
             'actual_task_ids': actual_task_ids,
@@ -341,6 +385,7 @@ class JsonaBackupManager:
             'problem_entries': problems,
             'duplicate_entries': duplicates,
             'missing_entries': missing_files,
+            'prompt_conflicts': prompt_conflicts,
         }
 
     def inspect_jsona_file(self, json_file: str, expected_name: Optional[str] = None, check_files: bool = False) -> Dict:
@@ -375,6 +420,7 @@ class JsonaBackupManager:
                 + info.get('duplicate_count', 0)
                 + info.get('missing_file_count', 0)
                 + info.get('type_mismatch_count', 0)
+                + info.get('prompt_conflict_count', 0)
             )
             if info.get('error'):
                 info['status'] = 'invalid'
@@ -517,6 +563,79 @@ class JsonaBackupManager:
         finally:
             self._release_lock(lock_file)
 
+    def upsert_entries(self, json_file: str, entries: List[Dict]) -> Dict[str, int]:
+        """
+        Upsert entries into a JSONA file.
+
+        - For text tasks (tag/nl/xml): key is (hint_image_path, task_id) so prompts can be rewritten.
+        - For control tasks: key is (hint_image_path, control_hints_path, task_id).
+        """
+        if not entries:
+            return {"added": 0, "updated": 0}
+
+        def key_for(entry: Dict) -> Tuple[str, str, str]:
+            task_id = entry.get("task_id", "")
+            if task_id in self.TEXT_TASKS:
+                return (entry.get("hint_image_path", ""), "", task_id)
+            return self._entry_key(entry)
+
+        self.ensure_session_backup(json_file)
+        lock_file = self._acquire_lock(json_file)
+        try:
+            existing_data = []
+            if os.path.exists(json_file):
+                try:
+                    raw_data = self._read_json_data(json_file)
+                except Exception as exc:
+                    raise ValueError(
+                        f'Existing JSONA is invalid and was not upserted: {json_file}. Repair or restore it before continuing. {exc}'
+                    ) from exc
+
+                existing_entries, _ = self._coerce_entries(raw_data)
+                if not isinstance(existing_entries, list):
+                    raise ValueError(
+                        f'Existing JSONA top-level structure is invalid and was not upserted: {json_file}. Repair or restore it before continuing.'
+                    )
+                existing_data = existing_entries
+
+            normalized_existing: List[Dict] = []
+            index_by_key: Dict[Tuple[str, str, str], int] = {}
+            for item in existing_data:
+                normalized, issues, _ = self._normalize_entry(item, None)
+                if normalized and not issues:
+                    k = key_for(normalized)
+                    if k not in index_by_key:
+                        index_by_key[k] = len(normalized_existing)
+                        normalized_existing.append(normalized)
+
+            added = 0
+            updated = 0
+            for entry in entries:
+                normalized, issues, _ = self._normalize_entry(entry, None)
+                if normalized and not issues:
+                    k = key_for(normalized)
+                    if k in index_by_key:
+                        idx = index_by_key[k]
+                        # Only rewrite hint_prompt; keep paths stable.
+                        if normalized_existing[idx].get("hint_prompt") != normalized.get("hint_prompt"):
+                            normalized_existing[idx]["hint_prompt"] = normalized.get("hint_prompt", "")
+                            updated += 1
+                    else:
+                        index_by_key[k] = len(normalized_existing)
+                        normalized_existing.append(normalized)
+                        added += 1
+
+            if (added == 0 and updated == 0) and os.path.exists(json_file):
+                return {"added": 0, "updated": 0}
+
+            os.makedirs(os.path.dirname(json_file), exist_ok=True)
+            self._write_json_data(json_file, normalized_existing)
+            # Use (added+updated) to drive rolling backup cadence.
+            self.register_write(json_file, added + updated)
+            return {"added": added, "updated": updated}
+        finally:
+            self._release_lock(lock_file)
+
     def replace_entries(self, json_file: str, entries: List[Dict], reason: str = 'repair') -> Optional[str]:
         backup_path = self.create_backup(json_file, reason='restorepoint') if os.path.exists(json_file) else None
         lock_file = self._acquire_lock(json_file)
@@ -579,6 +698,9 @@ class JsonaBackupManager:
             'invalid_entry_count': report.get('invalid_entry_count', 0),
             'duplicate_count': report.get('duplicate_count', 0),
             'missing_file_count': report.get('missing_file_count', 0),
+            'prompt_conflict_count': report.get('prompt_conflict_count', 0),
+            'merge_duplicate_count': report.get('merge_duplicate_count', 0),
+            'merge_prompt_conflict_count': report.get('merge_prompt_conflict_count', 0),
             'type_mismatch_count': report.get('type_mismatch_count', 0),
             'fixed_field_count': report.get('fixed_field_count', 0),
             'actual_task_ids': report.get('actual_task_ids', []),
@@ -591,6 +713,8 @@ class JsonaBackupManager:
         issue_entries = [item['entry'] for item in report.get('missing_entries', [])]
         issue_entries.extend(item['entry'] for item in report.get('problem_entries', []))
         issue_entries.extend(item['entry'] for item in report.get('duplicate_entries', []))
+        issue_entries.extend(item['entry'] for item in report.get('prompt_conflicts', []))
+        issue_entries.extend(item['entry'] for item in report.get('merge_prompt_conflicts', []))
 
         issue_path = ''
         if issue_entries:
@@ -602,6 +726,97 @@ class JsonaBackupManager:
             'summary': summary_path,
             'issues': issue_path,
         }
+
+    def merge_entries_into_file(self, json_file: str, entries: List[Dict]) -> Dict:
+        """
+        Merge entries into a managed JSONA file with conflict reporting.
+
+        For text tasks (`tag/nl/xml`), same-image same-task entries with different
+        prompt text are treated as conflicts and are not silently overwritten.
+        """
+        if not entries:
+            return {
+                'added': 0,
+                'duplicate_count': 0,
+                'prompt_conflict_count': 0,
+                'prompt_conflicts': [],
+            }
+
+        self.ensure_session_backup(json_file)
+        lock_file = self._acquire_lock(json_file)
+        try:
+            existing_data = []
+            if os.path.exists(json_file):
+                try:
+                    raw_data = self._read_json_data(json_file)
+                except Exception as exc:
+                    raise ValueError(
+                        f'Existing JSONA is invalid and was not merged: {json_file}. Repair or restore it before continuing. {exc}'
+                    ) from exc
+
+                existing_entries, _ = self._coerce_entries(raw_data)
+                if not isinstance(existing_entries, list):
+                    raise ValueError(
+                        f'Existing JSONA top-level structure is invalid and was not merged: {json_file}. Repair or restore it before continuing.'
+                    )
+                existing_data = existing_entries
+
+            normalized_existing: List[Dict] = []
+            index_by_key: Dict[Tuple[str, str, str], int] = {}
+            for item in existing_data:
+                normalized, issues, _ = self._normalize_entry(item, None)
+                if normalized and not issues:
+                    key = self._merge_key(normalized)
+                    if key not in index_by_key:
+                        index_by_key[key] = len(normalized_existing)
+                        normalized_existing.append(normalized)
+
+            added = 0
+            duplicate_count = 0
+            prompt_conflicts: List[Dict] = []
+            for entry in entries:
+                normalized, issues, _ = self._normalize_entry(entry, None)
+                if not normalized or issues:
+                    continue
+                key = self._merge_key(normalized)
+                if key in index_by_key:
+                    existing = normalized_existing[index_by_key[key]]
+                    if (
+                        normalized.get('task_id') in self.TEXT_TASKS
+                        and existing.get('hint_prompt', '') != normalized.get('hint_prompt', '')
+                    ):
+                        prompt_conflicts.append({
+                            'reason': 'prompt_conflict',
+                            'entry': normalized,
+                            'existing_entry': deepcopy(existing),
+                        })
+                    else:
+                        duplicate_count += 1
+                    continue
+
+                index_by_key[key] = len(normalized_existing)
+                normalized_existing.append(normalized)
+                added += 1
+
+            if added == 0 and os.path.exists(json_file):
+                return {
+                    'added': 0,
+                    'duplicate_count': duplicate_count,
+                    'prompt_conflict_count': len(prompt_conflicts),
+                    'prompt_conflicts': prompt_conflicts,
+                }
+
+            os.makedirs(os.path.dirname(json_file), exist_ok=True)
+            self._write_json_data(json_file, normalized_existing)
+            self.register_write(json_file, added)
+            return {
+                'added': added,
+                'duplicate_count': duplicate_count,
+                'prompt_conflict_count': len(prompt_conflicts),
+                'prompt_conflicts': prompt_conflicts,
+            }
+        finally:
+            self._release_lock(lock_file)
 
     def import_jsona(self, source_path: str, output_dir: str, verify_files: bool = False) -> Dict:
         raw_data = self._read_json_data(source_path)
@@ -618,5 +833,96 @@ class JsonaBackupManager:
         report['top_level_fixed'] = top_level_key is not None
         report['target_name'] = target_name
         report['target_file'] = os.path.join(output_dir, f'{target_name}.jsona')
-        report['imported_count'] = self.append_entries(report['target_file'], report['valid_entries'])
+        entries_to_merge = report['existing_entries'] if verify_files else report['valid_entries']
+        merge_result = self.merge_entries_into_file(report['target_file'], entries_to_merge)
+        report['imported_count'] = merge_result.get('added', 0)
+        report['merge_duplicate_count'] = merge_result.get('duplicate_count', 0)
+        report['merge_prompt_conflict_count'] = merge_result.get('prompt_conflict_count', 0)
+        report['merge_prompt_conflicts'] = merge_result.get('prompt_conflicts', [])
         return report
+
+    def merge_jsona_files(self, source_paths: List[str], output_dir: str, verify_files: bool = False) -> Dict:
+        """
+        Merge multiple JSONA files into managed output files grouped by target type.
+
+        Files are auto-grouped by detected target name. Same-type files are concatenated
+        into the managed target file with duplicate suppression.
+        """
+        if not source_paths:
+            raise ValueError('No JSONA files selected for merge.')
+
+        groups: Dict[str, Dict] = {}
+        per_file_reports: List[Dict] = []
+
+        for source_path in source_paths:
+            raw_data = self._read_json_data(source_path)
+            entries, top_level_key = self._coerce_entries(raw_data)
+            if entries is None:
+                raise ValueError(f'JSONA top-level structure is not a list: {source_path}')
+
+            target_name = self.detect_target_name(source_path, entries)
+            if not target_name:
+                raise ValueError(
+                    f'Cannot determine JSONA target type: {source_path}. '
+                    'Please use canny/pose/depth/tag/nl/xml/metadata naming or valid task_id values.'
+                )
+
+            expected_name = self._target_name_to_expected(target_name)
+            report = self.analyze_entries(entries, expected_name=expected_name, check_files=verify_files, source_path=source_path)
+            report['top_level_fixed'] = top_level_key is not None
+            report['target_name'] = target_name
+            report['target_file'] = os.path.join(output_dir, f'{target_name}.jsona')
+            per_file_reports.append(report)
+
+            group = groups.setdefault(target_name, {
+                'target_name': target_name,
+                'target_file': report['target_file'],
+                'source_files': [],
+                'entries_to_merge': [],
+                'entry_count': 0,
+                'valid_entry_count': 0,
+                'existing_entry_count': 0,
+                'invalid_entry_count': 0,
+                'duplicate_count': 0,
+                'missing_file_count': 0,
+                'prompt_conflict_count': 0,
+                'type_mismatch_count': 0,
+                'fixed_field_count': 0,
+                'imported_count': 0,
+                'merge_duplicate_count': 0,
+                'merge_prompt_conflict_count': 0,
+                'merge_prompt_conflicts': [],
+                'prompt_conflicts': [],
+            })
+
+            group['source_files'].append(source_path)
+            source_entries = report.get('existing_entries', []) if verify_files else report.get('valid_entries', [])
+            group['entries_to_merge'].extend(source_entries)
+            for key in (
+                'entry_count',
+                'valid_entry_count',
+                'existing_entry_count',
+                'invalid_entry_count',
+                'duplicate_count',
+                'missing_file_count',
+                'prompt_conflict_count',
+                'type_mismatch_count',
+                'fixed_field_count',
+            ):
+                group[key] += int(report.get(key, 0))
+            group['prompt_conflicts'].extend(report.get('prompt_conflicts', []))
+
+        for group in groups.values():
+            merge_result = self.merge_entries_into_file(group['target_file'], group['entries_to_merge'])
+            group['imported_count'] = merge_result.get('added', 0)
+            group['merge_duplicate_count'] = merge_result.get('duplicate_count', 0)
+            group['merge_prompt_conflict_count'] = merge_result.get('prompt_conflict_count', 0)
+            group['merge_prompt_conflicts'] = merge_result.get('prompt_conflicts', [])
+
+        return {
+            'group_count': len(groups),
+            'file_count': len(source_paths),
+            'verify_files': verify_files,
+            'groups': list(groups.values()),
+            'files': per_file_reports,
+        }

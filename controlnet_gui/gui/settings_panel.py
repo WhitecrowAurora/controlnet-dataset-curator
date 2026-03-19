@@ -5,19 +5,25 @@ Data source selection, thread count, output path configuration
 
 import os
 import json
+import sys
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QSpinBox, QComboBox,
     QCheckBox, QFileDialog, QFormLayout, QListWidget, QTextEdit, QProgressBar,
-    QDialog, QDialogButtonBox, QListWidgetItem, QMessageBox, QRadioButton, QApplication
+    QDialog, QDialogButtonBox, QListWidgetItem, QMessageBox, QRadioButton, QApplication,
+    QDoubleSpinBox, QTabBar, QStackedWidget, QSizePolicy
 )
-from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot, Qt
+from PyQt5.QtCore import pyqtSignal, QThread, pyqtSlot, Qt, QUrl, QTimer, QProcess
+from PyQt5.QtGui import QDesktopServices
 from ..language import tr
 from ..core.parquet_source import ParquetDataSource, StreamingDataSource
 from ..core.jsona_backup import JsonaBackupManager
+from ..core.fusion_score_filter import FusionScoreFilter
+from ..core.progress_manager import ProgressManager
 from ..core.tag_formats import build_xml_fragment
 
 
@@ -94,6 +100,127 @@ class TextImportDialog(QDialog):
 
     def get_text(self) -> str:
         return self.text_edit.toPlainText()
+
+
+class ProcessConsoleDialog(QDialog):
+    """Simple console dialog for running an external process."""
+
+    def __init__(self, parent, title: str, program: str, arguments: list, intro_text: str = ''):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(760, 520)
+
+        self.program = program
+        self.arguments = list(arguments or [])
+        self.process = None
+        self.success = False
+
+        layout = QVBoxLayout(self)
+
+        if intro_text:
+            label = QLabel(intro_text)
+            label.setWordWrap(True)
+            layout.addWidget(label)
+
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setStyleSheet(
+            "background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas, monospace;"
+        )
+        layout.addWidget(self.console)
+
+        self.close_button = QPushButton('请稍候...')
+        self.close_button.setEnabled(False)
+        self.close_button.clicked.connect(self.accept)
+        layout.addWidget(self.close_button)
+
+        self._start_process()
+
+    def _start_process(self):
+        self.process = QProcess(self)
+        self.process.readyReadStandardOutput.connect(self._handle_stdout)
+        self.process.readyReadStandardError.connect(self._handle_stderr)
+        self.process.finished.connect(self._handle_finished)
+        self.console.append(f"$ {self.program} {' '.join(self.arguments)}\n")
+        self.process.start(self.program, self.arguments)
+
+    def _append_output(self, text: str):
+        if not text:
+            return
+        self.console.append(text)
+        self.console.verticalScrollBar().setValue(self.console.verticalScrollBar().maximum())
+
+    def _handle_stdout(self):
+        data = self.process.readAllStandardOutput()
+        self._append_output(bytes(data).decode('utf-8', errors='ignore'))
+
+    def _handle_stderr(self):
+        data = self.process.readAllStandardError()
+        self._append_output(bytes(data).decode('utf-8', errors='ignore'))
+
+    def _handle_finished(self, exit_code, exit_status):
+        self.success = (exit_code == 0 and exit_status == QProcess.NormalExit)
+        self.console.append('\n' + '=' * 60)
+        self.console.append('[成功] 执行完成' if self.success else '[失败] 执行失败')
+        self.console.append('=' * 60 + '\n')
+        self.close_button.setText('关闭')
+        self.close_button.setEnabled(True)
+
+
+class ScoreFilterProgressCountThread(QThread):
+    """Count current custom-directory files and matched score-progress entries."""
+
+    counted = pyqtSignal(int, int, int)
+    failed = pyqtSignal(int, str)
+
+    SUPPORTED_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+    def __init__(self, request_id: int, custom_dir: str, progress_file: str, parent=None):
+        super().__init__(parent)
+        self.request_id = int(request_id)
+        self.custom_dir = str(custom_dir or '').strip()
+        self.progress_file = str(progress_file or '').strip()
+
+    @staticmethod
+    def _normalize_path(path: Path) -> str:
+        return str(path.resolve()).replace('\\', '/').lower()
+
+    def run(self):
+        try:
+            if not self.custom_dir:
+                self.counted.emit(self.request_id, 0, 0)
+                return
+
+            custom_dir = Path(self.custom_dir).expanduser().resolve()
+            if not custom_dir.exists() or not custom_dir.is_dir():
+                self.counted.emit(self.request_id, 0, 0)
+                return
+
+            image_paths = []
+            for ext in self.SUPPORTED_EXTENSIONS:
+                image_paths.extend(custom_dir.glob(f'*{ext}'))
+                image_paths.extend(custom_dir.glob(f'*{ext.upper()}'))
+
+            normalized_image_keys = {
+                f"{self._normalize_path(path)}::prefilter_score"
+                for path in image_paths
+                if path.is_file()
+            }
+            total = len(normalized_image_keys)
+            if total <= 0:
+                self.counted.emit(self.request_id, 0, 0)
+                return
+
+            processed = 0
+            if self.progress_file and os.path.exists(self.progress_file):
+                progress_manager = ProgressManager(self.progress_file)
+                processed_keys = progress_manager.get_processed_set()
+                processed = sum(1 for key in normalized_image_keys if key in processed_keys)
+
+            self.counted.emit(self.request_id, processed, total)
+        except Exception as e:
+            self.failed.emit(self.request_id, str(e))
 
 
 class SettingsHistoryDialog(QDialog):
@@ -394,6 +521,17 @@ class SettingsPanel(QWidget):
         self._settings_tracking_suspended = True
         self._settings_history_limit = 500
         self._last_saved_flat_settings = None
+        self._maintenance_prompt_timers = {}
+        self._maintenance_prompt_pending = {}
+        self._maintenance_prompt_handled = {}
+        self._score_filter_toggle_guard = False
+        self._score_filter_count_request_id = 0
+        self._score_filter_count_thread = None
+        self._score_filter_count_pending_restart = False
+        self._score_filter_progress_counts = {'processed': 0, 'total': 0}
+        self._score_filter_progress_refresh_timer = QTimer(self)
+        self._score_filter_progress_refresh_timer.setSingleShot(True)
+        self._score_filter_progress_refresh_timer.timeout.connect(self._start_score_filter_progress_count)
 
         # Track if we've already checked dependencies/models this session
         self._vitpose_deps_checked = False
@@ -509,19 +647,39 @@ class SettingsPanel(QWidget):
             QPushButton:pressed {
                 background-color: #2d2d2d;
             }
+            QTabBar::tab {
+                background-color: #2d2d2d;
+                color: #cccccc;
+                border: 1px solid #444;
+                border-bottom: none;
+                padding: 8px 14px;
+                margin-right: 4px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: #0078d4;
+                color: #ffffff;
+            }
+            QTabBar::tab:!selected {
+                margin-top: 3px;
+            }
         """)
 
         # Data source settings
         data_source_group = self._create_data_source_group()
         main_layout.addWidget(data_source_group)
 
-        # Retry and custom tags settings
-        advanced_group = self._create_advanced_group()
-        main_layout.addWidget(advanced_group)
+        mode_switch_group = self._create_mode_switch_group()
+        main_layout.addWidget(mode_switch_group)
 
         # Processing settings
         processing_group = self._create_processing_group()
         main_layout.addWidget(processing_group)
+
+        # Retry and custom tags settings
+        advanced_group = self._create_advanced_group()
+        main_layout.addWidget(advanced_group)
 
         # Output settings
         output_group = self._create_output_group()
@@ -830,6 +988,29 @@ class SettingsPanel(QWidget):
 
         return group
 
+    def _create_mode_switch_group(self) -> QGroupBox:
+        """Create top-level mode switch tabs."""
+        group = QGroupBox('运行模式')
+        layout = QVBoxLayout(group)
+
+        note = QLabel(
+            '用 Tab 直接切换当前工作模式。切换后，下面的处理设置和高级设置会显示对应模式的面板。'
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888;')
+        layout.addWidget(note)
+
+        self.tab_processing_mode = QTabBar()
+        self.tab_processing_mode.setExpanding(True)
+        self.tab_processing_mode.addTab('ControlNet 图片生成模式')
+        self.tab_processing_mode.addTab('图片评分模式')
+        self.tab_processing_mode.setTabToolTip(0, '生成并筛选 Canny / Pose / Depth 控制图。')
+        self.tab_processing_mode.setTabToolTip(1, '只对原图做评分与筛选，不生成控制图。')
+        self.tab_processing_mode.setCurrentIndex(0)
+        layout.addWidget(self.tab_processing_mode)
+
+        return group
+
     def _get_repo_root(self) -> str:
         return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
@@ -863,6 +1044,7 @@ class SettingsPanel(QWidget):
             'custom_input_dir': self.edit_custom_input_dir.text(),
             'processing_threads': self.spin_processing_threads.value(),
             'preload_count': self.spin_preload_count.value(),
+            'processing_mode': self._current_processing_mode(),
             'canny_enabled': self.check_canny.isChecked(),
             'openpose_enabled': self.check_openpose.isChecked(),
             'depth_enabled': self.check_depth.isChecked(),
@@ -873,6 +1055,14 @@ class SettingsPanel(QWidget):
             'pose_reject': self.spin_pose_reject.value(),
             'depth_accept': self.spin_depth_accept.value(),
             'depth_reject': self.spin_depth_reject.value(),
+            'score_filter_enabled': self.check_score_filter_enabled.isChecked(),
+            'score_filter_checkpoint_path': self.edit_score_checkpoint_path.text(),
+            'score_filter_cache_root': self.edit_score_cache_root.text(),
+            'score_filter_device': self.combo_score_device.currentText(),
+            'score_filter_min_aesthetic': self.spin_score_min_aesthetic.value(),
+            'score_filter_require_in_domain': self.check_score_require_in_domain.isChecked(),
+            'score_filter_min_in_domain_prob': self.spin_score_min_in_domain_prob.value(),
+            'score_mode_auto_accept': self.spin_score_mode_auto_accept.value(),
             'openpose_model': self.combo_openpose_model.currentText(),
             'openpose_yolo_version': self.combo_yolo_version.currentText(),
             'openpose_yolo_model_type': self.combo_yolo_model_type.currentText(),
@@ -928,6 +1118,7 @@ class SettingsPanel(QWidget):
             'custom_input_dir': '自定义输入目录',
             'processing_threads': '处理线程数',
             'preload_count': '预加载数量',
+            'processing_mode': '处理模式',
             'canny_enabled': '启用 Canny',
             'openpose_enabled': '启用 Pose',
             'depth_enabled': '启用 Depth',
@@ -938,6 +1129,14 @@ class SettingsPanel(QWidget):
             'pose_reject': 'Pose 自动拒绝',
             'depth_accept': 'Depth 自动接受',
             'depth_reject': 'Depth 自动拒绝',
+            'score_filter_enabled': '启用原图评分筛选',
+            'score_filter_checkpoint_path': '评分 checkpoint 路径',
+            'score_filter_cache_root': '评分缓存目录',
+            'score_filter_device': '评分设备',
+            'score_filter_min_aesthetic': '最低美学分',
+            'score_filter_require_in_domain': '要求目标域命中',
+            'score_filter_min_in_domain_prob': '最低目标域概率',
+            'score_mode_auto_accept': '评分模式自动接受阈值',
             'openpose_model': 'Pose 模型',
             'openpose_yolo_version': 'YOLO 版本',
             'openpose_yolo_model_type': 'Pose 检测器',
@@ -1142,6 +1341,89 @@ class SettingsPanel(QWidget):
         self._record_settings_history(previous, config, reason=history_reason, force_history=force_history)
         self._last_saved_flat_settings = deepcopy(config)
         self.settings_changed.emit(self.get_settings())
+        self._schedule_maintenance_prompts(previous, config)
+
+    def _build_maintenance_signature(self, flat_settings: dict, keys: set) -> str:
+        payload = {
+            key: deepcopy(flat_settings.get(key))
+            for key in sorted(keys)
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _schedule_maintenance_prompt(self, category: str, signature: str):
+        if self._settings_tracking_suspended or not signature:
+            return
+
+        self._maintenance_prompt_pending[category] = signature
+        timer = self._maintenance_prompt_timers.get(category)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda c=category: self._run_maintenance_prompt(c))
+            self._maintenance_prompt_timers[category] = timer
+        timer.start(800)
+
+    def _schedule_maintenance_prompts(self, previous: dict, current: dict):
+        changed_keys = {
+            key
+            for key in set(previous.keys()) | set(current.keys())
+            if previous.get(key) != current.get(key)
+        }
+        if not changed_keys:
+            return
+
+        xml_keys = {
+            'xml_template_path',
+            'xml_artist_field_path',
+            'xml_artist_tag_index',
+            'xml_character1_field_path',
+            'xml_character1_tag_index',
+            'xml_character2_field_path',
+            'xml_character2_tag_index',
+            'xml_custom_mappings',
+        }
+        text_keys = {
+            'append_tags',
+            'custom_tags',
+        }
+        score_filter_keys = {
+            'score_filter_checkpoint_path',
+            'score_filter_min_aesthetic',
+            'score_filter_require_in_domain',
+            'score_filter_min_in_domain_prob',
+            'score_mode_auto_accept',
+        }
+
+        if changed_keys & xml_keys:
+            self._schedule_maintenance_prompt(
+                'xml_jsona',
+                self._build_maintenance_signature(current, xml_keys),
+            )
+        if changed_keys & text_keys:
+            self._schedule_maintenance_prompt(
+                'text_jsona',
+                self._build_maintenance_signature(current, text_keys),
+            )
+        if changed_keys & score_filter_keys:
+            self._schedule_maintenance_prompt(
+                'score_filter_progress',
+                self._build_maintenance_signature(current, score_filter_keys),
+            )
+
+    def _run_maintenance_prompt(self, category: str):
+        signature = self._maintenance_prompt_pending.get(category, '')
+        if not signature or self._maintenance_prompt_handled.get(category) == signature:
+            return
+
+        try:
+            if category == 'xml_jsona':
+                self._prompt_reset_xml_jsona()
+            elif category == 'text_jsona':
+                self._prompt_reset_text_jsona()
+            elif category == 'score_filter_progress':
+                self._prompt_reset_score_filter_progress()
+        finally:
+            self._maintenance_prompt_handled[category] = signature
 
     def load_settings(self):
         """Load settings from config file"""
@@ -1150,177 +1432,15 @@ class SettingsPanel(QWidget):
         if not os.path.exists(config_file):
             return
 
-        previous_state = self._settings_tracking_suspended
-        self._settings_tracking_suspended = True
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-
-            # Restore settings
-            if 'data_source_type' in config:
-                self.combo_source_type.setCurrentIndex(config['data_source_type'])
-            if 'local_parquet_files' in config:
-                self.list_parquet_files.clear()
-                for file_path in config.get('local_parquet_files') or []:
-                    self.list_parquet_files.addItem(str(file_path))
-            if 'local_num_samples' in config:
-                self.spin_local_samples.setValue(int(config['local_num_samples']))
-            if 'dataset_id' in config:
-                self.edit_dataset_id.setText(config['dataset_id'])
-            if 'split' in config:
-                self.edit_split.setText(config['split'])
-            if 'hf_token' in config:
-                self.edit_hf_token.setText(config['hf_token'])
-            if 'num_samples' in config:
-                self.spin_num_samples.setValue(config['num_samples'])
-            if 'user_prefix' in config:
-                self.edit_user_prefix.setText(config['user_prefix'])
-            if 'skip_count' in config:
-                self.spin_skip_count.setValue(config['skip_count'])
-            if 'enable_multithread' in config:
-                self.check_multithread.setChecked(config['enable_multithread'])
-            else:
-                # Default to True if not in config
-                self.check_multithread.setChecked(True)
-            if 'thread_count' in config:
-                # Use saved value, but ensure it's at least 2 if multi-threading is enabled
-                saved_threads = config['thread_count']
-                if saved_threads < 2 and config.get('enable_multithread', False):
-                    # If saved value is too low, use auto-detected value
-                    cpu_count = os.cpu_count() or 4
-                    saved_threads = max(2, cpu_count - 1)
-                self.spin_thread_count.setValue(saved_threads)
-            if 'streaming_extract_dir' in config:
-                self.edit_streaming_extract_dir.setText(config['streaming_extract_dir'])
-            if 'local_extract_dir' in config:
-                self.edit_extract_dir.setText(config['local_extract_dir'])
-
-            # Processing settings
-            if 'use_custom_dir' in config:
-                self.radio_use_custom_dir.setChecked(config['use_custom_dir'])
-                self.radio_use_data_source.setChecked(not config['use_custom_dir'])
-            if 'custom_input_dir' in config:
-                self.edit_custom_input_dir.setText(config['custom_input_dir'])
-            if 'processing_threads' in config:
-                self.spin_processing_threads.setValue(config['processing_threads'])
-            if 'preload_count' in config:
-                self.spin_preload_count.setValue(config['preload_count'])
-
-            # Control types
-            if 'canny_enabled' in config:
-                self.check_canny.setChecked(config['canny_enabled'])
-            if 'openpose_enabled' in config:
-                self.check_openpose.setChecked(config['openpose_enabled'])
-            if 'depth_enabled' in config:
-                self.check_depth.setChecked(config['depth_enabled'])
-
-            # Model settings
-            if 'openpose_model' in config:
-                self.combo_openpose_model.setCurrentText(config['openpose_model'])
-            if 'openpose_yolo_version' in config:
-                self.combo_yolo_version.setCurrentText(config['openpose_yolo_version'])
-            if 'openpose_yolo_model_type' in config:
-                self.combo_yolo_model_type.setCurrentText(config['openpose_yolo_model_type'])
-            if 'openpose_custom_path' in config:
-                self.edit_openpose_path.setText(config['openpose_custom_path'])
-            if 'depth_model' in config:
-                self.combo_depth_model.setCurrentText(config['depth_model'])
-            if 'depth_custom_path' in config:
-                self.edit_depth_path.setText(config['depth_custom_path'])
-
-            # Quality profile and thresholds
-            if 'quality_profile' in config:
-                self.combo_quality_profile.setCurrentText(config['quality_profile'])
-            if 'canny_accept' in config:
-                self.spin_canny_accept.setValue(config['canny_accept'])
-            if 'canny_reject' in config:
-                self.spin_canny_reject.setValue(config['canny_reject'])
-            if 'pose_accept' in config:
-                self.spin_pose_accept.setValue(config['pose_accept'])
-            if 'pose_reject' in config:
-                self.spin_pose_reject.setValue(config['pose_reject'])
-            if 'depth_accept' in config:
-                self.spin_depth_accept.setValue(config['depth_accept'])
-            if 'depth_reject' in config:
-                self.spin_depth_reject.setValue(config['depth_reject'])
-
-            # Advanced settings
-            if 'parallel_threads' in config:
-                self.spin_parallel_threads.setValue(config['parallel_threads'])
-            if 'auto_pass_no_review' in config:
-                self.check_auto_pass_no_review.setChecked(config['auto_pass_no_review'])
-            if 'single_jsona' in config:
-                self.check_single_jsona.setChecked(config['single_jsona'])
-            if 'jsona_backup_every_entries' in config:
-                self.spin_jsona_backup_every_entries.setValue(config['jsona_backup_every_entries'])
-            if 'jsona_backup_every_seconds' in config:
-                self.spin_jsona_backup_every_seconds.setValue(config['jsona_backup_every_seconds'])
-            if 'jsona_backup_keep' in config:
-                self.spin_jsona_backup_keep.setValue(config['jsona_backup_keep'])
-            if 'unattended_mode' in config:
-                self.check_unattended_mode.setChecked(bool(config['unattended_mode']))
-            if 'unattended_inbox_max_mb' in config:
-                try:
-                    self.spin_unattended_inbox_max_mb.setValue(int(config['unattended_inbox_max_mb']))
-                except Exception:
-                    pass
-            if 'unattended_inbox_full_action' in config:
-                act = str(config['unattended_inbox_full_action']).lower()
-                self.combo_unattended_inbox_full_action.setCurrentIndex(0 if act == 'pause' else 1)
-            if 'vlm_backend' in config:
-                self.combo_vlm_backend.setCurrentText(str(config['vlm_backend']))
-            if 'vlm_base_url' in config:
-                self.edit_vlm_base_url.setText(str(config['vlm_base_url']))
-            if 'vlm_model' in config:
-                self.edit_vlm_model.setText(str(config['vlm_model']))
-            if 'vlm_api_key' in config:
-                self.edit_vlm_api_key.setText(str(config['vlm_api_key']))
-            if 'vlm_timeout_seconds' in config:
-                try:
-                    self.spin_vlm_timeout.setValue(int(config['vlm_timeout_seconds']))
-                except Exception:
-                    pass
-            if 'xml_template_path' in config:
-                self.edit_xml_template_path.setText(str(config['xml_template_path']))
-                try:
-                    self._analyze_xml_template()
-                except Exception:
-                    pass
-            if 'xml_artist_field_path' in config:
-                self.combo_xml_artist_field.setCurrentText(str(config['xml_artist_field_path']))
-            if 'xml_artist_tag_index' in config:
-                self.spin_xml_artist_tag_index.setValue(int(config['xml_artist_tag_index']))
-            if 'xml_character1_field_path' in config:
-                self.combo_xml_character1_field.setCurrentText(str(config['xml_character1_field_path']))
-            if 'xml_character1_tag_index' in config:
-                self.spin_xml_character1_tag_index.setValue(int(config['xml_character1_tag_index']))
-            if 'xml_character2_field_path' in config:
-                self.combo_xml_character2_field.setCurrentText(str(config['xml_character2_field_path']))
-            if 'xml_character2_tag_index' in config:
-                self.spin_xml_character2_tag_index.setValue(int(config['xml_character2_tag_index']))
-            if 'xml_custom_mappings' in config:
-                self._load_xml_custom_mappings(config['xml_custom_mappings'])
-            if 'enable_retry' in config:
-                self.check_enable_retry.setChecked(config['enable_retry'])
-            if 'max_retries' in config:
-                self.spin_max_retries.setValue(config['max_retries'])
-
-            # Custom tags
-            if 'append_tags' in config:
-                self.check_append_tags.setChecked(config['append_tags'])
-            if 'custom_tags' in config:
-                self.edit_custom_tags.setPlainText(config['custom_tags'])
-
-            # Output
-            if 'output_dir' in config:
-                self.edit_output_dir.setText(config['output_dir'])
-            if 'discard_action' in config:
-                self.combo_discard_action.setCurrentText(config['discard_action'])
-
         except Exception as e:
             print(f"Failed to load settings: {e}")
-        finally:
-            self._settings_tracking_suspended = previous_state
+            return
+
+        self._apply_flat_settings(config)
+        return
 
     def _apply_flat_settings(self, config: dict):
         if not isinstance(config, dict):
@@ -1371,6 +1491,8 @@ class SettingsPanel(QWidget):
                 self.spin_processing_threads.setValue(int(config['processing_threads']))
             if 'preload_count' in config:
                 self.spin_preload_count.setValue(int(config['preload_count']))
+            if 'processing_mode' in config:
+                self._set_processing_mode(str(config['processing_mode']))
             if 'canny_enabled' in config:
                 self.check_canny.setChecked(bool(config['canny_enabled']))
             if 'openpose_enabled' in config:
@@ -1389,6 +1511,22 @@ class SettingsPanel(QWidget):
                 self.combo_depth_model.setCurrentText(str(config['depth_model']))
             if 'depth_custom_path' in config:
                 self.edit_depth_path.setText(str(config['depth_custom_path']))
+            if 'score_filter_enabled' in config:
+                self.check_score_filter_enabled.setChecked(bool(config['score_filter_enabled']))
+            if 'score_filter_checkpoint_path' in config:
+                self.edit_score_checkpoint_path.setText(str(config['score_filter_checkpoint_path']))
+            if 'score_filter_cache_root' in config:
+                self.edit_score_cache_root.setText(str(config['score_filter_cache_root']))
+            if 'score_filter_device' in config:
+                self.combo_score_device.setCurrentText(str(config['score_filter_device']).lower())
+            if 'score_filter_min_aesthetic' in config:
+                self.spin_score_min_aesthetic.setValue(float(config['score_filter_min_aesthetic']))
+            if 'score_filter_require_in_domain' in config:
+                self.check_score_require_in_domain.setChecked(bool(config['score_filter_require_in_domain']))
+            if 'score_filter_min_in_domain_prob' in config:
+                self.spin_score_min_in_domain_prob.setValue(float(config['score_filter_min_in_domain_prob']))
+            if 'score_mode_auto_accept' in config:
+                self.spin_score_mode_auto_accept.setValue(float(config['score_mode_auto_accept']))
             if 'quality_profile' in config:
                 self.combo_quality_profile.setCurrentText(str(config['quality_profile']))
             if 'canny_accept' in config:
@@ -1471,6 +1609,10 @@ class SettingsPanel(QWidget):
         finally:
             self._settings_tracking_suspended = previous_state
 
+        self._update_score_filter_controls()
+        self._update_processing_mode_controls()
+        self._refresh_score_filter_status()
+        self._schedule_score_filter_progress_count_refresh()
         self._refresh_xml_preview()
         self._update_jsona_statistics()
 
@@ -1494,8 +1636,12 @@ class SettingsPanel(QWidget):
         # Processing and output settings
         self.radio_use_custom_dir.toggled.connect(lambda: self.save_settings())
         self.edit_custom_input_dir.textChanged.connect(lambda: self.save_settings())
+        self.radio_use_custom_dir.toggled.connect(lambda _checked: self._schedule_score_filter_progress_count_refresh())
+        self.edit_custom_input_dir.textChanged.connect(lambda _text: self._schedule_score_filter_progress_count_refresh())
         self.spin_processing_threads.valueChanged.connect(lambda: self.save_settings())
         self.spin_preload_count.valueChanged.connect(lambda: self.save_settings())
+        self.tab_processing_mode.currentChanged.connect(lambda: self.save_settings())
+        self.tab_processing_mode.currentChanged.connect(self._update_processing_mode_controls)
         self.check_canny.stateChanged.connect(lambda: self.save_settings())
         self.check_openpose.stateChanged.connect(lambda: self.save_settings())
         self.check_depth.stateChanged.connect(lambda: self.save_settings())
@@ -1549,6 +1695,18 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.valueChanged.connect(lambda: self.save_settings())
         self.spin_depth_accept.valueChanged.connect(lambda: self.save_settings())
         self.spin_depth_reject.valueChanged.connect(lambda: self.save_settings())
+        self.check_score_filter_enabled.stateChanged.connect(self._on_score_filter_enabled_changed)
+        self.edit_score_checkpoint_path.textChanged.connect(lambda: self.save_settings())
+        self.edit_score_checkpoint_path.textChanged.connect(lambda: self._refresh_score_filter_status())
+        self.edit_score_cache_root.textChanged.connect(lambda: self.save_settings())
+        self.edit_score_cache_root.textChanged.connect(lambda: self._refresh_score_filter_status())
+        self.combo_score_device.currentTextChanged.connect(lambda: self.save_settings())
+        self.combo_score_device.currentTextChanged.connect(lambda: self._refresh_score_filter_status())
+        self.spin_score_min_aesthetic.valueChanged.connect(lambda: self.save_settings())
+        self.check_score_require_in_domain.stateChanged.connect(lambda: self.save_settings())
+        self.check_score_require_in_domain.stateChanged.connect(lambda: self._update_score_filter_controls())
+        self.spin_score_min_in_domain_prob.valueChanged.connect(lambda: self.save_settings())
+        self.spin_score_mode_auto_accept.valueChanged.connect(lambda: self.save_settings())
         self.combo_quality_profile.currentIndexChanged.connect(self._on_profile_changed)
 
     def _on_profile_changed(self):
@@ -1578,28 +1736,37 @@ class SettingsPanel(QWidget):
         self.save_settings()
 
     def _create_advanced_group(self) -> QGroupBox:
-        """Create advanced settings group (retry + custom tags + parallel processing)"""
+        """Create advanced settings group."""
         group = QGroupBox(tr('advanced'))
         main_layout = QHBoxLayout(group)
 
-        # Left side: existing settings
         left_layout = QVBoxLayout()
+        self.advanced_mode_stack = QStackedWidget()
+        self.advanced_mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
-        # Smart retry
+        controlnet_page = QWidget()
+        controlnet_page_layout = QVBoxLayout(controlnet_page)
+        controlnet_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        controlnet_note = QLabel(
+            '当前是 ControlNet 模式扩展设置：这里放生成控制图时才会用到的运行策略。'
+        )
+        controlnet_note.setWordWrap(True)
+        controlnet_note.setStyleSheet('color: #888;')
+        controlnet_page_layout.addWidget(controlnet_note)
+
         retry_layout = QHBoxLayout()
         self.check_enable_retry = QCheckBox(tr('enable_retry'))
         self.check_enable_retry.setChecked(True)
         retry_layout.addWidget(self.check_enable_retry)
-
         retry_layout.addWidget(QLabel(tr('max_retries') + ':'))
         self.spin_max_retries = QSpinBox()
         self.spin_max_retries.setRange(1, 5)
         self.spin_max_retries.setValue(2)
         retry_layout.addWidget(self.spin_max_retries)
         retry_layout.addStretch()
-        left_layout.addLayout(retry_layout)
+        controlnet_page_layout.addLayout(retry_layout)
 
-        # Parallel processing threads
         parallel_layout = QHBoxLayout()
         parallel_layout.addWidget(QLabel('并行处理线程数:'))
         self.spin_parallel_threads = QSpinBox()
@@ -1613,17 +1780,13 @@ class SettingsPanel(QWidget):
             "根据显卡显存调整: 8GB → 2-3, 12GB+ → 3-4"
         )
         parallel_layout.addWidget(self.spin_parallel_threads)
-
-        # Auto button (set to 3 as recommended)
         btn_auto_parallel = QPushButton('自动')
         btn_auto_parallel.setMaximumWidth(50)
         btn_auto_parallel.clicked.connect(lambda: self.spin_parallel_threads.setValue(3))
         parallel_layout.addWidget(btn_auto_parallel)
-
         parallel_layout.addStretch()
-        left_layout.addLayout(parallel_layout)
+        controlnet_page_layout.addLayout(parallel_layout)
 
-        # Auto-pass without review
         auto_pass_layout = QHBoxLayout()
         self.check_auto_pass_no_review = QCheckBox('自动通过无需审核')
         self.check_auto_pass_no_review.setChecked(True)
@@ -1633,9 +1796,8 @@ class SettingsPanel(QWidget):
         )
         auto_pass_layout.addWidget(self.check_auto_pass_no_review)
         auto_pass_layout.addStretch()
-        left_layout.addLayout(auto_pass_layout)
+        controlnet_page_layout.addLayout(auto_pass_layout)
 
-        # Single JSONA file option
         single_jsona_layout = QHBoxLayout()
         self.check_single_jsona = QCheckBox('合并为单个 JSONA 文件')
         self.check_single_jsona.setChecked(False)
@@ -1645,67 +1807,20 @@ class SettingsPanel(QWidget):
         )
         single_jsona_layout.addWidget(self.check_single_jsona)
         single_jsona_layout.addStretch()
-        left_layout.addLayout(single_jsona_layout)
+        controlnet_page_layout.addLayout(single_jsona_layout)
+        controlnet_page_layout.addStretch()
 
-        # JSONA backup strategy
-        jsona_backup_group = QGroupBox('JSONA 备份策略')
-        jsona_backup_layout = QFormLayout(jsona_backup_group)
+        score_page = QWidget()
+        score_page_layout = QVBoxLayout(score_page)
+        score_page_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.spin_jsona_backup_every_entries = QSpinBox()
-        self.spin_jsona_backup_every_entries.setRange(10, 5000)
-        self.spin_jsona_backup_every_entries.setValue(200)
-        self.spin_jsona_backup_every_entries.setSingleStep(10)
-        self.spin_jsona_backup_every_entries.setToolTip(
-            '每追加多少条 JSONA 记录后创建一次滚动备份。'
+        score_note = QLabel(
+            '当前是图片评分模式扩展设置：这里放 VLM 辅助核对和 XML / 文本输出映射。'
         )
-        jsona_backup_layout.addRow('按条数备份:', self.spin_jsona_backup_every_entries)
+        score_note.setWordWrap(True)
+        score_note.setStyleSheet('color: #888;')
+        score_page_layout.addWidget(score_note)
 
-        self.spin_jsona_backup_every_seconds = QSpinBox()
-        self.spin_jsona_backup_every_seconds.setRange(30, 86400)
-        self.spin_jsona_backup_every_seconds.setValue(600)
-        self.spin_jsona_backup_every_seconds.setSingleStep(30)
-        self.spin_jsona_backup_every_seconds.setSuffix(' 秒')
-        self.spin_jsona_backup_every_seconds.setToolTip(
-            '即使新增条数未达到阈值，也会按这个时间间隔补一次备份。'
-        )
-        jsona_backup_layout.addRow('按时间备份:', self.spin_jsona_backup_every_seconds)
-
-        self.spin_jsona_backup_keep = QSpinBox()
-        self.spin_jsona_backup_keep.setRange(1, 100)
-        self.spin_jsona_backup_keep.setValue(10)
-        self.spin_jsona_backup_keep.setToolTip(
-            '每个 JSONA 文件保留的最新滚动备份数量。'
-        )
-        jsona_backup_layout.addRow('保留份数:', self.spin_jsona_backup_keep)
-
-        left_layout.addWidget(jsona_backup_group)
-
-        # Unattended mode (disk-backed review inbox)
-        unattended_group = QGroupBox('无人值守 (审核箱)')
-        unattended_layout = QFormLayout(unattended_group)
-
-        self.check_unattended_mode = QCheckBox('无人值守模式 (不显示中间审核图片)')
-        self.check_unattended_mode.setToolTip(
-            '开启后：需要人工审核的条目会保存到 output/review_inbox，界面不再堆积图片，适合挂机跑一整晚。'
-        )
-        unattended_layout.addRow(self.check_unattended_mode)
-
-        self.spin_unattended_inbox_max_mb = QSpinBox()
-        self.spin_unattended_inbox_max_mb.setRange(100, 102400)
-        self.spin_unattended_inbox_max_mb.setValue(2048)
-        self.spin_unattended_inbox_max_mb.setSingleStep(100)
-        self.spin_unattended_inbox_max_mb.setSuffix(' MB')
-        self.spin_unattended_inbox_max_mb.setToolTip('审核箱临时文件夹最大大小，超过后会按“满额动作”处理。')
-        unattended_layout.addRow('最大大小:', self.spin_unattended_inbox_max_mb)
-
-        self.combo_unattended_inbox_full_action = QComboBox()
-        self.combo_unattended_inbox_full_action.addItems(['自动暂停', '自动停止'])
-        self.combo_unattended_inbox_full_action.setToolTip('审核箱达到最大大小后的处理方式。')
-        unattended_layout.addRow('满额动作:', self.combo_unattended_inbox_full_action)
-
-        left_layout.addWidget(unattended_group)
-
-        # VLM config (for tag verification + NL rewrite tool)
         vlm_group = QGroupBox('VLM 推理 (Tag 核对 / NL 重写)')
         vlm_layout = QFormLayout(vlm_group)
 
@@ -1736,21 +1851,7 @@ class SettingsPanel(QWidget):
         self.spin_vlm_timeout.setValue(120)
         self.spin_vlm_timeout.setSuffix(' 秒')
         vlm_layout.addRow('超时:', self.spin_vlm_timeout)
-
-        left_layout.addWidget(vlm_group)
-
-        # Custom tags
-        tags_layout = QVBoxLayout()
-        self.check_append_tags = QCheckBox(tr('append_tags'))
-        tags_layout.addWidget(self.check_append_tags)
-
-        self.edit_custom_tags = QTextEdit()
-        self.edit_custom_tags.setMaximumHeight(60)
-        self.edit_custom_tags.setPlaceholderText(tr('tag_placeholder'))
-        self.edit_custom_tags.setEnabled(False)
-        self.check_append_tags.toggled.connect(self.edit_custom_tags.setEnabled)
-        tags_layout.addWidget(self.edit_custom_tags)
-        left_layout.addLayout(tags_layout)
+        score_page_layout.addWidget(vlm_group)
 
         xml_group = QGroupBox('XML 配置')
         xml_layout = QVBoxLayout(xml_group)
@@ -1822,7 +1923,7 @@ class SettingsPanel(QWidget):
 
         self.edit_xml_preview_output = QTextEdit()
         self.edit_xml_preview_output.setReadOnly(True)
-        self.edit_xml_preview_output.setMinimumHeight(120)
+        self.edit_xml_preview_output.setMinimumHeight(96)
         self.edit_xml_preview_output.setPlaceholderText('这里会显示 XML 片段预览')
         xml_preview_layout.addWidget(self.edit_xml_preview_output)
 
@@ -1833,10 +1934,76 @@ class SettingsPanel(QWidget):
         xml_preview_btn_row.addWidget(btn_copy_xml_preview)
         xml_preview_layout.addLayout(xml_preview_btn_row)
         xml_layout.addWidget(xml_preview_group)
+        score_page_layout.addWidget(xml_group)
+        score_page_layout.addStretch()
 
-        left_layout.addWidget(xml_group)
+        self.advanced_mode_stack.addWidget(controlnet_page)
+        self.advanced_mode_stack.addWidget(score_page)
+        left_layout.addWidget(self.advanced_mode_stack)
 
-        main_layout.addLayout(left_layout)
+        jsona_backup_group = QGroupBox('JSONA 备份策略')
+        jsona_backup_layout = QFormLayout(jsona_backup_group)
+
+        self.spin_jsona_backup_every_entries = QSpinBox()
+        self.spin_jsona_backup_every_entries.setRange(10, 5000)
+        self.spin_jsona_backup_every_entries.setValue(200)
+        self.spin_jsona_backup_every_entries.setSingleStep(10)
+        self.spin_jsona_backup_every_entries.setToolTip('每追加多少条 JSONA 记录后创建一次滚动备份。')
+        jsona_backup_layout.addRow('按条数备份:', self.spin_jsona_backup_every_entries)
+
+        self.spin_jsona_backup_every_seconds = QSpinBox()
+        self.spin_jsona_backup_every_seconds.setRange(30, 86400)
+        self.spin_jsona_backup_every_seconds.setValue(600)
+        self.spin_jsona_backup_every_seconds.setSingleStep(30)
+        self.spin_jsona_backup_every_seconds.setSuffix(' 秒')
+        self.spin_jsona_backup_every_seconds.setToolTip('即使新增条数未达到阈值，也会按这个时间间隔补一次备份。')
+        jsona_backup_layout.addRow('按时间备份:', self.spin_jsona_backup_every_seconds)
+
+        self.spin_jsona_backup_keep = QSpinBox()
+        self.spin_jsona_backup_keep.setRange(1, 100)
+        self.spin_jsona_backup_keep.setValue(10)
+        self.spin_jsona_backup_keep.setToolTip('每个 JSONA 文件保留的最新滚动备份数量。')
+        jsona_backup_layout.addRow('保留份数:', self.spin_jsona_backup_keep)
+        left_layout.addWidget(jsona_backup_group)
+
+        unattended_group = QGroupBox('无人值守 (审核箱)')
+        unattended_layout = QFormLayout(unattended_group)
+
+        self.check_unattended_mode = QCheckBox('无人值守模式 (不显示中间审核图片)')
+        self.check_unattended_mode.setToolTip(
+            '开启后：需要人工审核的条目会保存到 output/review_inbox，界面不再堆积图片，适合挂机跑一整晚。'
+        )
+        unattended_layout.addRow(self.check_unattended_mode)
+
+        self.spin_unattended_inbox_max_mb = QSpinBox()
+        self.spin_unattended_inbox_max_mb.setRange(100, 102400)
+        self.spin_unattended_inbox_max_mb.setValue(2048)
+        self.spin_unattended_inbox_max_mb.setSingleStep(100)
+        self.spin_unattended_inbox_max_mb.setSuffix(' MB')
+        self.spin_unattended_inbox_max_mb.setToolTip('审核箱临时文件夹最大大小，超过后会按“满额动作”处理。')
+        unattended_layout.addRow('最大大小:', self.spin_unattended_inbox_max_mb)
+
+        self.combo_unattended_inbox_full_action = QComboBox()
+        self.combo_unattended_inbox_full_action.addItems(['自动暂停', '自动停止'])
+        self.combo_unattended_inbox_full_action.setToolTip('审核箱达到最大大小后的处理方式。')
+        unattended_layout.addRow('满额动作:', self.combo_unattended_inbox_full_action)
+        left_layout.addWidget(unattended_group)
+
+        tags_group = QGroupBox('追加标签')
+        tags_layout = QVBoxLayout(tags_group)
+        self.check_append_tags = QCheckBox(tr('append_tags'))
+        tags_layout.addWidget(self.check_append_tags)
+
+        self.edit_custom_tags = QTextEdit()
+        self.edit_custom_tags.setMaximumHeight(60)
+        self.edit_custom_tags.setPlaceholderText(tr('tag_placeholder'))
+        self.edit_custom_tags.setEnabled(False)
+        self.check_append_tags.toggled.connect(self.edit_custom_tags.setEnabled)
+        tags_layout.addWidget(self.edit_custom_tags)
+        left_layout.addWidget(tags_group)
+        left_layout.addStretch()
+
+        main_layout.addLayout(left_layout, 1)
 
         # Right side: JSONA statistics
         right_layout = QVBoxLayout()
@@ -1954,11 +2121,12 @@ class SettingsPanel(QWidget):
         return group
 
     def _create_processing_group(self) -> QGroupBox:
-        """Create processing settings group"""
+        """Create processing settings group."""
         group = QGroupBox(tr('processing'))
-        layout = QFormLayout(group)
+        main_layout = QVBoxLayout(group)
 
-        # Input directory source selection
+        common_form = QFormLayout()
+
         input_source_layout = QHBoxLayout()
         self.radio_use_data_source = QRadioButton(tr('use_data_source_dir'))
         self.radio_use_data_source.setChecked(True)
@@ -1966,9 +2134,8 @@ class SettingsPanel(QWidget):
         input_source_layout.addWidget(self.radio_use_data_source)
         input_source_layout.addWidget(self.radio_use_custom_dir)
         input_source_layout.addStretch()
-        layout.addRow(tr('input_source') + ':', input_source_layout)
+        common_form.addRow(tr('input_source') + ':', input_source_layout)
 
-        # Custom input directory
         custom_input_layout = QHBoxLayout()
         self.edit_custom_input_dir = QLineEdit("./images")
         self.edit_custom_input_dir.setEnabled(False)
@@ -1977,18 +2144,52 @@ class SettingsPanel(QWidget):
         btn_browse_custom_input.setEnabled(False)
         btn_browse_custom_input.clicked.connect(lambda: self._browse_directory(self.edit_custom_input_dir))
         custom_input_layout.addWidget(btn_browse_custom_input)
-        layout.addRow('', custom_input_layout)
+        common_form.addRow('', custom_input_layout)
 
-        # Connect radio buttons to enable/disable custom input
         self.radio_use_custom_dir.toggled.connect(lambda checked: self.edit_custom_input_dir.setEnabled(checked))
         self.radio_use_custom_dir.toggled.connect(lambda checked: btn_browse_custom_input.setEnabled(checked))
 
-        # Quality profile (general/anime)
+        thread_layout = QHBoxLayout()
+        self.spin_processing_threads = QSpinBox()
+        self.spin_processing_threads.setRange(1, 16)
+        self.spin_processing_threads.setValue(1)
+        thread_layout.addWidget(self.spin_processing_threads)
+        btn_auto_processing = QPushButton('自动')
+        btn_auto_processing.setMaximumWidth(50)
+        btn_auto_processing.clicked.connect(lambda: self.spin_processing_threads.setValue(max(1, (os.cpu_count() or 4) - 1)))
+        thread_layout.addWidget(btn_auto_processing)
+        thread_layout.addStretch()
+        common_form.addRow(tr('threads') + ':', thread_layout)
+
+        self.spin_preload_count = QSpinBox()
+        self.spin_preload_count.setRange(5, 50)
+        self.spin_preload_count.setValue(15)
+        common_form.addRow(tr('preload_count') + ':', self.spin_preload_count)
+        main_layout.addLayout(common_form)
+
+        self.processing_mode_stack = QStackedWidget()
+        self.processing_mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        controlnet_page = QWidget()
+        controlnet_page_layout = QVBoxLayout(controlnet_page)
+        controlnet_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        controlnet_note = QLabel(
+            '当前页只显示 ControlNet 图生成会直接用到的参数。'
+        )
+        controlnet_note.setWordWrap(True)
+        controlnet_note.setStyleSheet('color: #888;')
+        controlnet_page_layout.addWidget(controlnet_note)
+
+        controlnet_form = QFormLayout()
         self.combo_quality_profile = QComboBox()
         self.combo_quality_profile.addItems([tr('general'), tr('anime')])
-        layout.addRow(tr('quality_profile') + ':', self.combo_quality_profile)
+        controlnet_form.addRow(tr('quality_profile') + ':', self.combo_quality_profile)
+        controlnet_page_layout.addLayout(controlnet_form)
 
-        # Canny thresholds
+        threshold_group = QGroupBox('自动判定阈值')
+        threshold_layout = QVBoxLayout(threshold_group)
+
         canny_threshold_layout = QHBoxLayout()
         canny_threshold_layout.addWidget(QLabel('Canny 自动接受:'))
         self.spin_canny_accept = QSpinBox()
@@ -2003,9 +2204,8 @@ class SettingsPanel(QWidget):
         self.spin_canny_reject.setSuffix(' 分')
         canny_threshold_layout.addWidget(self.spin_canny_reject)
         canny_threshold_layout.addStretch()
-        layout.addRow('', canny_threshold_layout)
+        threshold_layout.addLayout(canny_threshold_layout)
 
-        # OpenPose thresholds
         pose_threshold_layout = QHBoxLayout()
         pose_threshold_layout.addWidget(QLabel('Pose 自动接受:'))
         self.spin_pose_accept = QSpinBox()
@@ -2020,9 +2220,8 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.setSuffix(' 分')
         pose_threshold_layout.addWidget(self.spin_pose_reject)
         pose_threshold_layout.addStretch()
-        layout.addRow('', pose_threshold_layout)
+        threshold_layout.addLayout(pose_threshold_layout)
 
-        # Depth thresholds
         depth_threshold_layout = QHBoxLayout()
         depth_threshold_layout.addWidget(QLabel('Depth 自动接受:'))
         self.spin_depth_accept = QSpinBox()
@@ -2037,34 +2236,12 @@ class SettingsPanel(QWidget):
         self.spin_depth_reject.setSuffix(' 分')
         depth_threshold_layout.addWidget(self.spin_depth_reject)
         depth_threshold_layout.addStretch()
-        layout.addRow('', depth_threshold_layout)
+        threshold_layout.addLayout(depth_threshold_layout)
+        controlnet_page_layout.addWidget(threshold_group)
 
-        # Thread count
-        thread_layout = QHBoxLayout()
-        self.spin_processing_threads = QSpinBox()
-        self.spin_processing_threads.setRange(1, 16)
-        self.spin_processing_threads.setValue(1)
-        thread_layout.addWidget(self.spin_processing_threads)
+        control_group = QGroupBox(tr('control_types'))
+        control_layout = QVBoxLayout(control_group)
 
-        # Auto button
-        btn_auto_processing = QPushButton('自动')
-        btn_auto_processing.setMaximumWidth(50)
-        btn_auto_processing.clicked.connect(lambda: self.spin_processing_threads.setValue(max(1, (os.cpu_count() or 4) - 1)))
-        thread_layout.addWidget(btn_auto_processing)
-        thread_layout.addStretch()
-
-        layout.addRow(tr('threads') + ':', thread_layout)
-
-        # Preload count
-        self.spin_preload_count = QSpinBox()
-        self.spin_preload_count.setRange(5, 50)
-        self.spin_preload_count.setValue(15)
-        layout.addRow(tr('preload_count') + ':', self.spin_preload_count)
-
-        # Control types
-        control_layout = QVBoxLayout()
-
-        # Canny
         canny_layout = QHBoxLayout()
         self.check_canny = QCheckBox("Canny")
         self.check_canny.setChecked(True)
@@ -2073,17 +2250,13 @@ class SettingsPanel(QWidget):
         canny_layout.addStretch()
         control_layout.addLayout(canny_layout)
 
-        # OpenPose
         openpose_layout = QHBoxLayout()
         self.check_openpose = QCheckBox("OpenPose")
         openpose_layout.addWidget(self.check_openpose)
-
-        # Install torch button for OpenPose (shown when torch not available)
         self.btn_install_torch_openpose = QPushButton("安装 PyTorch")
         self.btn_install_torch_openpose.clicked.connect(self._on_install_torch_clicked)
         self.btn_install_torch_openpose.setVisible(False)
         openpose_layout.addWidget(self.btn_install_torch_openpose)
-
         openpose_layout.addWidget(QLabel(tr('model') + ':'))
         self.combo_openpose_model = QComboBox()
         self.combo_openpose_model.addItems([
@@ -2095,47 +2268,38 @@ class SettingsPanel(QWidget):
         ])
         self.combo_openpose_model.setEnabled(False)
         openpose_layout.addWidget(self.combo_openpose_model)
-
-        # YOLO version selection (only for ViTPose/SDPose)
         openpose_layout.addWidget(QLabel('YOLO:'))
         self.combo_yolo_version = QComboBox()
         self.combo_yolo_version.addItems(['YOLO26 (推荐)', 'YOLOv11', 'YOLOv8'])
         self.combo_yolo_version.setEnabled(False)
         self.combo_yolo_version.setVisible(False)
         openpose_layout.addWidget(self.combo_yolo_version)
-
-        # YOLO model type selection (only for ViTPose/SDPose)
         openpose_layout.addWidget(QLabel('检测器:'))
         self.combo_yolo_model_type = QComboBox()
         self.combo_yolo_model_type.addItems(['通用 (General)', '动漫专用 (Anime)'])
         self.combo_yolo_model_type.setEnabled(False)
         self.combo_yolo_model_type.setVisible(False)
         openpose_layout.addWidget(self.combo_yolo_model_type)
-
         self.edit_openpose_path = QLineEdit()
         self.edit_openpose_path.setPlaceholderText(tr('model_path_placeholder'))
         self.edit_openpose_path.setEnabled(False)
-        self.edit_openpose_path.setVisible(False)  # Hidden by default
+        self.edit_openpose_path.setVisible(False)
         openpose_layout.addWidget(self.edit_openpose_path)
         self.btn_browse_openpose = QPushButton(tr('browse'))
         self.btn_browse_openpose.setEnabled(False)
-        self.btn_browse_openpose.setVisible(False)  # Hidden by default
+        self.btn_browse_openpose.setVisible(False)
         self.btn_browse_openpose.clicked.connect(lambda: self._browse_directory(self.edit_openpose_path))
         openpose_layout.addWidget(self.btn_browse_openpose)
         openpose_layout.addStretch()
         control_layout.addLayout(openpose_layout)
 
-        # Depth
         depth_layout = QHBoxLayout()
         self.check_depth = QCheckBox("Depth")
         depth_layout.addWidget(self.check_depth)
-
-        # Install torch button for Depth (shown when torch not available)
         self.btn_install_torch_depth = QPushButton("安装 PyTorch")
         self.btn_install_torch_depth.clicked.connect(self._on_install_torch_clicked)
         self.btn_install_torch_depth.setVisible(False)
         depth_layout.addWidget(self.btn_install_torch_depth)
-
         depth_layout.addWidget(QLabel(tr('model') + ':'))
         self.combo_depth_model = QComboBox()
         self.combo_depth_model.addItems(['Depth Anything V2', 'Custom Path'])
@@ -2144,30 +2308,854 @@ class SettingsPanel(QWidget):
         self.edit_depth_path = QLineEdit()
         self.edit_depth_path.setPlaceholderText(tr('model_path_placeholder'))
         self.edit_depth_path.setEnabled(False)
-        self.edit_depth_path.setVisible(False)  # Hidden by default
+        self.edit_depth_path.setVisible(False)
         depth_layout.addWidget(self.edit_depth_path)
         self.btn_browse_depth = QPushButton(tr('browse'))
         self.btn_browse_depth.setEnabled(False)
-        self.btn_browse_depth.setVisible(False)  # Hidden by default
+        self.btn_browse_depth.setVisible(False)
         self.btn_browse_depth.clicked.connect(lambda: self._browse_directory(self.edit_depth_path))
         depth_layout.addWidget(self.btn_browse_depth)
         depth_layout.addStretch()
         control_layout.addLayout(depth_layout)
+        controlnet_page_layout.addWidget(control_group)
+        self.label_controlnet_mode_note = QLabel('原图评分预筛与自动通过阈值请切换到上方“图片评分模式”页配置。')
+        self.label_controlnet_mode_note.setWordWrap(True)
+        self.label_controlnet_mode_note.setStyleSheet('color: #999; font-size: 11px;')
+        controlnet_page_layout.addWidget(self.label_controlnet_mode_note)
 
-        # Connect signals to enable/disable model selection
         self.check_openpose.toggled.connect(self._on_openpose_toggled)
         self.combo_openpose_model.currentTextChanged.connect(self._on_openpose_model_changed)
         self.combo_yolo_model_type.currentTextChanged.connect(self._on_yolo_model_type_changed)
-
         self.check_depth.toggled.connect(self._on_depth_toggled)
         self.combo_depth_model.currentTextChanged.connect(self._on_depth_model_changed)
-
-        # Check torch availability on init
         self._check_torch_availability()
+        controlnet_page_layout.addStretch()
 
-        layout.addRow(tr('control_types') + ':', control_layout)
+        score_page = QWidget()
+        score_page_layout = QVBoxLayout(score_page)
+        score_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        score_filter_group = QGroupBox('原图评分筛选')
+        score_filter_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        score_filter_layout = QVBoxLayout(score_filter_group)
+
+        score_enable_layout = QVBoxLayout()
+        score_enable_row = QHBoxLayout()
+        self.check_score_filter_enabled = QCheckBox('启用原图评分筛选 (二次元 / furry)')
+        self.check_score_filter_enabled.setChecked(False)
+        score_enable_row.addWidget(self.check_score_filter_enabled)
+        score_enable_row.addStretch()
+        score_enable_layout.addLayout(score_enable_row)
+        score_enable_action_row = QHBoxLayout()
+        score_enable_action_row.addStretch()
+        self.btn_refresh_score_filter_status = QPushButton('检查环境')
+        self.btn_refresh_score_filter_status.clicked.connect(self._refresh_score_filter_status)
+        score_enable_action_row.addWidget(self.btn_refresh_score_filter_status)
+        score_enable_layout.addLayout(score_enable_action_row)
+        score_filter_layout.addLayout(score_enable_layout)
+
+        self.label_score_filter_status = QLabel('未启用')
+        self.label_score_filter_status.setWordWrap(True)
+        self.label_score_filter_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.label_score_filter_status.setMinimumWidth(0)
+        self.label_score_filter_status.setStyleSheet('color: #888;')
+        score_filter_layout.addWidget(self.label_score_filter_status)
+
+        score_action_layout = QVBoxLayout()
+        score_action_row1 = QHBoxLayout()
+        self.btn_install_score_filter_deps = QPushButton('安装评分依赖')
+        self.btn_install_score_filter_deps.clicked.connect(self._install_score_filter_dependencies)
+        self.btn_install_score_filter_deps.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        score_action_row1.addWidget(self.btn_install_score_filter_deps)
+        self.btn_install_missing_score_models = QPushButton('安装缺失模型')
+        self.btn_install_missing_score_models.clicked.connect(self._show_score_model_manager)
+        self.btn_install_missing_score_models.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        score_action_row1.addWidget(self.btn_install_missing_score_models)
+        score_action_layout.addLayout(score_action_row1)
+        score_filter_layout.addLayout(score_action_layout)
+
+        score_path_form = QFormLayout()
+        score_path_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        score_path_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        score_ckpt_widget = QWidget()
+        score_ckpt_layout = QHBoxLayout(score_ckpt_widget)
+        score_ckpt_layout.setContentsMargins(0, 0, 0, 0)
+        self.edit_score_checkpoint_path = QLineEdit('./models/score/5kdataset.safetensors')
+        score_ckpt_layout.addWidget(self.edit_score_checkpoint_path)
+        self.btn_browse_score_checkpoint = QPushButton(tr('browse'))
+        self.btn_browse_score_checkpoint.clicked.connect(self._browse_score_checkpoint)
+        score_ckpt_layout.addWidget(self.btn_browse_score_checkpoint)
+        score_path_form.addRow('评分 checkpoint:', score_ckpt_widget)
+
+        score_cache_widget = QWidget()
+        score_cache_layout = QHBoxLayout(score_cache_widget)
+        score_cache_layout.setContentsMargins(0, 0, 0, 0)
+        self.edit_score_cache_root = QLineEdit('./models/score')
+        score_cache_layout.addWidget(self.edit_score_cache_root)
+        self.btn_browse_score_cache_root = QPushButton(tr('browse'))
+        self.btn_browse_score_cache_root.clicked.connect(lambda: self._browse_directory(self.edit_score_cache_root))
+        score_cache_layout.addWidget(self.btn_browse_score_cache_root)
+        score_path_form.addRow('模型缓存目录:', score_cache_widget)
+        score_filter_layout.addLayout(score_path_form)
+
+        score_runtime_form = QFormLayout()
+        score_runtime_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        score_runtime_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.combo_score_device = QComboBox()
+        self.combo_score_device.addItems(['auto', 'cuda', 'cpu'])
+        score_runtime_form.addRow('设备:', self.combo_score_device)
+
+        self.spin_score_min_aesthetic = QDoubleSpinBox()
+        self.spin_score_min_aesthetic.setRange(0.0, 5.0)
+        self.spin_score_min_aesthetic.setDecimals(2)
+        self.spin_score_min_aesthetic.setSingleStep(0.1)
+        self.spin_score_min_aesthetic.setValue(2.5)
+        score_runtime_form.addRow('最低美学分:', self.spin_score_min_aesthetic)
+
+        self.check_score_require_in_domain = QCheckBox('同时要求目标域命中')
+        self.check_score_require_in_domain.setChecked(True)
+        score_runtime_form.addRow('目标域限制:', self.check_score_require_in_domain)
+
+        self.spin_score_min_in_domain_prob = QDoubleSpinBox()
+        self.spin_score_min_in_domain_prob.setRange(0.0, 1.0)
+        self.spin_score_min_in_domain_prob.setDecimals(2)
+        self.spin_score_min_in_domain_prob.setSingleStep(0.05)
+        self.spin_score_min_in_domain_prob.setValue(0.5)
+        score_runtime_form.addRow('最低目标域概率:', self.spin_score_min_in_domain_prob)
+
+        self.spin_score_mode_auto_accept = QDoubleSpinBox()
+        self.spin_score_mode_auto_accept.setRange(0.0, 5.0)
+        self.spin_score_mode_auto_accept.setDecimals(2)
+        self.spin_score_mode_auto_accept.setSingleStep(0.1)
+        self.spin_score_mode_auto_accept.setValue(4.0)
+        self.spin_score_mode_auto_accept.setToolTip(
+            '仅在“图片评分模式”下生效。\n'
+            '达到该美学分的原图会自动通过，低于它但未触发自动拒绝的图片进入人工审核。'
+        )
+        score_runtime_form.addRow('评分模式自动接受:', self.spin_score_mode_auto_accept)
+        score_filter_layout.addLayout(score_runtime_form)
+
+        score_progress_group = QGroupBox('评分进度')
+        score_progress_layout = QVBoxLayout(score_progress_group)
+
+        score_progress_row = QHBoxLayout()
+        self.label_score_filter_progress_count = QLabel('已处理总数 (-- / --)')
+        self.label_score_filter_progress_count.setStyleSheet('color: #cccccc;')
+        score_progress_row.addWidget(self.label_score_filter_progress_count)
+        score_progress_row.addStretch()
+        self.btn_reset_score_filter_progress = QPushButton('重置')
+        self.btn_reset_score_filter_progress.clicked.connect(self._reset_score_filter_progress)
+        score_progress_row.addWidget(self.btn_reset_score_filter_progress)
+        score_progress_layout.addLayout(score_progress_row)
+
+        self.progress_score_filter_count = QProgressBar()
+        self.progress_score_filter_count.setRange(0, 100)
+        self.progress_score_filter_count.setValue(0)
+        self.progress_score_filter_count.setFormat('就绪')
+        self.progress_score_filter_count.setTextVisible(True)
+        score_progress_layout.addWidget(self.progress_score_filter_count)
+        score_filter_layout.addWidget(score_progress_group)
+
+        self.label_score_mode_note = QLabel(
+            '低于阈值的原图会在生成 Canny / Pose / Depth 前直接自动拒绝。'
+            '若本地没有 JTP-3 / CLIP 缓存，首次运行可能仍需联网下载。'
+        )
+        self.label_score_mode_note.setWordWrap(True)
+        self.label_score_mode_note.setStyleSheet('color: #999; font-size: 11px;')
+        score_filter_layout.addWidget(self.label_score_mode_note)
+        score_page_layout.addWidget(score_filter_group)
+        score_page_layout.addStretch()
+
+        self.processing_mode_stack.addWidget(controlnet_page)
+        self.processing_mode_stack.addWidget(score_page)
+        main_layout.addWidget(self.processing_mode_stack)
+
+        self._update_processing_mode_controls()
+        self._update_score_filter_controls()
+        self._refresh_score_filter_status()
 
         return group
+
+    def _build_score_filter_config(self) -> dict:
+        device = str(self.combo_score_device.currentText() or 'auto').strip().lower()
+        if device not in {'auto', 'cpu', 'cuda'}:
+            device = 'auto'
+        return {
+            'enabled': self.check_score_filter_enabled.isChecked(),
+            'checkpoint_path': self.edit_score_checkpoint_path.text().strip(),
+            'cache_root': self.edit_score_cache_root.text().strip(),
+            'device': device,
+            'min_aesthetic_score': float(self.spin_score_min_aesthetic.value()),
+            'require_in_domain': self.check_score_require_in_domain.isChecked(),
+            'min_in_domain_prob': float(self.spin_score_min_in_domain_prob.value()),
+        }
+
+    def _current_processing_mode(self) -> str:
+        if not hasattr(self, 'tab_processing_mode'):
+            return 'controlnet'
+        return 'image_score' if int(self.tab_processing_mode.currentIndex()) == 1 else 'controlnet'
+
+    def _set_processing_mode(self, mode: str):
+        normalized = str(mode or 'controlnet').strip().lower()
+        if normalized not in {'controlnet', 'image_score'}:
+            normalized = 'controlnet'
+        if not hasattr(self, 'tab_processing_mode'):
+            return
+        self.tab_processing_mode.setCurrentIndex(1 if normalized == 'image_score' else 0)
+
+    def _shrink_stack_to_current_page(self, stack):
+        if stack is None:
+            return
+        page = stack.currentWidget()
+        if page is None:
+            return
+        page.adjustSize()
+        page.updateGeometry()
+        layout = page.layout()
+        available_width = max(240, int(stack.width()) - 4)
+        if layout is not None:
+            layout.invalidate()
+            if layout.hasHeightForWidth():
+                target_height = int(layout.totalHeightForWidth(available_width))
+            else:
+                target_height = int(layout.sizeHint().height())
+        elif page.hasHeightForWidth():
+            target_height = int(page.heightForWidth(available_width))
+        else:
+            target_height = int(page.sizeHint().height())
+        target_height = max(80, target_height + 8)
+        stack.setMinimumHeight(target_height)
+        stack.setMaximumHeight(target_height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+        self._shrink_stack_to_current_page(getattr(self, 'advanced_mode_stack', None))
+
+    def _update_processing_mode_controls(self):
+        mode = self._current_processing_mode()
+        is_score_mode = mode == 'image_score'
+
+        if hasattr(self, 'processing_mode_stack'):
+            self.processing_mode_stack.setCurrentIndex(1 if is_score_mode else 0)
+            self._shrink_stack_to_current_page(self.processing_mode_stack)
+        if hasattr(self, 'advanced_mode_stack'):
+            self.advanced_mode_stack.setCurrentIndex(1 if is_score_mode else 0)
+            self._shrink_stack_to_current_page(self.advanced_mode_stack)
+
+        if hasattr(self, 'label_score_mode_note'):
+            if is_score_mode:
+                self.label_score_mode_note.setText(
+                    '当前为图片评分模式：只对原图做评分与筛选，不生成 Canny / Pose / Depth。\n'
+                    '低于最低美学分或目标域阈值的图片会自动拒绝，高于“评分模式自动接受”的图片会自动通过，其余进入人工审核。'
+                )
+            else:
+                self.label_score_mode_note.setText(
+                    '当前为 ControlNet 图片生成模式：低于阈值的原图会在生成 Canny / Pose / Depth 前直接自动拒绝。'
+                    '若本地没有 JTP-3 / CLIP 缓存，首次运行可能仍需联网下载。'
+                )
+
+        if hasattr(self, 'label_controlnet_mode_note'):
+            self.label_controlnet_mode_note.setVisible(not is_score_mode)
+
+        if hasattr(self, 'btn_start'):
+            mode_suffix = '图片评分' if is_score_mode else 'ControlNet'
+            self.btn_start.setText(f"{tr('start_processing')} ({mode_suffix})")
+
+        self._update_score_filter_controls()
+
+    def _update_score_filter_controls(self):
+        if not hasattr(self, 'check_score_filter_enabled'):
+            return
+        enabled = self.check_score_filter_enabled.isChecked()
+        widgets = [
+            getattr(self, 'edit_score_checkpoint_path', None),
+            getattr(self, 'btn_browse_score_checkpoint', None),
+            getattr(self, 'edit_score_cache_root', None),
+            getattr(self, 'btn_browse_score_cache_root', None),
+            getattr(self, 'combo_score_device', None),
+            getattr(self, 'spin_score_min_aesthetic', None),
+            getattr(self, 'check_score_require_in_domain', None),
+        ]
+        for widget in widgets:
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+        if hasattr(self, 'spin_score_min_in_domain_prob'):
+            self.spin_score_min_in_domain_prob.setEnabled(
+                enabled and self.check_score_require_in_domain.isChecked()
+            )
+
+        if hasattr(self, 'spin_score_mode_auto_accept'):
+            self.spin_score_mode_auto_accept.setEnabled(
+                enabled and self._current_processing_mode() == 'image_score'
+            )
+
+    def _set_score_filter_progress_busy(self, text: str = '统计中'):
+        if not hasattr(self, 'progress_score_filter_count'):
+            return
+        self.progress_score_filter_count.setRange(0, 0)
+        self.progress_score_filter_count.setFormat(text)
+
+    def _set_score_filter_progress_idle(self, text: str = '就绪'):
+        if not hasattr(self, 'progress_score_filter_count'):
+            return
+        self.progress_score_filter_count.setRange(0, 100)
+        self.progress_score_filter_count.setValue(0)
+        self.progress_score_filter_count.setFormat(text)
+
+    def _update_score_filter_progress_display(self, processed: int = 0, total: int = 0):
+        self._score_filter_progress_counts = {
+            'processed': max(0, int(processed or 0)),
+            'total': max(0, int(total or 0)),
+        }
+        if not hasattr(self, 'label_score_filter_progress_count'):
+            return
+        if not self.radio_use_custom_dir.isChecked():
+            self.label_score_filter_progress_count.setText('已处理总数 (-- / --)')
+        else:
+            self.label_score_filter_progress_count.setText(
+                f"已处理总数 ({self._score_filter_progress_counts['processed']} / {self._score_filter_progress_counts['total']})"
+            )
+
+    def _schedule_score_filter_progress_count_refresh(self):
+        if not hasattr(self, 'radio_use_custom_dir'):
+            return
+        self._score_filter_count_request_id += 1
+        if not self.radio_use_custom_dir.isChecked():
+            self._update_score_filter_progress_display(0, 0)
+            self._set_score_filter_progress_idle('就绪')
+            return
+        self._set_score_filter_progress_busy('统计中')
+        self._score_filter_progress_refresh_timer.start(200)
+
+    def _start_score_filter_progress_count(self):
+        if not hasattr(self, 'radio_use_custom_dir') or not self.radio_use_custom_dir.isChecked():
+            self._update_score_filter_progress_display(0, 0)
+            self._set_score_filter_progress_idle('就绪')
+            return
+
+        custom_dir = self.edit_custom_input_dir.text().strip()
+        if not custom_dir:
+            self._update_score_filter_progress_display(0, 0)
+            self._set_score_filter_progress_idle('就绪')
+            return
+
+        running_thread = getattr(self, '_score_filter_count_thread', None)
+        if running_thread is not None and running_thread.isRunning():
+            self._score_filter_count_pending_restart = True
+            return
+
+        self._score_filter_count_pending_restart = False
+        request_id = max(1, int(self._score_filter_count_request_id))
+
+        thread = ScoreFilterProgressCountThread(
+            request_id,
+            custom_dir,
+            self._resolve_progress_file_path(),
+            self,
+        )
+        thread.counted.connect(self._on_score_filter_progress_counted)
+        thread.failed.connect(self._on_score_filter_progress_count_failed)
+        thread.finished.connect(self._on_score_filter_progress_count_thread_finished)
+        self._score_filter_count_thread = thread
+        self._set_score_filter_progress_busy('统计中')
+        thread.start()
+
+    def _on_score_filter_progress_counted(self, request_id: int, processed: int, total: int):
+        if int(request_id) != int(self._score_filter_count_request_id):
+            return
+        self._update_score_filter_progress_display(processed, total)
+        self._set_score_filter_progress_idle('就绪')
+
+    def _on_score_filter_progress_count_failed(self, request_id: int, error_message: str):
+        if int(request_id) != int(self._score_filter_count_request_id):
+            return
+        print(f"Error counting score filter custom-dir progress: {error_message}")
+        self._update_score_filter_progress_display(0, 0)
+        self._set_score_filter_progress_idle('就绪')
+
+    def _on_score_filter_progress_count_thread_finished(self):
+        thread = self.sender()
+        if thread is self._score_filter_count_thread:
+            self._score_filter_count_thread = None
+        if self._score_filter_count_pending_restart:
+            self._score_filter_count_pending_restart = False
+            QTimer.singleShot(0, self._start_score_filter_progress_count)
+
+    def _set_score_filter_enabled_checked(self, enabled: bool):
+        self._score_filter_toggle_guard = True
+        try:
+            self.check_score_filter_enabled.setChecked(bool(enabled))
+        finally:
+            self._score_filter_toggle_guard = False
+
+    def _on_score_filter_enabled_changed(self, state):
+        enabled = int(state) == int(Qt.Checked)
+        if self._score_filter_toggle_guard:
+            return
+
+        if enabled and not self._settings_tracking_suspended:
+            probe = FusionScoreFilter.probe_environment(self._build_score_filter_config())
+            missing_dependencies = list(probe.get('missing_dependencies', []) or [])
+            if missing_dependencies:
+                package_preview = '\n'.join(f'  - {item}' for item in missing_dependencies)
+                extra_note = ''
+                if any(item in {'torch', 'torchvision'} for item in missing_dependencies):
+                    extra_note = (
+                        '\n\n检测到缺少 PyTorch / torchvision 时，后续会先打开现有的 '
+                        'PyTorch 安装流程，让你选择 CPU / CUDA 版本。'
+                    )
+                reply = QMessageBox.question(
+                    self,
+                    '初始化评分环境',
+                    '初次使用原图评分筛选需要先初始化环境。\n\n'
+                    '以下依赖将会被安装:\n\n'
+                    f'{package_preview}'
+                    f'{extra_note}\n\n'
+                    '这一步只安装 Python 依赖，不会自动下载评分 checkpoint 和模型缓存文件。\n\n'
+                    '是否现在开始初始化？',
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply != QMessageBox.Yes:
+                    self._set_score_filter_enabled_checked(False)
+                    self._update_score_filter_controls()
+                    self._refresh_score_filter_status()
+                    self.save_settings()
+                    return
+                self._install_score_filter_dependencies(skip_confirm=True)
+
+        self._update_score_filter_controls()
+        self._refresh_score_filter_status()
+        if not self._settings_tracking_suspended:
+            self.save_settings()
+
+    def _refresh_score_filter_status(self):
+        if not hasattr(self, 'label_score_filter_status'):
+            return
+        probe = FusionScoreFilter.probe_environment(self._build_score_filter_config())
+        report = self._build_score_environment_report(probe)
+        text = str(report.get('short_text', '未启用') or '未启用')
+        tooltip_text = str(report.get('detailed_text', text) or text)
+        self.label_score_filter_status.setText(text)
+        self.label_score_filter_status.setToolTip(tooltip_text)
+        self.label_score_filter_status.adjustSize()
+
+        deps_missing = bool(report.get('missing_dependencies'))
+        models_missing = bool(report.get('missing_models'))
+        checkpoint_missing = not bool(report.get('checkpoint_exists', True))
+
+        if hasattr(self, 'btn_install_score_filter_deps'):
+            self.btn_install_score_filter_deps.setVisible(
+                probe.get('enabled', False) and deps_missing
+            )
+        if hasattr(self, 'btn_install_missing_score_models'):
+            self.btn_install_missing_score_models.setVisible(
+                probe.get('enabled', False) and (not deps_missing) and models_missing
+            )
+
+        if not probe.get('enabled', False):
+            color = '#888'
+        elif deps_missing or models_missing or checkpoint_missing:
+            color = '#EF5350'
+        elif probe.get('available', False) and not probe.get('warnings'):
+            color = '#66BB6A'
+        elif probe.get('available', False):
+            color = '#FFB300'
+        else:
+            color = '#EF5350'
+        self.label_score_filter_status.setStyleSheet(f'color: {color};')
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _browse_score_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            '选择评分 checkpoint',
+            self.edit_score_checkpoint_path.text() or '.',
+            'Model Files (*.safetensors *.pt *.pth *.ckpt);;All Files (*.*)'
+        )
+        if path:
+            self.edit_score_checkpoint_path.setText(path)
+
+    def _resolve_score_filter_cache_root(self) -> str:
+        raw_path = self.edit_score_cache_root.text().strip() or './models/score'
+        if os.path.isabs(raw_path):
+            return raw_path
+        return os.path.abspath(os.path.join(self._get_repo_root(), raw_path))
+
+    def _build_score_filter_requirements_text(self) -> str:
+        cache_root = self._resolve_score_filter_cache_root()
+        checkpoint_path = self.edit_score_checkpoint_path.text().strip() or './models/score/5kdataset.safetensors'
+        if not os.path.isabs(checkpoint_path):
+            checkpoint_path = os.path.abspath(os.path.join(self._get_repo_root(), checkpoint_path))
+        return (
+            '评分筛选离线准备说明\n\n'
+            f'1. checkpoint\n{checkpoint_path}\n\n'
+            f'2. waifu scorer head\n{os.path.join(cache_root, "waifu-scorer-v3", "model.safetensors")}\n\n'
+            f'3. JTP-3 本地仓库\n{os.path.join(cache_root, "repos", "RedRocket__JTP-3", "model.py")}\n'
+            f'{os.path.join(cache_root, "repos", "RedRocket__JTP-3", "models", "jtp-3-hydra.safetensors")}\n\n'
+            '4. open-clip 权重\n'
+            '建议提前用 ref/batch/runtime/prefetch_jtp3.py 预取，避免首次运行时联网下载。'
+        )
+
+    def _copy_score_filter_requirements(self):
+        text = self._build_score_filter_requirements_text()
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, '评分筛选', '模型说明已复制到剪贴板。')
+
+    def _open_score_filter_cache_root(self):
+        target_dir = self._resolve_score_filter_cache_root()
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, '评分筛选', f'无法创建模型目录:\n{e}')
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(target_dir)):
+            QMessageBox.information(self, '评分筛选', f'模型目录: {target_dir}')
+
+    def _install_score_filter_dependencies(self, skip_confirm: bool = False):
+        main_window = self.window()
+        if hasattr(main_window, '_install_score_dependencies'):
+            main_window._install_score_dependencies(skip_confirm=skip_confirm)
+            return
+        QMessageBox.warning(self, '评分筛选', '无法访问安装入口，请重启程序后重试。')
+
+    def _get_score_model_targets(self) -> dict:
+        cache_root = Path(self._resolve_score_filter_cache_root()).resolve()
+        checkpoint_path = Path(
+            self.edit_score_checkpoint_path.text().strip() or './models/score/5kdataset.safetensors'
+        )
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = (Path(self._get_repo_root()) / checkpoint_path).resolve()
+
+        jtp_repo_dir = (cache_root / 'repos' / 'RedRocket__JTP-3').resolve()
+        return {
+            'cache_root': cache_root,
+            'checkpoint_path': checkpoint_path,
+            'waifu_head': (cache_root / 'waifu-scorer-v3' / 'model.safetensors').resolve(),
+            'jtp_repo_dir': jtp_repo_dir,
+            'jtp_model_py': (jtp_repo_dir / 'model.py').resolve(),
+            'jtp_weights': (jtp_repo_dir / 'models' / 'jtp-3-hydra.safetensors').resolve(),
+            'prefetch_script': (Path(self._get_repo_root()) / 'ref' / 'batch' / 'runtime' / 'prefetch_jtp3.py').resolve(),
+        }
+
+    def _build_score_environment_report(self, probe: dict | None = None) -> dict:
+        targets = self._get_score_model_targets()
+        probe = probe or FusionScoreFilter.probe_environment(self._build_score_filter_config())
+        metadata = probe.get('metadata') or {}
+        models_cfg = (metadata.get('config') or {}).get('models', {}) if isinstance(metadata, dict) else {}
+        needs_waifu = bool(models_cfg.get('include_waifu_score', True))
+        checkpoint_exists = targets['checkpoint_path'].exists()
+        waifu_exists = (not needs_waifu) or targets['waifu_head'].exists()
+        jtp_exists = targets['jtp_model_py'].exists() and targets['jtp_weights'].exists()
+
+        installed_models = []
+        missing_models = []
+        checkpoint_item = {
+            'key': 'score_checkpoint',
+            'label': '评分模型 checkpoint',
+            'paths': [str(targets['checkpoint_path'])],
+            'installed_action': None,
+            'missing_action': '选择文件',
+        }
+        if checkpoint_exists:
+            installed_models.append(checkpoint_item)
+        else:
+            missing_models.append(checkpoint_item)
+        if needs_waifu:
+            waifu_item = {
+                'key': 'waifu_head',
+                'label': 'waifu scorer head',
+                'paths': [str(targets['waifu_head'])],
+                'installed_action': '卸载',
+                'missing_action': '下载',
+            }
+            if waifu_exists:
+                installed_models.append(waifu_item)
+            else:
+                missing_models.append(waifu_item)
+        if jtp_exists:
+            installed_models.append({
+                'key': 'jtp3_repo',
+                'label': 'JTP-3 本地仓库',
+                'paths': [str(targets['jtp_model_py']), str(targets['jtp_weights'])],
+                'installed_action': '卸载',
+                'missing_action': '下载',
+            })
+        else:
+            missing_models.append({
+                'key': 'jtp3_repo',
+                'label': 'JTP-3 本地仓库',
+                'paths': [str(targets['jtp_model_py']), str(targets['jtp_weights'])],
+                'installed_action': '卸载',
+                'missing_action': '下载',
+            })
+
+        missing_dependencies = list(probe.get('missing_dependencies', []) or [])
+        status_lines = []
+        detailed_lines = []
+
+        if not probe.get('enabled', False):
+            status_lines.append('未启用')
+        else:
+            if missing_dependencies:
+                status_lines.append('缺少依赖: ' + ', '.join(missing_dependencies))
+                detailed_lines.append('缺少依赖: ' + ', '.join(missing_dependencies))
+            if not checkpoint_exists:
+                status_lines.append('缺少文件: 评分 checkpoint')
+                detailed_lines.append(f"评分 checkpoint: {targets['checkpoint_path']}")
+            if missing_models:
+                status_lines.append('缺少模型: ' + ', '.join(item['label'] for item in missing_models))
+                for item in missing_models:
+                    for model_path in item['paths']:
+                        detailed_lines.append(f"{item['label']}: {model_path}")
+            if not status_lines:
+                status_lines.append('已就绪')
+            if not detailed_lines:
+                detailed_lines.append('评分环境已就绪。')
+
+        return {
+            'targets': targets,
+            'checkpoint_exists': checkpoint_exists,
+            'waifu_exists': waifu_exists,
+            'jtp_exists': jtp_exists,
+            'needs_waifu': needs_waifu,
+            'missing_dependencies': missing_dependencies,
+            'installed_models': installed_models,
+            'missing_models': missing_models,
+            'short_text': '\n'.join(status_lines),
+            'detailed_text': '\n'.join(detailed_lines),
+            'can_open_model_manager': bool(installed_models or missing_models),
+        }
+
+    def _show_score_model_manager(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('评分模型管理')
+        dialog.resize(760, 480)
+
+        layout = QVBoxLayout(dialog)
+
+        installed_group = QGroupBox('已安装模型')
+        installed_layout = QVBoxLayout(installed_group)
+        layout.addWidget(installed_group, 1)
+
+        missing_group = QGroupBox('未安装模型')
+        missing_layout = QVBoxLayout(missing_group)
+        layout.addWidget(missing_group, 1)
+
+        button_row = QHBoxLayout()
+        btn_refresh = QPushButton('刷新')
+        btn_close = QPushButton('关闭')
+
+        button_row.addWidget(btn_refresh)
+        button_row.addStretch()
+        button_row.addWidget(btn_close)
+        layout.addLayout(button_row)
+
+        def clear_layout(target_layout):
+            while target_layout.count():
+                item = target_layout.takeAt(0)
+                widget = item.widget()
+                child_layout = item.layout()
+                if widget is not None:
+                    widget.deleteLater()
+                elif child_layout is not None:
+                    clear_layout(child_layout)
+
+        def build_model_row(item: dict, button_text: str = '', callback=None):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            text_layout = QVBoxLayout()
+            title = QLabel(item['label'])
+            title.setStyleSheet('color: #ffffff; font-weight: bold;')
+            text_layout.addWidget(title)
+            for model_path in item.get('paths', []):
+                path_label = QLabel(model_path)
+                path_label.setWordWrap(True)
+                path_label.setStyleSheet('color: #999; font-size: 11px;')
+                text_layout.addWidget(path_label)
+            row_layout.addLayout(text_layout, 1)
+
+            if button_text and callback is not None:
+                button = QPushButton(button_text)
+                button.clicked.connect(lambda _checked=False, key=item['key']: callback(key))
+                row_layout.addWidget(button)
+            return row
+
+        def refresh_view():
+            report = self._build_score_environment_report()
+            clear_layout(installed_layout)
+            clear_layout(missing_layout)
+
+            if report['installed_models']:
+                for item in report['installed_models']:
+                    installed_layout.addWidget(
+                        build_model_row(
+                            item,
+                            item.get('installed_action') or '',
+                            lambda key: self._uninstall_score_model_item(key, dialog, refresh_view)
+                        )
+                    )
+            else:
+                installed_layout.addWidget(QLabel('当前没有已安装模型'))
+
+            if report['missing_models']:
+                for item in report['missing_models']:
+                    action_text = str(item.get('missing_action') or '')
+                    action_callback = self._download_score_model_item
+                    if item.get('key') == 'score_checkpoint':
+                        action_callback = self._choose_score_checkpoint_file
+                    missing_layout.addWidget(
+                        build_model_row(
+                            item,
+                            action_text,
+                            lambda key, cb=action_callback: cb(key, dialog, refresh_view)
+                        )
+                    )
+            else:
+                missing_layout.addWidget(QLabel('当前没有缺失模型'))
+
+        btn_refresh.clicked.connect(refresh_view)
+        btn_close.clicked.connect(dialog.accept)
+
+        refresh_view()
+        dialog.exec_()
+
+    def _choose_score_checkpoint_file(self, model_key: str, parent_dialog=None, on_finished=None):
+        if model_key != 'score_checkpoint':
+            return False
+        before = self.edit_score_checkpoint_path.text().strip()
+        self._browse_score_checkpoint()
+        after = self.edit_score_checkpoint_path.text().strip()
+        self._refresh_score_filter_status()
+        if callable(on_finished):
+            on_finished()
+        return bool(after and after != before)
+
+    def _download_score_model_item(self, model_key: str, parent_dialog=None, on_finished=None):
+        import importlib.util
+
+        if importlib.util.find_spec('huggingface_hub') is None:
+            reply = QMessageBox.question(
+                parent_dialog or self,
+                '评分模型管理',
+                '当前缺少模型下载依赖 huggingface-hub。\n\n是否先安装评分依赖？',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self._install_score_filter_dependencies(skip_confirm=True)
+            return False
+
+        report = self._build_score_environment_report()
+        item_map = {item['key']: item for item in report['missing_models']}
+        if model_key not in item_map:
+            QMessageBox.information(parent_dialog or self, '评分模型管理', '该模型当前不是缺失状态。')
+            return False
+
+        targets = report['targets']
+        script_path = targets['prefetch_script']
+        if not script_path.exists():
+            QMessageBox.warning(
+                parent_dialog or self,
+                '评分模型管理',
+                f'未找到模型预取脚本:\n{script_path}'
+            )
+            return False
+
+        reply = QMessageBox.question(
+            parent_dialog or self,
+            '评分模型管理',
+            (
+                f"将下载模型:\n\n{item_map[model_key]['label']}\n\n"
+                + ('JTP-3 下载时会顺带预取 open-clip 缓存。\n\n' if model_key == 'jtp3_repo' else '')
+                + '是否继续？'
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        args = ['-X', 'utf8', str(script_path), '--root', str(targets['cache_root'])]
+        if model_key == 'waifu_head':
+            args.extend(['--no-prefetch-jtp3', '--no-prefetch-openclip'])
+        elif model_key == 'jtp3_repo':
+            args.append('--no-prefetch-waifu-head')
+        else:
+            QMessageBox.warning(parent_dialog or self, '评分模型管理', f'暂不支持该模型类型: {model_key}')
+            return False
+
+        dialog = ProcessConsoleDialog(
+            parent_dialog or self,
+            '下载评分模型',
+            sys.executable,
+            args,
+            '正在下载评分模型。下载期间请保持网络通畅。'
+        )
+        dialog.exec_()
+        self._refresh_score_filter_status()
+        if callable(on_finished):
+            on_finished()
+        if dialog.success:
+            QMessageBox.information(parent_dialog or self, '评分模型管理', '模型下载完成。')
+            return True
+        QMessageBox.warning(
+            parent_dialog or self,
+            '评分模型管理',
+            '模型下载未完成，请查看上面的输出日志。'
+        )
+        return False
+
+    def _uninstall_score_model_item(self, model_key: str, parent_dialog=None, on_finished=None):
+        import shutil
+
+        report = self._build_score_environment_report()
+        item_map = {item['key']: item for item in report['installed_models']}
+        if model_key not in item_map:
+            QMessageBox.information(parent_dialog or self, '评分模型管理', '该模型当前不是已安装状态。')
+            return False
+
+        targets = report['targets']
+        reply = QMessageBox.question(
+            parent_dialog or self,
+            '评分模型管理',
+            f"确定要卸载 {item_map[model_key]['label']} 吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        try:
+            if model_key == 'waifu_head':
+                waifu_path = Path(targets['waifu_head'])
+                if waifu_path.exists():
+                    waifu_path.unlink()
+                waifu_dir = waifu_path.parent
+                if waifu_dir.exists() and not any(waifu_dir.iterdir()):
+                    waifu_dir.rmdir()
+            elif model_key == 'jtp3_repo':
+                repo_dir = Path(targets['jtp_repo_dir'])
+                if repo_dir.exists():
+                    shutil.rmtree(repo_dir)
+            else:
+                QMessageBox.warning(parent_dialog or self, '评分模型管理', f'暂不支持该模型类型: {model_key}')
+                return False
+        except Exception as e:
+            QMessageBox.critical(parent_dialog or self, '评分模型管理', f'卸载失败:\n{e}')
+            return False
+
+        self._refresh_score_filter_status()
+        if callable(on_finished):
+            on_finished()
+        QMessageBox.information(parent_dialog or self, '评分模型管理', '模型已卸载。')
+        return True
 
     def _create_xml_field_combo(self, default_text: str = '') -> QComboBox:
         combo = QComboBox()
@@ -2284,6 +3272,7 @@ class SettingsPanel(QWidget):
                 self.label_xml_template_status.setText(f'已加载结构: {os.path.basename(path)}')
                 self.label_xml_fields_hint.setText('没有解析到可用字段，将继续使用默认字段。')
             self.save_settings()
+            self._shrink_stack_to_current_page(getattr(self, 'advanced_mode_stack', None))
         except Exception as e:
             QMessageBox.warning(self, 'XML 配置', f'XML 字段分析失败:\n{e}')
 
@@ -2318,6 +3307,7 @@ class SettingsPanel(QWidget):
 
         self._xml_custom_mapping_rows.append(row)
         self.xml_custom_map_layout.addWidget(row_widget)
+        self._shrink_stack_to_current_page(getattr(self, 'advanced_mode_stack', None))
 
     def _remove_xml_custom_mapping_row(self, row: dict):
         if row not in self._xml_custom_mapping_rows:
@@ -2329,6 +3319,7 @@ class SettingsPanel(QWidget):
             widget.deleteLater()
         self.save_settings()
         self._refresh_xml_preview()
+        self._shrink_stack_to_current_page(getattr(self, 'advanced_mode_stack', None))
 
     def _serialize_xml_custom_mappings(self) -> list:
         results = []
@@ -2364,6 +3355,7 @@ class SettingsPanel(QWidget):
                 tag_index=int(row.get('tag_index', 1) or 1),
             )
         self._refresh_xml_preview()
+        self._shrink_stack_to_current_page(getattr(self, 'advanced_mode_stack', None))
 
     def _build_xml_mapping_config(self) -> dict:
         return {
@@ -2400,6 +3392,7 @@ class SettingsPanel(QWidget):
 
     def _get_shareable_setting_keys(self) -> list:
         return [
+            'processing_mode',
             'processing_threads',
             'preload_count',
             'canny_enabled',
@@ -2412,6 +3405,14 @@ class SettingsPanel(QWidget):
             'pose_reject',
             'depth_accept',
             'depth_reject',
+            'score_filter_enabled',
+            'score_filter_checkpoint_path',
+            'score_filter_cache_root',
+            'score_filter_device',
+            'score_filter_min_aesthetic',
+            'score_filter_require_in_domain',
+            'score_filter_min_in_domain_prob',
+            'score_mode_auto_accept',
             'openpose_model',
             'openpose_yolo_version',
             'openpose_yolo_model_type',
@@ -2676,6 +3677,7 @@ class SettingsPanel(QWidget):
         else:
             self.edit_openpose_path.setEnabled(False)
             self.btn_browse_openpose.setEnabled(False)
+            self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
     def _get_openpose_model_type(self):
         """Extract actual model type from display text"""
@@ -2707,6 +3709,11 @@ class SettingsPanel(QWidget):
         self.combo_yolo_version.setEnabled(is_vitpose)
         self.combo_yolo_model_type.setVisible(is_vitpose)
         self.combo_yolo_model_type.setEnabled(is_vitpose)
+
+        # Avoid prompting during startup restore or when OpenPose is disabled.
+        if self._settings_tracking_suspended or not self.check_openpose.isChecked():
+            self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+            return
 
         # Check dependencies for ViTPose/SDPose-Wholebody (only once per session)
         if is_vitpose and not self._vitpose_deps_checked:
@@ -2747,6 +3754,7 @@ class SettingsPanel(QWidget):
             self._check_vitpose_model_files(model_type)
             # Mark as checked regardless of result (user can manually download if needed)
             self._vitpose_models_checked[model_type] = True
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
     def _on_yolo_model_type_changed(self):
         """Handle YOLO model type change (General vs Anime)"""
@@ -2799,6 +3807,7 @@ class SettingsPanel(QWidget):
             self.btn_browse_depth.setEnabled(False)
             self.edit_depth_path.setVisible(False)
             self.btn_browse_depth.setVisible(False)
+            self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
     def _on_depth_model_changed(self):
         """Handle Depth model selection change"""
@@ -2807,6 +3816,7 @@ class SettingsPanel(QWidget):
         self.btn_browse_depth.setEnabled(is_custom)
         self.edit_depth_path.setVisible(is_custom)
         self.btn_browse_depth.setVisible(is_custom)
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
     def _check_torch_availability(self):
         """Check if torch is available and update UI accordingly"""
@@ -3043,9 +4053,7 @@ class SettingsPanel(QWidget):
 
         if reply == QMessageBox.Yes:
             # Get progress file path from config
-            config = self.get_settings()
-            progress_config = config.get('progress', {})
-            progress_file = progress_config.get('progress_file', '.progress.json')
+            progress_file = self._resolve_progress_file_path()
 
             # Delete progress file
             import os
@@ -3357,6 +4365,7 @@ class SettingsPanel(QWidget):
         processing = self.config.get('processing', {})
         self.spin_processing_threads.setValue(processing.get('thread_count', 1))
         self.spin_preload_count.setValue(processing.get('preload_count', 15))
+        self._set_processing_mode(processing.get('mode', 'controlnet'))
 
         # Quality profile
         scoring = self.config.get('scoring', {})
@@ -3378,6 +4387,23 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.setValue(int(profile.get('pose_auto_reject', default_reject)))
         self.spin_depth_accept.setValue(int(profile.get('depth_auto_accept', default_accept)))
         self.spin_depth_reject.setValue(int(profile.get('depth_auto_reject', default_reject)))
+
+        prefilter = self.config.get('prefilter', {})
+        score_filter = FusionScoreFilter.normalize_config(prefilter.get('score_filter', {}))
+        self.check_score_filter_enabled.setChecked(bool(score_filter.get('enabled', False)))
+        self.edit_score_checkpoint_path.setText(
+            str(score_filter.get('checkpoint_path', './models/score/5kdataset.safetensors'))
+        )
+        self.edit_score_cache_root.setText(str(score_filter.get('cache_root', './models/score')))
+        self.combo_score_device.setCurrentText(str(score_filter.get('device', 'auto')).lower())
+        self.spin_score_min_aesthetic.setValue(float(score_filter.get('min_aesthetic_score', 2.5)))
+        self.check_score_require_in_domain.setChecked(bool(score_filter.get('require_in_domain', True)))
+        self.spin_score_min_in_domain_prob.setValue(float(score_filter.get('min_in_domain_prob', 0.5)))
+        self.spin_score_mode_auto_accept.setValue(float(processing.get('score_mode_auto_accept', 4.0)))
+        self._update_processing_mode_controls()
+        self._update_score_filter_controls()
+        self._refresh_score_filter_status()
+        self._schedule_score_filter_progress_count_refresh()
 
         # Control types (nested under processing)
         control_types = processing.get('control_types', {})
@@ -3432,7 +4458,7 @@ class SettingsPanel(QWidget):
             'vlm': {},
             'custom_tags': {},
             'output': {},
-            'prefilter': self.config.get('prefilter', {}),
+            'prefilter': deepcopy(self.config.get('prefilter', {})),
             'progress': self.config.get('progress', {}),
             'report': self.config.get('report', {}),
             'scoring': self.config.get('scoring', {})
@@ -3468,6 +4494,7 @@ class SettingsPanel(QWidget):
             'custom_input_dir': self.edit_custom_input_dir.text(),
             'thread_count': self.spin_processing_threads.value(),
             'preload_count': self.spin_preload_count.value(),
+            'mode': self._current_processing_mode(),
             'control_types': {
                 'canny': self.check_canny.isChecked(),
                 'openpose': self.check_openpose.isChecked(),
@@ -3492,6 +4519,7 @@ class SettingsPanel(QWidget):
                 'random_offset_range': 20
             },
             'parallel_threads': self.spin_parallel_threads.value(),
+            'score_mode_auto_accept': float(self.spin_score_mode_auto_accept.value()),
             'auto_pass_no_review': self.check_auto_pass_no_review.isChecked(),
             'single_jsona': self.check_single_jsona.isChecked(),
             'jsona_backup_every_entries': self.spin_jsona_backup_every_entries.value(),
@@ -3547,6 +4575,10 @@ class SettingsPanel(QWidget):
         settings['scoring']['profiles'][profile_key]['auto_accept'] = self.spin_canny_accept.value()
         settings['scoring']['profiles'][profile_key]['auto_reject'] = self.spin_canny_reject.value()
 
+        if 'prefilter' not in settings or not isinstance(settings['prefilter'], dict):
+            settings['prefilter'] = {}
+        settings['prefilter']['score_filter'] = self._build_score_filter_config()
+
         # Custom tags
         settings['custom_tags'] = {
             'enabled': self.check_append_tags.isChecked(),
@@ -3599,6 +4631,142 @@ class SettingsPanel(QWidget):
                 '重置完成',
                 '设置已重置为默认配置。\n\n请重新配置您需要的选项。'
             )
+
+    def _is_processing_running(self) -> bool:
+        main_window = self.window()
+        processing_thread = getattr(main_window, 'processing_thread', None)
+        return bool(processing_thread and processing_thread.isRunning())
+
+    def _resolve_progress_file_path(self) -> str:
+        settings = self.get_settings()
+        progress_config = settings.get('progress', {})
+        progress_file = str(progress_config.get('progress_file', '.progress.json') or '.progress.json').strip()
+        if os.path.isabs(progress_file):
+            return progress_file
+        return os.path.join(self._get_repo_root(), progress_file)
+
+    def _count_score_filter_progress_entries(self) -> int:
+        progress_file = self._resolve_progress_file_path()
+        if not os.path.exists(progress_file):
+            return 0
+        try:
+            return ProgressManager(progress_file).count_for_control_type('prefilter_score')
+        except Exception as e:
+            print(f"Error counting score filter progress: {e}")
+            return 0
+
+    def _reset_score_filter_progress(
+        self,
+        require_confirmation: bool = True,
+        prompt_title: str = '确认重置',
+        prompt_text: str = '',
+        show_result: bool = True,
+    ) -> int:
+        if self._is_processing_running():
+            if show_result:
+                QMessageBox.warning(self, '评分筛选', '当前任务正在运行，请先停止任务后再重置评分筛选进度。')
+            return 0
+
+        progress_file = self._resolve_progress_file_path()
+        if require_confirmation:
+            message = prompt_text or (
+                "确定要重置原图评分筛选进度吗？\n\n"
+                "这只会清空评分筛选相关的处理记录，下次处理时会重新执行原图评分。\n"
+                "已生成的控制图和 JSONA 文件不会被删除。"
+            )
+            reply = QMessageBox.question(
+                self,
+                prompt_title,
+                message,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return 0
+
+        if not os.path.exists(progress_file):
+            if show_result:
+                QMessageBox.information(self, '评分筛选', '进度文件不存在，无需重置评分筛选进度。')
+            return 0
+
+        try:
+            removed = ProgressManager(progress_file).reset_for_control_type('prefilter_score')
+            self._schedule_score_filter_progress_count_refresh()
+            if show_result:
+                if removed > 0:
+                    QMessageBox.information(
+                        self,
+                        '评分筛选',
+                        f'已重置 {removed} 条评分筛选进度记录。\n\n进度文件: {progress_file}'
+                    )
+                else:
+                    QMessageBox.information(self, '评分筛选', '没有检测到评分筛选进度记录，无需重置。')
+            return removed
+        except Exception as e:
+            if show_result:
+                QMessageBox.critical(self, '评分筛选', f'重置评分筛选进度失败:\n{e}')
+            return 0
+
+    def _prompt_reset_xml_jsona(self):
+        settings = self.get_settings()
+        output_dir = settings['output']['base_dir']
+        xml_count = self._count_jsona_entries(os.path.join(output_dir, 'xml.jsona'), expected_name='xml')
+        if xml_count <= 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            'XML 映射已修改',
+            f'检测到当前已有 {xml_count} 条 XML JSONA 记录。\n\n'
+            'XML 映射配置刚刚发生变化，现有 xml.jsona 可能与新配置不一致。\n'
+            '是否现在清空 xml.jsona，后续重新生成？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self._reset_jsona_files(['xml'], require_confirmation=False)
+
+    def _prompt_reset_text_jsona(self):
+        settings = self.get_settings()
+        output_dir = settings['output']['base_dir']
+        counts = {
+            'tag': self._count_jsona_entries(os.path.join(output_dir, 'tag.jsona'), expected_name='tag'),
+            'nl': self._count_jsona_entries(os.path.join(output_dir, 'nl.jsona'), expected_name='nl'),
+            'xml': self._count_jsona_entries(os.path.join(output_dir, 'xml.jsona'), expected_name='xml'),
+        }
+        total = sum(counts.values())
+        if total <= 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            'Tag 输出设置已修改',
+            f'检测到当前已有 Tag/NL/XML 记录共 {total} 条。\n'
+            f"Tag: {counts['tag']} 条, NL: {counts['nl']} 条, XML: {counts['xml']} 条\n\n"
+            'Tag 附加设置刚刚发生变化，现有 tag.jsona / nl.jsona / xml.jsona 可能与新设置不一致。\n'
+            '是否现在清空这 3 个文件，后续重新生成？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self._reset_jsona_files(['tag', 'nl', 'xml'], require_confirmation=False)
+
+    def _prompt_reset_score_filter_progress(self):
+        existing_count = self._count_score_filter_progress_entries()
+        if existing_count <= 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            '评分筛选设置已修改',
+            f'检测到当前已有 {existing_count} 条原图评分筛选进度记录。\n\n'
+            '评分阈值或 checkpoint 刚刚发生变化，旧进度可能阻止图片重新评分。\n'
+            '是否现在重置评分筛选进度，下次重新筛选这些图片？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self._reset_score_filter_progress(require_confirmation=False)
 
     def _update_jsona_statistics(self):
         """Update JSONA file statistics display"""
@@ -3655,61 +4823,89 @@ class SettingsPanel(QWidget):
             print(f"Error counting jsona entries: {e}")
             return 0
 
-    def _reset_jsona_file(self, control_type: str):
-        """Reset (clear) a specific jsona file with confirmation"""
-        reply = QMessageBox.question(
-            self,
-            '确认重置',
-            f'确定要清空 {control_type.upper()} 的 JSONA 文件吗？\n\n此操作不可恢复！',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
+    def _jsona_filename_for_control_type(self, control_type: str) -> str:
+        mapping = {
+            'canny': 'canny.jsona',
+            'pose': 'pose.jsona',
+            'depth': 'depth.jsona',
+            'metadata': 'metadata.jsona',
+            'tag': 'tag.jsona',
+            'nl': 'nl.jsona',
+            'xml': 'xml.jsona',
+        }
+        return mapping.get(control_type, '')
 
-        if reply == QMessageBox.Yes:
-            settings = self.get_settings()
-            output_dir = settings['output']['base_dir']
+    def _reset_jsona_files(
+        self,
+        control_types: list,
+        require_confirmation: bool = True,
+        prompt_title: str = '确认重置',
+        prompt_text: str = '',
+        show_result: bool = True,
+    ) -> int:
+        if self._is_processing_running():
+            if show_result:
+                QMessageBox.warning(self, 'JSONA 重置', '当前任务正在运行，请先停止任务后再重置 JSONA 文件。')
+            return 0
 
-            # Determine jsona filename
-            if control_type == 'canny':
-                jsona_file = 'canny.jsona'
-            elif control_type == 'pose':
-                jsona_file = 'pose.jsona'
-            elif control_type == 'depth':
-                jsona_file = 'depth.jsona'
-            elif control_type == 'metadata':
-                jsona_file = 'metadata.jsona'
-            elif control_type == 'tag':
-                jsona_file = 'tag.jsona'
-            elif control_type == 'nl':
-                jsona_file = 'nl.jsona'
-            elif control_type == 'xml':
-                jsona_file = 'xml.jsona'
+        cleaned_types = [str(item or '').strip().lower() for item in control_types if str(item or '').strip()]
+        if not cleaned_types:
+            return 0
+
+        if require_confirmation:
+            if len(cleaned_types) == 1:
+                default_text = f'确定要清空 {cleaned_types[0].upper()} 的 JSONA 文件吗？\n\n此操作不可恢复！'
             else:
-                return
-
-            jsona_path = os.path.join(output_dir, jsona_file)
-
-            try:
-                if os.path.exists(jsona_path):
-                    backup_manager = JsonaBackupManager()
-                    restore_point = backup_manager.replace_entries(jsona_path, [], reason='manual_reset')
-
-                    message = f'{control_type.upper()} 的 JSONA 文件已清空。'
-                    if restore_point:
-                        message += f'\n\n恢复点备份：\n{restore_point}'
-                    QMessageBox.information(self, '重置完成', message)
-
-                    # Update statistics
-                    self._update_jsona_statistics()
-                else:
-                    QMessageBox.information(
-                        self,
-                        '文件不存在',
-                        f'{control_type.upper()} 的 JSONA 文件不存在。'
-                    )
-            except Exception as e:
-                QMessageBox.critical(
-                    self,
-                    '重置失败',
-                    f'清空 JSONA 文件时出错：\n{str(e)}'
+                default_text = (
+                    '确定要清空以下 JSONA 文件吗？\n\n'
+                    + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
+                    + '\n\n此操作不可恢复！'
                 )
+            reply = QMessageBox.question(
+                self,
+                prompt_title,
+                prompt_text or default_text,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return 0
+
+        settings = self.get_settings()
+        output_dir = settings['output']['base_dir']
+        backup_manager = JsonaBackupManager()
+        restore_points = []
+        reset_count = 0
+
+        try:
+            for control_type in cleaned_types:
+                jsona_file = self._jsona_filename_for_control_type(control_type)
+                if not jsona_file:
+                    continue
+                jsona_path = os.path.join(output_dir, jsona_file)
+                if not os.path.exists(jsona_path):
+                    continue
+                restore_point = backup_manager.replace_entries(jsona_path, [], reason='manual_reset')
+                if restore_point:
+                    restore_points.append(restore_point)
+                reset_count += 1
+        except Exception as e:
+            if show_result:
+                QMessageBox.critical(self, '重置失败', f'清空 JSONA 文件时出错：\n{str(e)}')
+            return 0
+
+        self._update_jsona_statistics()
+
+        if show_result:
+            if reset_count > 0:
+                message = '已清空以下 JSONA 文件：\n' + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
+                if restore_points:
+                    message += '\n\n恢复点备份：\n' + '\n'.join(restore_points)
+                QMessageBox.information(self, '重置完成', message)
+            else:
+                QMessageBox.information(self, '文件不存在', '目标 JSONA 文件不存在，无需重置。')
+        return reset_count
+
+    def _reset_jsona_file(self, control_type: str):
+        """Reset (clear) a specific jsona file with confirmation."""
+        self._reset_jsona_files([control_type], require_confirmation=True)

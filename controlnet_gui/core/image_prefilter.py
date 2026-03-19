@@ -1,10 +1,12 @@
 """
-Pre-filter - First layer quality check (blur detection)
+Pre-filter - First layer quality check.
 """
 import cv2
 import numpy as np
 from PIL import Image
 from enum import Enum
+
+from .fusion_score_filter import FusionScoreFilter
 
 
 class SharpnessLevel(Enum):
@@ -15,22 +17,34 @@ class SharpnessLevel(Enum):
 
 
 class ImagePreFilter:
-    """Pre-filter for input image quality check"""
+    """Pre-filter for input image quality checks."""
 
     def __init__(self, config: dict):
         """
         Args:
-            config: Configuration dict with blur detection settings
+            config: Configuration dict with blur detection and score filter settings.
         """
-        # Support both nested and flat config structures
         if 'blur_detection' in config:
             blur_config = config.get('blur_detection', {})
+            score_filter_config = config.get('score_filter', {})
         else:
-            blur_config = config.get('prefilter', {}).get('blur_detection', {})
+            prefilter_config = config.get('prefilter', {})
+            blur_config = prefilter_config.get('blur_detection', {})
+            score_filter_config = prefilter_config.get('score_filter', {})
 
         self.enabled = blur_config.get('enabled', True)
         self.threshold_high = blur_config.get('laplacian_threshold_high', 100.0)
         self.threshold_medium = blur_config.get('laplacian_threshold_medium', 50.0)
+        self.score_filter = FusionScoreFilter(score_filter_config)
+
+    def has_active_score_filter(self) -> bool:
+        return self.score_filter.is_enabled()
+
+    def get_score_filter_status(self, force_refresh: bool = False) -> dict:
+        return self.score_filter.get_probe(force_refresh=force_refresh)
+
+    def prepare_score_filter(self) -> tuple[bool, str]:
+        return self.score_filter.ensure_runtime_ready()
 
     def check_sharpness(self, image: Image.Image) -> tuple:
         """
@@ -63,19 +77,19 @@ class ImagePreFilter:
         return level, blur_score
 
     def evaluate(self, image: Image.Image) -> dict:
-        """
-        Evaluate image quality
-
-        Args:
-            image: PIL Image
-
-        Returns:
-            dict with quality information
-        """
+        """Evaluate image quality."""
         sharpness_level, blur_score = self.check_sharpness(image)
 
-        return {
+        result = {
             'sharpness_level': sharpness_level.value,
             'blur_score': blur_score,
-            'quality_warning': sharpness_level == SharpnessLevel.LOW
+            'quality_warning': sharpness_level == SharpnessLevel.LOW,
+            'skip_processing': False,
         }
+
+        if self.score_filter.is_enabled():
+            score_result = self.score_filter.evaluate(image)
+            result['score_filter'] = score_result
+            result['skip_processing'] = bool(score_result.get('should_reject', False))
+
+        return result
