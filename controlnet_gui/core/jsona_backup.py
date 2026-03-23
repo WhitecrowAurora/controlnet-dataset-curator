@@ -12,8 +12,8 @@ from typing import Dict, List, Optional, Tuple
 class JsonaBackupManager:
     """Manage JSONA backups and maintenance operations."""
 
-    DEFAULT_NAMES = ('canny', 'pose', 'depth', 'metadata', 'tag', 'nl', 'xml')
-    CONTROL_TASKS = ('canny', 'pose', 'depth')
+    DEFAULT_NAMES = ('canny', 'pose', 'depth', 'bbox', 'metadata', 'tag', 'nl', 'xml')
+    CONTROL_TASKS = ('canny', 'pose', 'depth', 'bbox')
     TEXT_TASKS = ('tag', 'nl', 'xml')
     KNOWN_TASKS = CONTROL_TASKS + TEXT_TASKS
     TOP_LEVEL_KEYS = ('entries', 'items', 'data', 'records')
@@ -179,6 +179,8 @@ class JsonaBackupManager:
             return 'pose'
         if '_depth' in path or '/depth/' in path:
             return 'depth'
+        if '_bbox' in path or '/bbox/' in path:
+            return 'bbox'
         return ''
 
     def _entry_key(self, entry: Dict) -> Tuple[str, str, str]:
@@ -826,7 +828,7 @@ class JsonaBackupManager:
 
         target_name = self.detect_target_name(source_path, entries)
         if not target_name:
-            raise ValueError('Cannot determine JSONA target type. Please use canny/pose/depth/metadata naming or valid task_id values.')
+            raise ValueError('Cannot determine JSONA target type. Please use canny/pose/depth/bbox/metadata naming or valid task_id values.')
 
         expected_name = self._target_name_to_expected(target_name)
         report = self.analyze_entries(entries, expected_name=expected_name, check_files=verify_files, source_path=source_path)
@@ -864,7 +866,7 @@ class JsonaBackupManager:
             if not target_name:
                 raise ValueError(
                     f'Cannot determine JSONA target type: {source_path}. '
-                    'Please use canny/pose/depth/tag/nl/xml/metadata naming or valid task_id values.'
+                    'Please use canny/pose/depth/bbox/tag/nl/xml/metadata naming or valid task_id values.'
                 )
 
             expected_name = self._target_name_to_expected(target_name)

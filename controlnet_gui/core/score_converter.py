@@ -112,6 +112,15 @@ def depth_to_10_scale(metrics: dict, is_valid: bool, warning: str = None) -> flo
     return round(base_score, 1)
 
 
+def bbox_to_10_scale(raw_score: float) -> float:
+    """
+    Convert BBox score (0-100) to 1-10 scale.
+    """
+    score = (float(raw_score) / 100.0) * 9.0 + 1.0
+    score = max(1.0, min(10.0, score))
+    return round(score, 1)
+
+
 def calculate_overall_score(canny_score: float, openpose_score: float = None,
                            depth_score: float = None) -> float:
     """

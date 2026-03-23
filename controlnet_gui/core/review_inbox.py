@@ -155,6 +155,7 @@ class ReviewInbox:
                 "thresholds": variant.get("thresholds"),
                 "warning": variant.get("warning"),
                 "metrics": variant.get("metrics"),
+                "detections": variant.get("detections"),
                 "visibility_ratio": variant.get("visibility_ratio"),
                 "is_vitpose": bool(variant.get("is_vitpose", False)),
             })
@@ -313,8 +314,12 @@ class ReviewInbox:
         try:
             shutil.copy2(original_path, orig_dst)
             copied["original"] = os.path.relpath(orig_dst, self.root)
-        except Exception:
-            copied["original"] = None
+        except Exception as exc:
+            shutil.rmtree(item_dir, ignore_errors=True)
+            return False, {
+                "error": "original_copy_failed",
+                "message": str(exc),
+            }
 
         # Save tags.
         tag_dst = os.path.join(item_dir, "tags.txt")
@@ -341,6 +346,7 @@ class ReviewInbox:
                     "thresholds": (variants[idx] or {}).get("thresholds"),
                     "warning": (variants[idx] or {}).get("warning"),
                     "metrics": (variants[idx] or {}).get("metrics"),
+                    "detections": (variants[idx] or {}).get("detections"),
                     "visibility_ratio": (variants[idx] or {}).get("visibility_ratio"),
                     "is_vitpose": (variants[idx] or {}).get("is_vitpose", False),
                 })

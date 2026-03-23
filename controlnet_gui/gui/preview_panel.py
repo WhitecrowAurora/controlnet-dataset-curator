@@ -214,6 +214,7 @@ class PreviewPanel(QWidget):
             'canny': 'Canny',
             'openpose': 'OpenPose',
             'depth': 'Depth',
+            'bbox': 'BBox',
             'prefilter_score': '原图评分',
         }.get(control_type, control_type)
 
@@ -268,6 +269,28 @@ class PreviewPanel(QWidget):
 目标域要求: {domain_rule}
 设备: {preset.get('device', 'N/A')}
 说明: {preset.get('reason', '') or '无'}
+            """.strip()
+        elif control_type == 'bbox':
+            count = int(preset.get('count', 0) or 0)
+            mean_conf = float(preset.get('mean_confidence', 0.0) or 0.0)
+            max_conf = float(preset.get('max_confidence', 0.0) or 0.0)
+            warning = str(preset.get('warning', '') or '').strip()
+            detections = preset.get('detections') or []
+            labels = []
+            for det in detections[:6]:
+                if isinstance(det, dict):
+                    label = str(det.get('label', 'obj') or 'obj')
+                    conf = float(det.get('confidence', 0.0) or 0.0)
+                    labels.append(f"{label}({conf:.2f})")
+            warning_line = f"\n警告: {warning}" if warning else ""
+            labels_line = ", ".join(labels) if labels else '无'
+            details = f"""
+预设: {preset_name}
+评分: {variant_10_score:.1f}/10 (原始: {raw_score:.1f}/100)
+检测框数量: {count}
+平均置信度: {mean_conf:.3f}
+最高置信度: {max_conf:.3f}
+检测明细: {labels_line}{warning_line}
             """.strip()
         else:
             details = f"预设: {preset_name}\n评分: {variant_10_score:.1f}/10"

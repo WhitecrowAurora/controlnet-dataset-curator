@@ -31,7 +31,7 @@ from ..core.review_inbox import ReviewInbox, ReviewInboxPolicy
 from ..core.tag_formats import build_nl_prompt, build_xml_fragment
 from ..core.vlm_client import VlmConfig
 from ..core.score_converter import (
-    canny_to_10_scale, openpose_to_10_scale, depth_to_10_scale
+    bbox_to_10_scale, canny_to_10_scale, openpose_to_10_scale, depth_to_10_scale
 )
 from ..language import get_lang_manager, tr
 
@@ -747,16 +747,24 @@ class ProcessingThread(QThread):
                                 if self.progress_manager:
                                     self.progress_manager.mark_processed(prefilter_progress_key)
                             else:
-                                current_mb = info.get('current_mb', 0)
-                                max_mb = info.get('max_mb', 0)
-                                self.progress_updated.emit(
-                                    f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
-                                )
-                                on_full = str(info.get('on_full', 'pause')).lower()
-                                if on_full == 'stop':
-                                    self.running = False
-                                    break
-                                self.paused = True
+                                error_code = str(info.get('error', '') or '').lower()
+                                if error_code == 'inbox_full':
+                                    current_mb = info.get('current_mb', 0)
+                                    max_mb = info.get('max_mb', 0)
+                                    self.progress_updated.emit(
+                                        f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
+                                    )
+                                    on_full = str(info.get('on_full', 'pause')).lower()
+                                    if on_full == 'stop':
+                                        self.running = False
+                                        break
+                                    self.paused = True
+                                else:
+                                    self.progress_updated.emit(
+                                        f"写入审核箱失败({error_code or 'unknown_error'})，已自动暂停。"
+                                        "请检查输出目录权限、源文件可读性或磁盘空间后继续。"
+                                    )
+                                    self.paused = True
                         else:
                             while self.running:
                                 try:
@@ -820,6 +828,7 @@ class ProcessingThread(QThread):
                 canny_result = result.get('canny', {})
                 openpose_result = result.get('openpose', {})
                 depth_result = result.get('depth', {})
+                bbox_result = result.get('bbox', {})
 
                 control_types_to_display = []
                 if canny_result and canny_result.get('variants'):
@@ -828,6 +837,8 @@ class ProcessingThread(QThread):
                     control_types_to_display.append(('openpose', openpose_result))
                 if depth_result and depth_result.get('variants'):
                     control_types_to_display.append(('depth', depth_result))
+                if bbox_result and bbox_result.get('variants'):
+                    control_types_to_display.append(('bbox', bbox_result))
 
                 if not control_types_to_display:
                     # No valid control type, skip this image
@@ -886,6 +897,9 @@ class ProcessingThread(QThread):
                     elif control_type == 'depth':
                         auto_accept_th = float(profile.get('depth_auto_accept', profile.get('auto_accept', 55)))
                         auto_reject_th = float(profile.get('depth_auto_reject', profile.get('auto_reject', 40)))
+                    elif control_type == 'bbox':
+                        auto_accept_th = float(profile.get('bbox_auto_accept', profile.get('auto_accept', 55)))
+                        auto_reject_th = float(profile.get('bbox_auto_reject', profile.get('auto_reject', 40)))
                     else:
                         auto_accept_th = float(profile.get('auto_accept', 55))
                         auto_reject_th = float(profile.get('auto_reject', 40))
@@ -914,6 +928,8 @@ class ProcessingThread(QThread):
                             best_variant.get('score', 0) >= 60,  # is_valid threshold
                             best_variant.get('warning')
                         )
+                    elif control_type == 'bbox':
+                        control_10_score = bbox_to_10_scale(best_score) if best_score > 0 else 1.0
 
                     gui_data = {
                         'original_image': img,
@@ -960,6 +976,14 @@ class ProcessingThread(QThread):
                             )
                             preset_info = variant.get('metrics', {})
                             preset_name = variant.get('preset', 'unknown')
+                        elif control_type == 'bbox':
+                            variant_10_score = bbox_to_10_scale(variant.get('score', 0))
+                            preset_info = {
+                                **(variant.get('metrics', {}) or {}),
+                                'warning': variant.get('warning'),
+                                'detections': variant.get('detections', []),
+                            }
+                            preset_name = variant.get('preset', 'bbox')
 
                         gui_data['variants'].append({
                             'image': variant_img,
@@ -1090,17 +1114,25 @@ class ProcessingThread(QThread):
                                 if self.progress_manager:
                                     self.progress_manager.mark_processed(progress_key)
                             else:
-                                # Inbox full: auto pause/stop.
-                                current_mb = info.get('current_mb', 0)
-                                max_mb = info.get('max_mb', 0)
-                                self.progress_updated.emit(
-                                    f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
-                                )
-                                on_full = str(info.get('on_full', 'pause')).lower()
-                                if on_full == 'stop':
-                                    self.running = False
-                                    break
-                                self.paused = True
+                                error_code = str(info.get('error', '') or '').lower()
+                                if error_code == 'inbox_full':
+                                    # Inbox full: auto pause/stop.
+                                    current_mb = info.get('current_mb', 0)
+                                    max_mb = info.get('max_mb', 0)
+                                    self.progress_updated.emit(
+                                        f"审核箱已满 ({current_mb:.0f}/{max_mb:.0f} MB)，已自动暂停。请处理审核箱或调大上限后继续。"
+                                    )
+                                    on_full = str(info.get('on_full', 'pause')).lower()
+                                    if on_full == 'stop':
+                                        self.running = False
+                                        break
+                                    self.paused = True
+                                else:
+                                    self.progress_updated.emit(
+                                        f"写入审核箱失败({error_code or 'unknown_error'})，已自动暂停。"
+                                        "请检查输出目录权限、源文件可读性或磁盘空间后继续。"
+                                    )
+                                    self.paused = True
                         else:
                             # Needs review - retry with short timeouts so stop/exit can interrupt cleanly.
                             while self.running:
@@ -1215,6 +1247,10 @@ class ProcessingThread(QThread):
                 save_path = os.path.join(out_dir, f"{basename}_depth.png")
                 control_img.save(save_path)
                 print(f"[DEBUG] Saved depth to: {save_path}")
+            elif control_type == 'bbox':
+                save_path = os.path.join(out_dir, f"{basename}_bbox.png")
+                control_img.save(save_path)
+                print(f"[DEBUG] Saved bbox to: {save_path}")
 
             # Save metadata (append control type info)
             meta_path = os.path.join(out_dir, f"{basename}_meta.json")
@@ -1238,6 +1274,9 @@ class ProcessingThread(QThread):
             elif control_type == 'depth':
                 meta['depth_preset'] = preset_name
                 meta['depth_score'] = result.get('best_score', 0)
+            elif control_type == 'bbox':
+                meta['bbox_preset'] = preset_name
+                meta['bbox_score'] = result.get('best_score', 0)
 
             with open(meta_path, 'w', encoding='utf-8') as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -1327,7 +1366,8 @@ class ProcessingThread(QThread):
             control_map = {
                 'canny': ('canny', '_canny.png'),
                 'openpose': ('pose', '_openpose.png'),
-                'depth': ('depth', '_depth.png')
+                'depth': ('depth', '_depth.png'),
+                'bbox': ('bbox', '_bbox.png'),
             }
 
             if control_type not in control_map:
@@ -2096,7 +2136,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(
                         self,
                         "No Control Type Selected",
-                        "Please select at least one control type (Canny, OpenPose, or Depth) in Processing Settings."
+                        "Please select at least one control type (Canny, OpenPose, Depth, or BBox) in Processing Settings."
                     )
                     return
 
@@ -2135,6 +2175,28 @@ class MainWindow(QMainWindow):
                             "无法继续",
                             "未安装 Depth Anything V2，无法进行 Depth 处理。\n\n"
                             "请禁用 Depth 或从 Tools 菜单安装后再试。"
+                        )
+                        return
+
+                if control_types.get('bbox', False):
+                    try:
+                        import ultralytics
+                    except ImportError:
+                        reply = QMessageBox.question(
+                            self,
+                            "需要安装 BBox 检测依赖",
+                            "您启用了 BBox 处理，但未安装 ultralytics 库。\n\n"
+                            "是否现在安装？",
+                            QMessageBox.Yes | QMessageBox.No
+                        )
+                        if reply == QMessageBox.Yes:
+                            self._run_pip_install(['ultralytics'], '安装 BBox 检测依赖')
+                            return
+                        QMessageBox.warning(
+                            self,
+                            "无法继续",
+                            "未安装 ultralytics，无法进行 BBox 处理。\n\n"
+                            "请禁用 BBox 或安装依赖后再试。"
                         )
                         return
 
@@ -2367,24 +2429,34 @@ class MainWindow(QMainWindow):
                         review_source='manual_review',
                     )
                 else:
+                    suffix_map = {
+                        'canny': '_canny.png',
+                        'openpose': '_openpose.png',
+                        'depth': '_depth.png',
+                        'bbox': '_bbox.png',
+                    }
+                    suffix = suffix_map.get(control_type, f'_{control_type}.png')
+                    control_save_path = os.path.join(review_dir, f"{basename}{suffix}")
                     control_img = variant.get('image')
-                    if control_img:
-                        suffix_map = {
-                            'canny': '_canny.png',
-                            'openpose': '_openpose.png',
-                            'depth': '_depth.png'
-                        }
-                        suffix = suffix_map.get(control_type, f'_{control_type}.png')
-                        control_save_path = os.path.join(review_dir, f"{basename}{suffix}")
+                    if control_img is not None:
                         control_img.save(control_save_path)
                         print(f"[DEBUG] Saved control image to: {control_save_path}")
+                    else:
+                        source_variant_path = str(variant.get('path', '') or '').strip()
+                        if source_variant_path and os.path.exists(source_variant_path):
+                            import shutil
+                            shutil.copy2(source_variant_path, control_save_path)
+                            print(f"[DEBUG] Copied control image from path: {control_save_path}")
+                        else:
+                            raise ValueError('选中的控制图不存在或已失效，无法保存。')
 
                     source_image_path = orig_save_path if os.path.exists(orig_save_path) else image_path
-                    if source_image_path:
+                    if source_image_path and os.path.exists(control_save_path):
                         folder_map = {
                             'canny': 'canny',
                             'openpose': 'pose',
-                            'depth': 'depth'
+                            'depth': 'depth',
+                            'bbox': 'bbox',
                         }
                         folder_name = folder_map.get(control_type, control_type)
                         entry = self._create_jsona_entry(source_image_path, tags, control_save_path, folder_name)
@@ -3350,11 +3422,15 @@ class MainWindow(QMainWindow):
                     stored = rec.get('stored', {}) or {}
                     orig_rel = stored.get('original')
                     if not orig_rel:
+                        if rec.get('id'):
+                            inbox.mark_done_by_id(rec.get('id'))
                         skipped += 1
                         continue
 
                     orig_path = os.path.join(inbox.root, orig_rel)
                     if not os.path.exists(orig_path):
+                        if rec.get('id'):
+                            inbox.mark_done_by_id(rec.get('id'))
                         skipped += 1
                         continue
 
@@ -3396,6 +3472,13 @@ class MainWindow(QMainWindow):
                                 raw_score >= 60,
                                 vrec.get('warning'),
                             )
+                        elif control_type == 'bbox':
+                            preset_info = vrec.get('metrics') or {}
+                            if vrec.get('warning'):
+                                preset_info = {**preset_info, 'warning': vrec.get('warning')}
+                            if vrec.get('detections') is not None:
+                                preset_info = {**preset_info, 'detections': vrec.get('detections')}
+                            score_10 = bbox_to_10_scale(raw_score)
                         elif control_type == 'prefilter_score':
                             preset_info = vrec.get('metrics') or {}
                             aesthetic = preset_info.get('aesthetic')

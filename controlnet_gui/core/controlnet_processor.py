@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import tempfile
 
+from .bbox_processor import BBoxProcessor
 from .jsona_backup import JsonaBackupManager
 
 # Lazy imports for heavy dependencies
@@ -33,6 +34,7 @@ class ControlNetProcessor:
         self.canny_detector = None
         self.dwpose_detector = None
         self.zoe_detector = None
+        self.bbox_processor = None
         self.torch = None
         self.device = None
 
@@ -47,6 +49,8 @@ class ControlNetProcessor:
         need_canny = bool(self.enabled_types.get('canny', False))
         need_openpose = bool(self.enabled_types.get('openpose', False))
         need_depth = bool(self.enabled_types.get('depth', False))
+        need_bbox = bool(self.enabled_types.get('bbox', False))
+        model_config = processing_config.get('model_config', {})
 
         # Canny runs via OpenCV to avoid importing controlnet_aux (its package __init__
         # imports torch and other heavy deps). This keeps "GUI-only / Canny-only" usable.
@@ -119,9 +123,6 @@ class ControlNetProcessor:
 
             self.torch = torch
             self.device = self.torch.device("cuda" if self.torch.cuda.is_available() else "cpu")
-
-            # Get model configuration
-            model_config = processing_config.get('model_config', {})
 
             if need_openpose:
                 from .vitpose_processor import PoseProcessorManager
@@ -239,6 +240,20 @@ class ControlNetProcessor:
 
                 print(f"[DEBUG] Depth detector loaded on device: {next(self.zoe_detector.model.parameters()).device if hasattr(self.zoe_detector, 'model') else 'unknown'}")
 
+        if need_bbox:
+            bbox_config = model_config.get('bbox', {}) if isinstance(model_config, dict) else {}
+            model_type = str(bbox_config.get('type', 'YOLOv11') or 'YOLOv11')
+            custom_path = str(bbox_config.get('custom_path', '') or '').strip()
+            model_source = self._resolve_bbox_model_source(model_type, custom_path)
+            self.bbox_processor = BBoxProcessor(
+                model_source=model_source,
+                conf_threshold=float(bbox_config.get('conf_threshold', 0.25)),
+                iou_threshold=float(bbox_config.get('iou_threshold', 0.45)),
+                max_detections=int(bbox_config.get('max_detections', 20)),
+                person_only=bool(bbox_config.get('person_only', True)),
+            )
+            print(f"[INFO] Using BBox model: {model_source}")
+
         # Retry configuration (nested under processing)
         if 'retry_strategy' in processing_config:
             self.retry_config = processing_config['retry_strategy']
@@ -291,6 +306,18 @@ class ControlNetProcessor:
         # Verify we now have a usable temp directory.
         tempfile.gettempdir()
 
+    def _resolve_bbox_model_source(self, model_type: str, custom_path: str) -> str:
+        text = str(model_type or '').strip()
+        if text == 'Custom Path':
+            return custom_path or 'models/yolo/yolo11n.pt'
+        if '动漫' in text or 'Anime' in text:
+            return 'models/yolo/anime_person_detect_v1.3_s.pt'
+        if 'YOLO26' in text:
+            return 'models/yolo/yolo26n.pt'
+        if 'YOLOv8' in text:
+            return 'models/yolo/yolov8n.pt'
+        return 'models/yolo/yolo11n.pt'
+
     def process_image(self, image_path: str, output_dir: str, basename: str) -> Dict:
         """
         Process single image and generate all enabled control types (parallel processing)
@@ -310,6 +337,11 @@ class ControlNetProcessor:
                 },
                 'depth': {
                     'variants': [{'path': str, 'score': float, 'preset': str, 'warning': str, 'metrics': dict}, ...],
+                    'best_score': float,
+                    'quality_flag': str
+                },
+                'bbox': {
+                    'variants': [{'path': str, 'score': float, 'preset': str, 'warning': str, 'metrics': dict, 'detections': list}],
                     'best_score': float,
                     'quality_flag': str
                 }
@@ -338,6 +370,10 @@ class ControlNetProcessor:
             if hasattr(self, 'depth_anything_model') and self.depth_anything_model:
                 future = executor.submit(self._process_depth, img, output_dir, basename)
                 tasks[future] = 'depth'
+
+            if self.bbox_processor is not None:
+                future = executor.submit(self._process_bbox, img, output_dir, basename)
+                tasks[future] = 'bbox'
 
             # Collect results as they complete
             for future in as_completed(tasks):
@@ -376,7 +412,8 @@ class ControlNetProcessor:
         folder_map = {
             'canny': 'canny',
             'openpose': 'pose',
-            'depth': 'depth'
+            'depth': 'depth',
+            'bbox': 'bbox',
         }
 
         # Check if using single JSONA file
@@ -718,6 +755,51 @@ class ControlNetProcessor:
             'variants': variants,
             'best_score': best_score,
             'quality_flag': quality_flag
+        }
+
+    def _process_bbox(self, img: Image.Image, output_dir: str, basename: str) -> Dict:
+        """Generate BBox detection visualization."""
+        if self.bbox_processor is None:
+            return {
+                'variants': [],
+                'best_score': 0,
+                'quality_flag': 'auto_reject',
+            }
+
+        try:
+            detected = self.bbox_processor.process_pil_image(img)
+        except Exception as e:
+            print(f"[ERROR] BBox inference failed: {e}")
+            return {
+                'variants': [],
+                'best_score': 0,
+                'quality_flag': 'auto_reject',
+            }
+
+        filename = f"{basename}_bbox.png"
+        bbox_path = os.path.join(output_dir, 'bbox', filename)
+        os.makedirs(os.path.dirname(bbox_path), exist_ok=True)
+        detected['visualized_image'].save(bbox_path)
+
+        score = float(detected.get('score', 0))
+        warning = detected.get('warning')
+        metrics = detected.get('metrics', {})
+        detections = detected.get('detections', [])
+        quality_flag = str(detected.get('quality_flag', 'user_review'))
+
+        return {
+            'variants': [
+                {
+                    'path': bbox_path,
+                    'score': score,
+                    'preset': 'bbox',
+                    'warning': warning,
+                    'metrics': metrics,
+                    'detections': detections,
+                }
+            ],
+            'best_score': score,
+            'quality_flag': quality_flag,
         }
 
     def _score_canny(self, canny_path: str) -> float:

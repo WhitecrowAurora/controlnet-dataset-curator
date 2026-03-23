@@ -1004,7 +1004,7 @@ class SettingsPanel(QWidget):
         self.tab_processing_mode.setExpanding(True)
         self.tab_processing_mode.addTab('ControlNet 图片生成模式')
         self.tab_processing_mode.addTab('图片评分模式')
-        self.tab_processing_mode.setTabToolTip(0, '生成并筛选 Canny / Pose / Depth 控制图。')
+        self.tab_processing_mode.setTabToolTip(0, '生成并筛选 Canny / Pose / Depth / BBox 控制图。')
         self.tab_processing_mode.setTabToolTip(1, '只对原图做评分与筛选，不生成控制图。')
         self.tab_processing_mode.setCurrentIndex(0)
         layout.addWidget(self.tab_processing_mode)
@@ -1048,6 +1048,7 @@ class SettingsPanel(QWidget):
             'canny_enabled': self.check_canny.isChecked(),
             'openpose_enabled': self.check_openpose.isChecked(),
             'depth_enabled': self.check_depth.isChecked(),
+            'bbox_enabled': self.check_bbox.isChecked(),
             'quality_profile': self.combo_quality_profile.currentText(),
             'canny_accept': self.spin_canny_accept.value(),
             'canny_reject': self.spin_canny_reject.value(),
@@ -1055,6 +1056,8 @@ class SettingsPanel(QWidget):
             'pose_reject': self.spin_pose_reject.value(),
             'depth_accept': self.spin_depth_accept.value(),
             'depth_reject': self.spin_depth_reject.value(),
+            'bbox_accept': self.spin_bbox_accept.value(),
+            'bbox_reject': self.spin_bbox_reject.value(),
             'score_filter_enabled': self.check_score_filter_enabled.isChecked(),
             'score_filter_checkpoint_path': self.edit_score_checkpoint_path.text(),
             'score_filter_cache_root': self.edit_score_cache_root.text(),
@@ -1069,6 +1072,11 @@ class SettingsPanel(QWidget):
             'openpose_custom_path': self.edit_openpose_path.text(),
             'depth_model': self.combo_depth_model.currentText(),
             'depth_custom_path': self.edit_depth_path.text(),
+            'bbox_model': self.combo_bbox_model.currentText(),
+            'bbox_custom_path': self.edit_bbox_path.text(),
+            'bbox_conf_threshold': self.spin_bbox_conf.value(),
+            'bbox_iou_threshold': self.spin_bbox_iou.value(),
+            'bbox_person_only': self.check_bbox_person_only.isChecked(),
             'parallel_threads': self.spin_parallel_threads.value(),
             'auto_pass_no_review': self.check_auto_pass_no_review.isChecked(),
             'single_jsona': self.check_single_jsona.isChecked(),
@@ -1122,6 +1130,7 @@ class SettingsPanel(QWidget):
             'canny_enabled': '启用 Canny',
             'openpose_enabled': '启用 Pose',
             'depth_enabled': '启用 Depth',
+            'bbox_enabled': '启用 BBox',
             'quality_profile': '质量预设',
             'canny_accept': 'Canny 自动接受',
             'canny_reject': 'Canny 自动拒绝',
@@ -1129,6 +1138,8 @@ class SettingsPanel(QWidget):
             'pose_reject': 'Pose 自动拒绝',
             'depth_accept': 'Depth 自动接受',
             'depth_reject': 'Depth 自动拒绝',
+            'bbox_accept': 'BBox 自动接受',
+            'bbox_reject': 'BBox 自动拒绝',
             'score_filter_enabled': '启用原图评分筛选',
             'score_filter_checkpoint_path': '评分 checkpoint 路径',
             'score_filter_cache_root': '评分缓存目录',
@@ -1143,6 +1154,11 @@ class SettingsPanel(QWidget):
             'openpose_custom_path': 'Pose 自定义路径',
             'depth_model': 'Depth 模型',
             'depth_custom_path': 'Depth 自定义路径',
+            'bbox_model': 'BBox 模型',
+            'bbox_custom_path': 'BBox 自定义路径',
+            'bbox_conf_threshold': 'BBox 置信度阈值',
+            'bbox_iou_threshold': 'BBox IoU 阈值',
+            'bbox_person_only': 'BBox 仅检测人物',
             'parallel_threads': '并行处理线程',
             'auto_pass_no_review': '自动通过无需审核',
             'single_jsona': '单个 JSONA',
@@ -1499,6 +1515,8 @@ class SettingsPanel(QWidget):
                 self.check_openpose.setChecked(bool(config['openpose_enabled']))
             if 'depth_enabled' in config:
                 self.check_depth.setChecked(bool(config['depth_enabled']))
+            if 'bbox_enabled' in config:
+                self.check_bbox.setChecked(bool(config['bbox_enabled']))
             if 'openpose_model' in config:
                 self.combo_openpose_model.setCurrentText(str(config['openpose_model']))
             if 'openpose_yolo_version' in config:
@@ -1511,6 +1529,16 @@ class SettingsPanel(QWidget):
                 self.combo_depth_model.setCurrentText(str(config['depth_model']))
             if 'depth_custom_path' in config:
                 self.edit_depth_path.setText(str(config['depth_custom_path']))
+            if 'bbox_model' in config:
+                self.combo_bbox_model.setCurrentText(str(config['bbox_model']))
+            if 'bbox_custom_path' in config:
+                self.edit_bbox_path.setText(str(config['bbox_custom_path']))
+            if 'bbox_conf_threshold' in config:
+                self.spin_bbox_conf.setValue(float(config['bbox_conf_threshold']))
+            if 'bbox_iou_threshold' in config:
+                self.spin_bbox_iou.setValue(float(config['bbox_iou_threshold']))
+            if 'bbox_person_only' in config:
+                self.check_bbox_person_only.setChecked(bool(config['bbox_person_only']))
             if 'score_filter_enabled' in config:
                 self.check_score_filter_enabled.setChecked(bool(config['score_filter_enabled']))
             if 'score_filter_checkpoint_path' in config:
@@ -1541,6 +1569,10 @@ class SettingsPanel(QWidget):
                 self.spin_depth_accept.setValue(int(config['depth_accept']))
             if 'depth_reject' in config:
                 self.spin_depth_reject.setValue(int(config['depth_reject']))
+            if 'bbox_accept' in config:
+                self.spin_bbox_accept.setValue(int(config['bbox_accept']))
+            if 'bbox_reject' in config:
+                self.spin_bbox_reject.setValue(int(config['bbox_reject']))
             if 'parallel_threads' in config:
                 self.spin_parallel_threads.setValue(int(config['parallel_threads']))
             if 'auto_pass_no_review' in config:
@@ -1645,12 +1677,18 @@ class SettingsPanel(QWidget):
         self.check_canny.stateChanged.connect(lambda: self.save_settings())
         self.check_openpose.stateChanged.connect(lambda: self.save_settings())
         self.check_depth.stateChanged.connect(lambda: self.save_settings())
+        self.check_bbox.stateChanged.connect(lambda: self.save_settings())
         self.combo_openpose_model.currentTextChanged.connect(lambda: self.save_settings())
         self.combo_yolo_version.currentTextChanged.connect(lambda: self.save_settings())
         self.combo_yolo_model_type.currentTextChanged.connect(lambda: self.save_settings())
         self.edit_openpose_path.textChanged.connect(lambda: self.save_settings())
         self.combo_depth_model.currentTextChanged.connect(lambda: self.save_settings())
         self.edit_depth_path.textChanged.connect(lambda: self.save_settings())
+        self.combo_bbox_model.currentTextChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_path.textChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_conf.valueChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_iou.valueChanged.connect(lambda: self.save_settings())
+        self.check_bbox_person_only.stateChanged.connect(lambda: self.save_settings())
         self.check_append_tags.stateChanged.connect(lambda: self.save_settings())
         self.edit_custom_tags.textChanged.connect(lambda: self.save_settings())
         self.edit_output_dir.textChanged.connect(lambda: self.save_settings())
@@ -1695,6 +1733,8 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.valueChanged.connect(lambda: self.save_settings())
         self.spin_depth_accept.valueChanged.connect(lambda: self.save_settings())
         self.spin_depth_reject.valueChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_accept.valueChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_reject.valueChanged.connect(lambda: self.save_settings())
         self.check_score_filter_enabled.stateChanged.connect(self._on_score_filter_enabled_changed)
         self.edit_score_checkpoint_path.textChanged.connect(lambda: self.save_settings())
         self.edit_score_checkpoint_path.textChanged.connect(lambda: self._refresh_score_filter_status())
@@ -1733,6 +1773,8 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.setValue(int(profile.get('pose_auto_reject', default_reject)))
         self.spin_depth_accept.setValue(int(profile.get('depth_auto_accept', default_accept)))
         self.spin_depth_reject.setValue(int(profile.get('depth_auto_reject', default_reject)))
+        self.spin_bbox_accept.setValue(int(profile.get('bbox_auto_accept', default_accept)))
+        self.spin_bbox_reject.setValue(int(profile.get('bbox_auto_reject', default_reject)))
         self.save_settings()
 
     def _create_advanced_group(self) -> QGroupBox:
@@ -1803,7 +1845,7 @@ class SettingsPanel(QWidget):
         self.check_single_jsona.setChecked(False)
         self.check_single_jsona.setToolTip(
             "勾选后，所有 control type 的 metadata 写入同一个 metadata.jsona 文件\n"
-            "取消勾选后，分别写入 canny.jsona、pose.jsona、depth.jsona"
+            "取消勾选后，分别写入 canny.jsona、pose.jsona、depth.jsona、bbox.jsona"
         )
         single_jsona_layout.addWidget(self.check_single_jsona)
         single_jsona_layout.addStretch()
@@ -2040,6 +2082,15 @@ class SettingsPanel(QWidget):
         depth_stat_layout.addWidget(self.btn_reset_depth_jsona)
         stats_layout.addLayout(depth_stat_layout)
 
+        bbox_stat_layout = QHBoxLayout()
+        self.label_bbox_count = QLabel('BBox: 0 张图')
+        bbox_stat_layout.addWidget(self.label_bbox_count)
+        self.btn_reset_bbox_jsona = QPushButton('重置')
+        self.btn_reset_bbox_jsona.setMaximumWidth(60)
+        self.btn_reset_bbox_jsona.clicked.connect(lambda: self._reset_jsona_file('bbox'))
+        bbox_stat_layout.addWidget(self.btn_reset_bbox_jsona)
+        stats_layout.addLayout(bbox_stat_layout)
+
         # Metadata statistics
         metadata_stat_layout = QHBoxLayout()
         self.label_metadata_count = QLabel('Metadata: 0 条')
@@ -2237,6 +2288,22 @@ class SettingsPanel(QWidget):
         depth_threshold_layout.addWidget(self.spin_depth_reject)
         depth_threshold_layout.addStretch()
         threshold_layout.addLayout(depth_threshold_layout)
+
+        bbox_threshold_layout = QHBoxLayout()
+        bbox_threshold_layout.addWidget(QLabel('BBox 自动接受:'))
+        self.spin_bbox_accept = QSpinBox()
+        self.spin_bbox_accept.setRange(0, 100)
+        self.spin_bbox_accept.setValue(60)
+        self.spin_bbox_accept.setSuffix(' 分')
+        bbox_threshold_layout.addWidget(self.spin_bbox_accept)
+        bbox_threshold_layout.addWidget(QLabel('  拒绝:'))
+        self.spin_bbox_reject = QSpinBox()
+        self.spin_bbox_reject.setRange(0, 100)
+        self.spin_bbox_reject.setValue(40)
+        self.spin_bbox_reject.setSuffix(' 分')
+        bbox_threshold_layout.addWidget(self.spin_bbox_reject)
+        bbox_threshold_layout.addStretch()
+        threshold_layout.addLayout(bbox_threshold_layout)
         controlnet_page_layout.addWidget(threshold_group)
 
         control_group = QGroupBox(tr('control_types'))
@@ -2317,6 +2384,52 @@ class SettingsPanel(QWidget):
         depth_layout.addWidget(self.btn_browse_depth)
         depth_layout.addStretch()
         control_layout.addLayout(depth_layout)
+
+        bbox_layout = QHBoxLayout()
+        self.check_bbox = QCheckBox("BBox")
+        bbox_layout.addWidget(self.check_bbox)
+        bbox_layout.addWidget(QLabel('模型:'))
+        self.combo_bbox_model = QComboBox()
+        self.combo_bbox_model.addItems(['YOLOv11', 'YOLO26', 'YOLOv8', '动漫专用 (Anime)', 'Custom Path'])
+        self.combo_bbox_model.setEnabled(False)
+        bbox_layout.addWidget(self.combo_bbox_model)
+
+        self.edit_bbox_path = QLineEdit()
+        self.edit_bbox_path.setPlaceholderText('BBox model path (.pt)')
+        self.edit_bbox_path.setEnabled(False)
+        self.edit_bbox_path.setVisible(False)
+        bbox_layout.addWidget(self.edit_bbox_path)
+
+        self.btn_browse_bbox = QPushButton(tr('browse'))
+        self.btn_browse_bbox.setEnabled(False)
+        self.btn_browse_bbox.setVisible(False)
+        self.btn_browse_bbox.clicked.connect(self._browse_bbox_model_file)
+        bbox_layout.addWidget(self.btn_browse_bbox)
+
+        bbox_layout.addWidget(QLabel('置信度:'))
+        self.spin_bbox_conf = QDoubleSpinBox()
+        self.spin_bbox_conf.setRange(0.05, 0.95)
+        self.spin_bbox_conf.setSingleStep(0.05)
+        self.spin_bbox_conf.setDecimals(2)
+        self.spin_bbox_conf.setValue(0.25)
+        self.spin_bbox_conf.setEnabled(False)
+        bbox_layout.addWidget(self.spin_bbox_conf)
+
+        bbox_layout.addWidget(QLabel('IoU:'))
+        self.spin_bbox_iou = QDoubleSpinBox()
+        self.spin_bbox_iou.setRange(0.05, 0.95)
+        self.spin_bbox_iou.setSingleStep(0.05)
+        self.spin_bbox_iou.setDecimals(2)
+        self.spin_bbox_iou.setValue(0.45)
+        self.spin_bbox_iou.setEnabled(False)
+        bbox_layout.addWidget(self.spin_bbox_iou)
+
+        self.check_bbox_person_only = QCheckBox('仅人物')
+        self.check_bbox_person_only.setChecked(True)
+        self.check_bbox_person_only.setEnabled(False)
+        bbox_layout.addWidget(self.check_bbox_person_only)
+        bbox_layout.addStretch()
+        control_layout.addLayout(bbox_layout)
         controlnet_page_layout.addWidget(control_group)
         self.label_controlnet_mode_note = QLabel('原图评分预筛与自动通过阈值请切换到上方“图片评分模式”页配置。')
         self.label_controlnet_mode_note.setWordWrap(True)
@@ -2328,6 +2441,8 @@ class SettingsPanel(QWidget):
         self.combo_yolo_model_type.currentTextChanged.connect(self._on_yolo_model_type_changed)
         self.check_depth.toggled.connect(self._on_depth_toggled)
         self.combo_depth_model.currentTextChanged.connect(self._on_depth_model_changed)
+        self.check_bbox.toggled.connect(self._on_bbox_toggled)
+        self.combo_bbox_model.currentTextChanged.connect(self._on_bbox_model_changed)
         self._check_torch_availability()
         controlnet_page_layout.addStretch()
 
@@ -2459,7 +2574,7 @@ class SettingsPanel(QWidget):
         score_filter_layout.addWidget(score_progress_group)
 
         self.label_score_mode_note = QLabel(
-            '低于阈值的原图会在生成 Canny / Pose / Depth 前直接自动拒绝。'
+            '低于阈值的原图会在生成 Canny / Pose / Depth / BBox 前直接自动拒绝。'
             '若本地没有 JTP-3 / CLIP 缓存，首次运行可能仍需联网下载。'
         )
         self.label_score_mode_note.setWordWrap(True)
@@ -2548,12 +2663,12 @@ class SettingsPanel(QWidget):
         if hasattr(self, 'label_score_mode_note'):
             if is_score_mode:
                 self.label_score_mode_note.setText(
-                    '当前为图片评分模式：只对原图做评分与筛选，不生成 Canny / Pose / Depth。\n'
+                    '当前为图片评分模式：只对原图做评分与筛选，不生成 Canny / Pose / Depth / BBox。\n'
                     '低于最低美学分或目标域阈值的图片会自动拒绝，高于“评分模式自动接受”的图片会自动通过，其余进入人工审核。'
                 )
             else:
                 self.label_score_mode_note.setText(
-                    '当前为 ControlNet 图片生成模式：低于阈值的原图会在生成 Canny / Pose / Depth 前直接自动拒绝。'
+                    '当前为 ControlNet 图片生成模式：低于阈值的原图会在生成 Canny / Pose / Depth / BBox 前直接自动拒绝。'
                     '若本地没有 JTP-3 / CLIP 缓存，首次运行可能仍需联网下载。'
                 )
 
@@ -3398,6 +3513,7 @@ class SettingsPanel(QWidget):
             'canny_enabled',
             'openpose_enabled',
             'depth_enabled',
+            'bbox_enabled',
             'quality_profile',
             'canny_accept',
             'canny_reject',
@@ -3405,6 +3521,8 @@ class SettingsPanel(QWidget):
             'pose_reject',
             'depth_accept',
             'depth_reject',
+            'bbox_accept',
+            'bbox_reject',
             'score_filter_enabled',
             'score_filter_checkpoint_path',
             'score_filter_cache_root',
@@ -3417,6 +3535,10 @@ class SettingsPanel(QWidget):
             'openpose_yolo_version',
             'openpose_yolo_model_type',
             'depth_model',
+            'bbox_model',
+            'bbox_conf_threshold',
+            'bbox_iou_threshold',
+            'bbox_person_only',
             'parallel_threads',
             'auto_pass_no_review',
             'single_jsona',
@@ -3818,6 +3940,30 @@ class SettingsPanel(QWidget):
         self.btn_browse_depth.setVisible(is_custom)
         self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
+    def _on_bbox_toggled(self, checked):
+        """Handle BBox checkbox toggle."""
+        self.combo_bbox_model.setEnabled(checked)
+        self.spin_bbox_conf.setEnabled(checked)
+        self.spin_bbox_iou.setEnabled(checked)
+        self.check_bbox_person_only.setEnabled(checked)
+        if checked:
+            self._on_bbox_model_changed()
+        else:
+            self.edit_bbox_path.setEnabled(False)
+            self.btn_browse_bbox.setEnabled(False)
+            self.edit_bbox_path.setVisible(False)
+            self.btn_browse_bbox.setVisible(False)
+            self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_model_changed(self):
+        """Handle BBox model selection change."""
+        is_custom = self.combo_bbox_model.currentText() == 'Custom Path'
+        self.edit_bbox_path.setEnabled(is_custom and self.check_bbox.isChecked())
+        self.btn_browse_bbox.setEnabled(is_custom and self.check_bbox.isChecked())
+        self.edit_bbox_path.setVisible(is_custom)
+        self.btn_browse_bbox.setVisible(is_custom)
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
     def _check_torch_availability(self):
         """Check if torch is available and update UI accordingly"""
         try:
@@ -3848,6 +3994,18 @@ class SettingsPanel(QWidget):
             self._apply_blur_effect(self.combo_depth_model)
             self._apply_blur_effect(self.edit_depth_path)
             self._apply_blur_effect(self.btn_browse_depth)
+
+            # Disable and blur BBox controls
+            self.check_bbox.setEnabled(False)
+            self.combo_bbox_model.setEnabled(False)
+            self.edit_bbox_path.setEnabled(False)
+            self.btn_browse_bbox.setEnabled(False)
+            self.spin_bbox_conf.setEnabled(False)
+            self.spin_bbox_iou.setEnabled(False)
+            self.check_bbox_person_only.setEnabled(False)
+            self._apply_blur_effect(self.combo_bbox_model)
+            self._apply_blur_effect(self.edit_bbox_path)
+            self._apply_blur_effect(self.btn_browse_bbox)
         else:
             # Hide install buttons
             self.btn_install_torch_openpose.setVisible(False)
@@ -4337,6 +4495,17 @@ class SettingsPanel(QWidget):
         if directory:
             line_edit.setText(directory)
 
+    def _browse_bbox_model_file(self):
+        """Browse for BBox model file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            '选择 BBox 模型文件',
+            self.edit_bbox_path.text() or self.edit_output_dir.text() or '.',
+            'Model Files (*.pt *.onnx);;All Files (*.*)'
+        )
+        if path:
+            self.edit_bbox_path.setText(path)
+
     def _load_config(self):
         """Load configuration"""
         # Data source
@@ -4387,6 +4556,8 @@ class SettingsPanel(QWidget):
         self.spin_pose_reject.setValue(int(profile.get('pose_auto_reject', default_reject)))
         self.spin_depth_accept.setValue(int(profile.get('depth_auto_accept', default_accept)))
         self.spin_depth_reject.setValue(int(profile.get('depth_auto_reject', default_reject)))
+        self.spin_bbox_accept.setValue(int(profile.get('bbox_auto_accept', default_accept)))
+        self.spin_bbox_reject.setValue(int(profile.get('bbox_auto_reject', default_reject)))
 
         prefilter = self.config.get('prefilter', {})
         score_filter = FusionScoreFilter.normalize_config(prefilter.get('score_filter', {}))
@@ -4410,6 +4581,15 @@ class SettingsPanel(QWidget):
         self.check_canny.setChecked(control_types.get('canny', True))
         self.check_openpose.setChecked(control_types.get('openpose', False))
         self.check_depth.setChecked(control_types.get('depth', False))
+        self.check_bbox.setChecked(control_types.get('bbox', False))
+
+        model_config = processing.get('model_config', {})
+        bbox_config = model_config.get('bbox', {}) if isinstance(model_config, dict) else {}
+        self.combo_bbox_model.setCurrentText(str(bbox_config.get('type', 'YOLOv11')))
+        self.edit_bbox_path.setText(str(bbox_config.get('custom_path', '') or ''))
+        self.spin_bbox_conf.setValue(float(bbox_config.get('conf_threshold', 0.25)))
+        self.spin_bbox_iou.setValue(float(bbox_config.get('iou_threshold', 0.45)))
+        self.check_bbox_person_only.setChecked(bool(bbox_config.get('person_only', True)))
 
         # Retry strategy (nested under processing)
         retry_config = processing.get('retry_strategy', {})
@@ -4498,7 +4678,8 @@ class SettingsPanel(QWidget):
             'control_types': {
                 'canny': self.check_canny.isChecked(),
                 'openpose': self.check_openpose.isChecked(),
-                'depth': self.check_depth.isChecked()
+                'depth': self.check_depth.isChecked(),
+                'bbox': self.check_bbox.isChecked(),
             },
             'model_config': {
                 'openpose': {
@@ -4510,6 +4691,14 @@ class SettingsPanel(QWidget):
                 'depth': {
                     'type': self.combo_depth_model.currentText(),
                     'custom_path': self.edit_depth_path.text() if self.combo_depth_model.currentText() == 'Custom Path' else None
+                },
+                'bbox': {
+                    'type': self.combo_bbox_model.currentText(),
+                    'custom_path': self.edit_bbox_path.text().strip() if self.combo_bbox_model.currentText() == 'Custom Path' else '',
+                    'conf_threshold': float(self.spin_bbox_conf.value()),
+                    'iou_threshold': float(self.spin_bbox_iou.value()),
+                    'max_detections': 20,
+                    'person_only': self.check_bbox_person_only.isChecked(),
                 }
             },
             'retry_strategy': {
@@ -4570,6 +4759,8 @@ class SettingsPanel(QWidget):
         settings['scoring']['profiles'][profile_key]['pose_auto_reject'] = self.spin_pose_reject.value()
         settings['scoring']['profiles'][profile_key]['depth_auto_accept'] = self.spin_depth_accept.value()
         settings['scoring']['profiles'][profile_key]['depth_auto_reject'] = self.spin_depth_reject.value()
+        settings['scoring']['profiles'][profile_key]['bbox_auto_accept'] = self.spin_bbox_accept.value()
+        settings['scoring']['profiles'][profile_key]['bbox_auto_reject'] = self.spin_bbox_reject.value()
 
         # Also keep the general auto_accept/auto_reject for backward compatibility
         settings['scoring']['profiles'][profile_key]['auto_accept'] = self.spin_canny_accept.value()
@@ -4778,6 +4969,7 @@ class SettingsPanel(QWidget):
         canny_count = self._count_jsona_entries(os.path.join(output_dir, 'canny.jsona'), expected_name='canny')
         pose_count = self._count_jsona_entries(os.path.join(output_dir, 'pose.jsona'), expected_name='pose')
         depth_count = self._count_jsona_entries(os.path.join(output_dir, 'depth.jsona'), expected_name='depth')
+        bbox_count = self._count_jsona_entries(os.path.join(output_dir, 'bbox.jsona'), expected_name='bbox')
         metadata_count = self._count_jsona_entries(os.path.join(output_dir, 'metadata.jsona'), expected_name='metadata')
         tag_count = self._count_jsona_entries(os.path.join(output_dir, 'tag.jsona'), expected_name='tag')
         nl_count = self._count_jsona_entries(os.path.join(output_dir, 'nl.jsona'), expected_name='nl')
@@ -4787,6 +4979,7 @@ class SettingsPanel(QWidget):
         self.label_canny_count.setText(f'Canny: {canny_count} 张图')
         self.label_pose_count.setText(f'Pose: {pose_count} 张图')
         self.label_depth_count.setText(f'Depth: {depth_count} 张图')
+        self.label_bbox_count.setText(f'BBox: {bbox_count} 张图')
         self.label_metadata_count.setText(f'Metadata: {metadata_count} 条')
         self.label_tag_count.setText(f'Tag: {tag_count} 条')
         self.label_nl_count.setText(f'NL: {nl_count} 条')
@@ -4798,6 +4991,7 @@ class SettingsPanel(QWidget):
             self.btn_reset_canny_jsona.setEnabled(False)
             self.btn_reset_pose_jsona.setEnabled(False)
             self.btn_reset_depth_jsona.setEnabled(False)
+            self.btn_reset_bbox_jsona.setEnabled(False)
             self.btn_reset_tag_jsona.setEnabled(True)
             self.btn_reset_nl_jsona.setEnabled(True)
             self.btn_reset_xml_jsona.setEnabled(True)
@@ -4807,6 +5001,7 @@ class SettingsPanel(QWidget):
             self.btn_reset_canny_jsona.setEnabled(True)
             self.btn_reset_pose_jsona.setEnabled(True)
             self.btn_reset_depth_jsona.setEnabled(True)
+            self.btn_reset_bbox_jsona.setEnabled(True)
             self.btn_reset_tag_jsona.setEnabled(True)
             self.btn_reset_nl_jsona.setEnabled(True)
             self.btn_reset_xml_jsona.setEnabled(True)
@@ -4828,6 +5023,7 @@ class SettingsPanel(QWidget):
             'canny': 'canny.jsona',
             'pose': 'pose.jsona',
             'depth': 'depth.jsona',
+            'bbox': 'bbox.jsona',
             'metadata': 'metadata.jsona',
             'tag': 'tag.jsona',
             'nl': 'nl.jsona',
