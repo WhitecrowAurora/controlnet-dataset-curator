@@ -351,21 +351,12 @@ class VitPoseProcessor:
         Returns:
             OpenPose control map (BGR)
         """
-        # Ensure BGR format
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
-        # Create output canvas (black background)
+        image = self._ensure_bgr_image(image)
         canvas = np.zeros_like(image)
 
-        # Detect persons
         boxes = self.detect_persons(image)
         print(f"[DEBUG] ViTPose detected {len(boxes)} person(s)")
-
-        # Reduce false positives and overlapping skeleton scribbles by preferring the largest person box.
-        # This tool targets dataset curation and typically expects a single main subject.
-        if len(boxes) > 1:
-            boxes = sorted(boxes, key=lambda b: float((b[2] - b[0]) * (b[3] - b[1])), reverse=True)[:1]
+        boxes = self._select_primary_person_boxes(boxes)
 
         # Heuristic guardrails to avoid drawing obviously invalid poses.
         # These thresholds are intentionally conservative.
@@ -373,50 +364,74 @@ class VitPoseProcessor:
         min_valid_keypoints = 6
 
         for box in boxes:
-            x1, y1, x2, y2 = map(int, box)
-
-            # Boundary protection
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
-
-            crop = image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # Estimate pose
-            bbox_shape = (x2 - x1, y2 - y1)
-            coco_keypoints = self.estimate_pose(crop, bbox_shape)
-
-            # Clamp keypoints into the crop region to avoid extreme lines from out-of-range peaks.
-            coco_keypoints[:, 0] = np.clip(coco_keypoints[:, 0], 0.0, float(bbox_shape[0] - 1))
-            coco_keypoints[:, 1] = np.clip(coco_keypoints[:, 1], 0.0, float(bbox_shape[1] - 1))
-
-            # Check keypoint confidence (guard against "fake" skeletons).
-            conf = coco_keypoints[:, 2]
-            valid_keypoints = int(np.sum(conf > min_keypoint_conf))
-            print(f"[DEBUG] ViTPose found {valid_keypoints}/17 valid keypoints (conf > {min_keypoint_conf})")
-
-            # Require a minimal plausible structure: at least one shoulder and one hip with confidence.
-            has_shoulder = bool(conf[5] > min_keypoint_conf or conf[6] > min_keypoint_conf)
-            has_hip = bool(conf[11] > min_keypoint_conf or conf[12] > min_keypoint_conf)
-            if valid_keypoints < min_valid_keypoints or not (has_shoulder and has_hip):
-                continue
-
-            # Convert to OpenPose format
-            openpose_points = self.coco_to_openpose(coco_keypoints)
-
-            # Adjust coordinates to global space
-            for pt in openpose_points:
-                pt[0] += x1
-                pt[1] += y1
-
-            # Calculate dynamic thickness
-            thickness = self.calculate_dynamic_thickness(bbox_shape[0], bbox_shape[1])
-
-            # Draw skeleton
-            canvas = self.draw_skeleton(canvas, openpose_points, thickness['body'])
+            canvas = self._draw_person_pose_on_canvas(
+                canvas=canvas,
+                image=image,
+                box=box,
+                min_keypoint_conf=min_keypoint_conf,
+                min_valid_keypoints=min_valid_keypoints,
+            )
 
         return canvas
+
+    @staticmethod
+    def _ensure_bgr_image(image: np.ndarray) -> np.ndarray:
+        if len(image.shape) == 2:
+            return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        return image
+
+    @staticmethod
+    def _select_primary_person_boxes(boxes: List[List[float]]) -> List[List[float]]:
+        if len(boxes) <= 1:
+            return boxes
+        return sorted(boxes, key=lambda b: float((b[2] - b[0]) * (b[3] - b[1])), reverse=True)[:1]
+
+    def _draw_person_pose_on_canvas(
+        self,
+        *,
+        canvas: np.ndarray,
+        image: np.ndarray,
+        box,
+        min_keypoint_conf: float,
+        min_valid_keypoints: int,
+    ) -> np.ndarray:
+        x1, y1, x2, y2 = map(int, box)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+
+        crop = image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return canvas
+
+        bbox_shape = (x2 - x1, y2 - y1)
+        coco_keypoints = self.estimate_pose(crop, bbox_shape)
+        coco_keypoints = self._clamp_coco_keypoints(coco_keypoints, bbox_shape)
+
+        if not self._is_plausible_coco_pose(coco_keypoints, min_keypoint_conf, min_valid_keypoints):
+            return canvas
+
+        openpose_points = self.coco_to_openpose(coco_keypoints)
+        for pt in openpose_points:
+            pt[0] += x1
+            pt[1] += y1
+
+        thickness = self.calculate_dynamic_thickness(bbox_shape[0], bbox_shape[1])
+        return self.draw_skeleton(canvas, openpose_points, thickness['body'])
+
+    @staticmethod
+    def _clamp_coco_keypoints(coco_keypoints: np.ndarray, bbox_shape: tuple) -> np.ndarray:
+        coco_keypoints[:, 0] = np.clip(coco_keypoints[:, 0], 0.0, float(bbox_shape[0] - 1))
+        coco_keypoints[:, 1] = np.clip(coco_keypoints[:, 1], 0.0, float(bbox_shape[1] - 1))
+        return coco_keypoints
+
+    @staticmethod
+    def _is_plausible_coco_pose(coco_keypoints: np.ndarray, min_keypoint_conf: float, min_valid_keypoints: int) -> bool:
+        conf = coco_keypoints[:, 2]
+        valid_keypoints = int(np.sum(conf > min_keypoint_conf))
+        print(f"[DEBUG] ViTPose found {valid_keypoints}/17 valid keypoints (conf > {min_keypoint_conf})")
+        has_shoulder = bool(conf[5] > min_keypoint_conf or conf[6] > min_keypoint_conf)
+        has_hip = bool(conf[11] > min_keypoint_conf or conf[12] > min_keypoint_conf)
+        return valid_keypoints >= min_valid_keypoints and has_shoulder and has_hip
 
     def process_pil_image(self, pil_image: Image.Image) -> Image.Image:
         """

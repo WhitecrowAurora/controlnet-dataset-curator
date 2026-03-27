@@ -12,7 +12,7 @@ import json
 import os
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 
 def _read_image_b64(image_path: str) -> str:
@@ -56,6 +56,21 @@ def build_rewrite_prompt(tags: str) -> str:
     )
 
 
+def build_bbox_prompt(label_hint: str = "") -> str:
+    hint = f"\nOptional labels to prioritize: {label_hint}" if str(label_hint or "").strip() else ""
+    return (
+        "Detect objects/parts in the image and return bounding boxes.\n"
+        "Return STRICT JSON object with keys:\n"
+        "- needs_review: boolean\n"
+        "- reason: string\n"
+        "- detections: array of items, each item must contain:\n"
+        "  - name: string\n"
+        "  - bbox: [x1, y1, x2, y2] as pixel coordinates in the original image\n"
+        "Do not output markdown."
+        + hint
+    )
+
+
 def _extract_json_from_text(text: str) -> Dict:
     text = (text or "").strip()
     if not text:
@@ -76,6 +91,29 @@ def _extract_json_from_text(text: str) -> Dict:
     return {}
 
 
+def _normalize_bbox_list(data) -> List[Dict]:
+    items = []
+    if isinstance(data, dict):
+        data = data.get("detections", [])
+    if not isinstance(data, list):
+        return items
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("name", "")).strip()
+        bbox = obj.get("bbox", [])
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+        except Exception:
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        items.append({"name": name or "object", "bbox": [x1, y1, x2, y2]})
+    return items
+
+
 class VlmClient:
     def __init__(self, cfg: VlmConfig):
         self.cfg = cfg
@@ -85,6 +123,19 @@ class VlmClient:
         if backend == "ollama":
             return self._rewrite_ollama(image_path, tags)
         return self._rewrite_openai(image_path, tags)
+
+    def detect_bboxes(self, image_path: str, label_hint: str = "") -> Dict:
+        backend = (self.cfg.backend or "openai").lower()
+        if backend == "ollama":
+            parsed = self._bbox_ollama(image_path, label_hint)
+        else:
+            parsed = self._bbox_openai(image_path, label_hint)
+        detections = _normalize_bbox_list(parsed)
+        return {
+            "needs_review": bool(parsed.get("needs_review", True)) if isinstance(parsed, dict) else True,
+            "reason": str(parsed.get("reason", "") or "") if isinstance(parsed, dict) else "model_output_parse_failed",
+            "detections": detections,
+        }
 
     def _rewrite_openai(self, image_path: str, tags: str) -> Dict:
         url = (self.cfg.base_url or "").rstrip("/") + "/v1/chat/completions"
@@ -140,3 +191,52 @@ class VlmClient:
         parsed = _extract_json_from_text(text if isinstance(text, str) else json.dumps(text))
         return parsed or {"needs_review": True, "nl_prompt": "", "reason": "model_output_parse_failed"}
 
+    def _bbox_openai(self, image_path: str, label_hint: str) -> Dict:
+        url = (self.cfg.base_url or "").rstrip("/") + "/v1/chat/completions"
+        b64 = _read_image_b64(image_path)
+        messages = [
+            {"role": "system", "content": "You output only JSON, no markdown."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": build_bbox_prompt(label_hint)},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            },
+        ]
+        headers = {}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+        payload = {
+            "model": self.cfg.model or "local",
+            "messages": messages,
+            "temperature": 0.1,
+        }
+        data = _http_post_json(url, payload, timeout=int(self.cfg.timeout_seconds), headers=headers)
+        text = (
+            (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+            if isinstance(data, dict)
+            else ""
+        )
+        parsed = _extract_json_from_text(text if isinstance(text, str) else json.dumps(text))
+        return parsed or {"needs_review": True, "reason": "model_output_parse_failed", "detections": []}
+
+    def _bbox_ollama(self, image_path: str, label_hint: str) -> Dict:
+        url = (self.cfg.base_url or "").rstrip("/") + "/api/chat"
+        b64 = _read_image_b64(image_path)
+        payload = {
+            "model": self.cfg.model or "llava",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": build_bbox_prompt(label_hint),
+                    "images": [b64],
+                }
+            ],
+            "options": {"temperature": 0.1},
+        }
+        data = _http_post_json(url, payload, timeout=int(self.cfg.timeout_seconds))
+        text = ((data.get("message") or {}).get("content") if isinstance(data, dict) else "")
+        parsed = _extract_json_from_text(text if isinstance(text, str) else json.dumps(text))
+        return parsed or {"needs_review": True, "reason": "model_output_parse_failed", "detections": []}

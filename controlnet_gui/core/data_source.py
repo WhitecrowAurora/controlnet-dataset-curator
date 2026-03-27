@@ -281,74 +281,75 @@ class StreamingDataSource(DataSource):
         if self._dataset is not None:
             return
 
+        hf_load_dataset, get_dataset_split_names = self._import_hf_dataset_apis()
+        self._detected_split = self._resolve_dataset_split(get_dataset_split_names)
+        self._dataset = self._load_streaming_dataset(hf_load_dataset, self._detected_split)
+        self._columns = self._peek_dataset_columns(self._dataset)
+        self._auto_detect_optional_columns()
+        self._dataset = self._load_streaming_dataset(hf_load_dataset, self._detected_split)
+
+    @staticmethod
+    def _import_hf_dataset_apis():
         # Lazy import datasets only when actually needed
         try:
             from datasets import load_dataset as hf_load_dataset
-            from datasets import get_dataset_config_names, get_dataset_split_names
+            from datasets import get_dataset_split_names
         except ImportError:
             raise ImportError(
                 "HuggingFace datasets library is required for streaming data sources. "
                 "Install it with: pip install datasets"
             )
+        return hf_load_dataset, get_dataset_split_names
 
-        # Auto-detect split if enabled
-        if self.auto_detect_split and not self._detected_split:
-            try:
-                # Try to get available splits
-                # First, try default config
-                splits = get_dataset_split_names(self.dataset_id, token=self.hf_token)
+    def _resolve_dataset_split(self, get_dataset_split_names) -> str:
+        if not self.auto_detect_split or self._detected_split:
+            return self.split
 
-                # Priority order: train > validation > test > first available
-                if 'train' in splits:
-                    self._detected_split = 'train'
-                elif 'validation' in splits:
-                    self._detected_split = 'validation'
-                elif 'test' in splits:
-                    self._detected_split = 'test'
-                elif splits:
-                    self._detected_split = splits[0]
-                else:
-                    self._detected_split = self.split  # Fallback to user-specified
+        try:
+            splits = get_dataset_split_names(self.dataset_id, token=self.hf_token)
+            detected_split = self._select_preferred_split(splits)
+            print(f"Auto-detected split: {detected_split} (available: {splits})")
+            return detected_split
+        except Exception as e:
+            print(f"Failed to auto-detect split, using '{self.split}': {e}")
+            return self.split
 
-                print(f"Auto-detected split: {self._detected_split} (available: {splits})")
-            except Exception as e:
-                print(f"Failed to auto-detect split, using '{self.split}': {e}")
-                self._detected_split = self.split
-        else:
-            self._detected_split = self.split
+    def _select_preferred_split(self, splits: List[str]) -> str:
+        if 'train' in splits:
+            return 'train'
+        if 'validation' in splits:
+            return 'validation'
+        if 'test' in splits:
+            return 'test'
+        if splits:
+            return splits[0]
+        return self.split
 
-        self._dataset = hf_load_dataset(
+    def _load_streaming_dataset(self, hf_load_dataset, split_name: str):
+        return hf_load_dataset(
             self.dataset_id,
-            split=self._detected_split,
+            split=split_name,
             streaming=True,
             token=self.hf_token
         )
 
-        # 获取列信息（需要peek一个样本）
-        sample = next(iter(self._dataset))
-        self._columns = list(sample.keys())
+    @staticmethod
+    def _peek_dataset_columns(dataset) -> List[str]:
+        sample = next(iter(dataset))
+        return list(sample.keys())
 
-        # 自动检测文本列
+    def _auto_detect_optional_columns(self):
         if self.text_column is None:
             for col in ['text', 'caption', 'tags', 'prompt']:
                 if col in self._columns:
                     self.text_column = col
                     break
 
-        # 自动检测深度图列
         if self.depth_column is None:
             for col in ['depth_map', 'depth', 'depth_image']:
                 if col in self._columns:
                     self.depth_column = col
                     break
-
-        # 重新加载数据集以避免丢失第一个样本
-        self._dataset = hf_load_dataset(
-            self.dataset_id,
-            split=self._detected_split,
-            streaming=True,
-            token=self.hf_token
-        )
     
     def __iter__(self) -> Iterator[ImageData]:
         """迭代返回图像数据"""

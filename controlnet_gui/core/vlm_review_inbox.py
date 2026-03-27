@@ -243,6 +243,44 @@ class VlmReviewInbox:
             reason=reason,
             records=existing_index,
         )
+        handled, result = self._resolve_duplicate_add_result(duplicate_info, duplicate_mode)
+        if handled:
+            return True, result
+
+        item_id = self.make_item_id(key, duplicate_info["next_revision"])
+
+        item_dir = self._item_dir(item_id)
+        _safe_mkdir(item_dir)
+
+        extra_bytes = self._estimate_bytes([image_path])
+        if self.would_exceed(extra_bytes):
+            return False, self._build_inbox_full_error(extra_bytes)
+
+        img_rel = self._copy_inbox_image(image_path, item_dir)
+        record = self._build_inbox_record(
+            item_id=item_id,
+            item_dir=item_dir,
+            duplicate_info=duplicate_info,
+            key=key,
+            image_path=image_path,
+            tags=tags,
+            nl_prompt=nl_prompt,
+            reason=reason,
+            img_rel=img_rel,
+        )
+        pending_delta = 1
+
+        with open(os.path.join(item_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+
+        if duplicate_info["status"] == "duplicate" and duplicate_mode == "overwrite":
+            pending_delta = self._apply_duplicate_overwrite(existing_index, duplicate_info, item_id, pending_delta)
+        existing_index.append(record)
+        self.save_index(existing_index)
+        record["pending_delta"] = pending_delta
+        return True, record
+
+    def _resolve_duplicate_add_result(self, duplicate_info: Dict, duplicate_mode: str) -> Tuple[bool, Dict]:
         if duplicate_info["status"] == "same":
             existing = deepcopy(duplicate_info["record"])
             existing["already_exists"] = True
@@ -255,30 +293,39 @@ class VlmReviewInbox:
             existing["duplicate_conflict"] = True
             existing["pending_delta"] = 0
             return True, existing
+        return False, {}
 
-        item_id = self.make_item_id(key, duplicate_info["next_revision"])
+    def _build_inbox_full_error(self, extra_bytes: int) -> Dict:
+        return {
+            "error": "inbox_full",
+            "max_mb": self.policy.max_mb,
+            "current_mb": self.current_size_mb(),
+            "need_mb": extra_bytes / (1024 * 1024),
+            "on_full": self.policy.on_full,
+        }
 
-        item_dir = self._item_dir(item_id)
-        _safe_mkdir(item_dir)
-
-        extra_bytes = self._estimate_bytes([image_path])
-        if self.would_exceed(extra_bytes):
-            return False, {
-                "error": "inbox_full",
-                "max_mb": self.policy.max_mb,
-                "current_mb": self.current_size_mb(),
-                "need_mb": extra_bytes / (1024 * 1024),
-                "on_full": self.policy.on_full,
-            }
-
+    def _copy_inbox_image(self, image_path: str, item_dir: str) -> Optional[str]:
         img_dst = os.path.join(item_dir, "image" + os.path.splitext(image_path)[1].lower())
         try:
             shutil.copy2(image_path, img_dst)
-            img_rel = os.path.relpath(img_dst, self.root)
+            return os.path.relpath(img_dst, self.root)
         except Exception:
-            img_rel = None
+            return None
 
-        record = {
+    def _build_inbox_record(
+        self,
+        *,
+        item_id: str,
+        item_dir: str,
+        duplicate_info: Dict,
+        key: str,
+        image_path: str,
+        tags: str,
+        nl_prompt: str,
+        reason: str,
+        img_rel: Optional[str],
+    ) -> Dict:
+        return {
             "id": item_id,
             "root_id": duplicate_info["base_id"],
             "revision": duplicate_info["next_revision"],
@@ -296,23 +343,16 @@ class VlmReviewInbox:
                 "image": img_rel,
             },
         }
-        pending_delta = 1
 
-        with open(os.path.join(item_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(record, f, ensure_ascii=False, indent=2)
-
-        if duplicate_info["status"] == "duplicate" and duplicate_mode == "overwrite":
-            existing_record = existing_index[duplicate_info["existing_index"]]
-            if isinstance(existing_record, dict):
-                previous_status = existing_record.get("status", "pending")
-                existing_record["archived_status"] = existing_record.get("status", "pending")
-                existing_record["status"] = "superseded"
-                existing_record["superseded_ts"] = _now_ts()
-                existing_record["superseded_by"] = item_id
-                existing_record["superseded_mode"] = "overwrite"
-                if previous_status == "pending":
-                    pending_delta = 0
-        existing_index.append(record)
-        self.save_index(existing_index)
-        record["pending_delta"] = pending_delta
-        return True, record
+    def _apply_duplicate_overwrite(self, existing_index: List[Dict], duplicate_info: Dict, item_id: str, pending_delta: int) -> int:
+        existing_record = existing_index[duplicate_info["existing_index"]]
+        if isinstance(existing_record, dict):
+            previous_status = existing_record.get("status", "pending")
+            existing_record["archived_status"] = existing_record.get("status", "pending")
+            existing_record["status"] = "superseded"
+            existing_record["superseded_ts"] = _now_ts()
+            existing_record["superseded_by"] = item_id
+            existing_record["superseded_mode"] = "overwrite"
+            if previous_status == "pending":
+                return 0
+        return pending_delta

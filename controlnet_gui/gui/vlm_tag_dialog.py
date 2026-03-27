@@ -134,11 +134,7 @@ class _BatchWorker(QThread):
 
     def run(self):
         try:
-            tag_entries = _load_jsona(self.tag_jsona)
-            client = VlmClient(self.cfg)
-            inbox = VlmReviewInbox(self.out_dir, policy=self.inbox_policy)
-
-            nl_file = os.path.join(self.out_dir, "nl.jsona")
+            tag_entries, client, inbox, nl_file = self._prepare_batch_runtime()
             written = 0
             updated = 0
             needs_review = 0
@@ -148,71 +144,25 @@ class _BatchWorker(QThread):
                 if self._stop:
                     break
 
-                if not isinstance(item, dict):
+                row = self._extract_batch_row(item)
+                if row is None:
                     continue
-                image_path = (item.get("hint_image_path") or "").strip()
-                tags = (item.get("hint_prompt") or "").strip()
-                if not image_path or not os.path.exists(image_path):
-                    continue
+                image_path, tags = row
 
                 processed += 1
                 self.progress.emit(f"VLM处理中: {processed}/{len(tag_entries)}")
 
-                try:
-                    result = client.rewrite(image_path, tags)
-                    nl_prompt = (result.get("nl_prompt") or "").strip()
-                    needs = bool(result.get("needs_review", False)) or (not nl_prompt)
-                    reason = (result.get("reason") or "").strip()
-                except Exception as exc:
-                    nl_prompt = ""
-                    needs = True
-                    reason = f"inference_error: {exc}"
-
+                nl_prompt, needs, reason = self._rewrite_row(client, image_path, tags)
                 if needs:
-                    duplicate_mode = "reuse"
-                    duplicate_info = inbox.inspect_duplicate(
-                        key=image_path,
-                        image_path=image_path,
-                        tags=tags,
-                        nl_prompt=nl_prompt,
-                        reason=reason or "needs_review",
-                    )
-                    if duplicate_info.get("status") == "duplicate":
-                        duplicate_mode = self._request_duplicate_resolution({
-                            "image_path": image_path,
-                            "existing_revision": int(duplicate_info.get("record", {}).get("revision", 0) or 0),
-                            "next_revision": int(duplicate_info.get("next_revision", 0) or 0),
-                            "record_count": int(duplicate_info.get("record_count", 0) or 0),
-                            "existing_summary": self._format_existing_summary(duplicate_info.get("record", {}) or {}),
-                            "new_summary": self._format_new_summary(
-                                next_revision=int(duplicate_info.get("next_revision", 0) or 0),
-                                tags=tags,
-                                nl_prompt=nl_prompt,
-                                reason=reason or "needs_review",
-                            ),
-                        })
-                    ok, info = inbox.add_item(
-                        key=image_path,
-                        image_path=image_path,
-                        tags=tags,
-                        nl_prompt=nl_prompt,
-                        reason=reason or "needs_review",
-                        duplicate_mode=duplicate_mode,
-                    )
+                    ok, info = self._enqueue_review_item(inbox, image_path, tags, nl_prompt, reason)
                     if not ok:
                         on_full = str(info.get("on_full", "pause")).lower()
-                        msg = f"VLM 审核箱已满，{on_full}。"
-                        self.paused.emit(msg)
+                        self.paused.emit(f"VLM 审核箱已满，{on_full}。")
                         break
                     needs_review += int(info.get("pending_delta", 0) or 0)
                     continue
 
-                entry = {
-                    "hint_image_path": os.path.abspath(image_path).replace("\\", "/"),
-                    "hint_prompt": nl_prompt,
-                    "control_hints_path": os.path.abspath(image_path).replace("\\", "/"),
-                    "task_id": "nl",
-                }
+                entry = self._build_nl_entry(image_path, nl_prompt)
                 res = self.backup_manager.upsert_entries(nl_file, [entry])
                 written += int(res.get("added", 0))
                 updated += int(res.get("updated", 0))
@@ -227,6 +177,96 @@ class _BatchWorker(QThread):
             })
         except Exception as e:
             self.finished_err.emit(str(e))
+
+    def _prepare_batch_runtime(self):
+        tag_entries = _load_jsona(self.tag_jsona)
+        client = VlmClient(self.cfg)
+        inbox = VlmReviewInbox(self.out_dir, policy=self.inbox_policy)
+        nl_file = os.path.join(self.out_dir, "nl.jsona")
+        return tag_entries, client, inbox, nl_file
+
+    @staticmethod
+    def _extract_batch_row(item: Dict) -> Optional[tuple]:
+        if not isinstance(item, dict):
+            return None
+        image_path = (item.get("hint_image_path") or "").strip()
+        tags = (item.get("hint_prompt") or "").strip()
+        if not image_path or not os.path.exists(image_path):
+            return None
+        return image_path, tags
+
+    @staticmethod
+    def _rewrite_row(client: VlmClient, image_path: str, tags: str):
+        try:
+            result = client.rewrite(image_path, tags)
+            nl_prompt = (result.get("nl_prompt") or "").strip()
+            needs = bool(result.get("needs_review", False)) or (not nl_prompt)
+            reason = (result.get("reason") or "").strip()
+            return nl_prompt, needs, reason
+        except Exception as exc:
+            return "", True, f"inference_error: {exc}"
+
+    def _enqueue_review_item(self, inbox: VlmReviewInbox, image_path: str, tags: str, nl_prompt: str, reason: str):
+        duplicate_mode = "reuse"
+        review_reason = reason or "needs_review"
+        duplicate_info = inbox.inspect_duplicate(
+            key=image_path,
+            image_path=image_path,
+            tags=tags,
+            nl_prompt=nl_prompt,
+            reason=review_reason,
+        )
+        if duplicate_info.get("status") == "duplicate":
+            duplicate_mode = self._request_duplicate_resolution(
+                self._build_duplicate_resolution_payload(
+                    duplicate_info=duplicate_info,
+                    image_path=image_path,
+                    tags=tags,
+                    nl_prompt=nl_prompt,
+                    reason=review_reason,
+                )
+            )
+        return inbox.add_item(
+            key=image_path,
+            image_path=image_path,
+            tags=tags,
+            nl_prompt=nl_prompt,
+            reason=review_reason,
+            duplicate_mode=duplicate_mode,
+        )
+
+    def _build_duplicate_resolution_payload(
+        self,
+        *,
+        duplicate_info: Dict,
+        image_path: str,
+        tags: str,
+        nl_prompt: str,
+        reason: str,
+    ) -> Dict:
+        return {
+            "image_path": image_path,
+            "existing_revision": int(duplicate_info.get("record", {}).get("revision", 0) or 0),
+            "next_revision": int(duplicate_info.get("next_revision", 0) or 0),
+            "record_count": int(duplicate_info.get("record_count", 0) or 0),
+            "existing_summary": self._format_existing_summary(duplicate_info.get("record", {}) or {}),
+            "new_summary": self._format_new_summary(
+                next_revision=int(duplicate_info.get("next_revision", 0) or 0),
+                tags=tags,
+                nl_prompt=nl_prompt,
+                reason=reason,
+            ),
+        }
+
+    @staticmethod
+    def _build_nl_entry(image_path: str, nl_prompt: str) -> Dict:
+        abs_path = os.path.abspath(image_path).replace("\\", "/")
+        return {
+            "hint_image_path": abs_path,
+            "hint_prompt": nl_prompt,
+            "control_hints_path": abs_path,
+            "task_id": "nl",
+        }
 
 
 class VlmTagDialog(QDialog):
@@ -265,6 +305,21 @@ class VlmTagDialog(QDialog):
         w = QDialog()
         v = QVBoxLayout(w)
 
+        v.addWidget(self._build_batch_intro())
+        v.addWidget(self._build_batch_backend_group())
+        self._apply_initial_vlm_config()
+        io_group = self._build_batch_io_group()
+        self.label_batch_status = QLabel("未开始。")
+        self.label_batch_status.setWordWrap(True)
+        v.addWidget(io_group)
+        v.addWidget(self.label_batch_status)
+
+        v.addWidget(self._build_batch_inbox_group())
+        v.addLayout(self._build_batch_action_row())
+        v.addStretch(1)
+        return w
+
+    def _build_batch_intro(self) -> QLabel:
         intro = QLabel(
             "这个工具只负责调用你已经准备好的 VLM 服务，不负责安装模型。\n"
             "你只需要填写 backend / base_url / model / api_key；CPU 或 GPU 由后端自己决定。\n"
@@ -272,8 +327,9 @@ class VlmTagDialog(QDialog):
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #bbb; padding: 4px 0 8px 0;")
-        v.addWidget(intro)
+        return intro
 
+    def _build_batch_backend_group(self) -> QGroupBox:
         cfg_group = QGroupBox("推理后端")
         cfg_form = QFormLayout(cfg_group)
 
@@ -296,26 +352,27 @@ class VlmTagDialog(QDialog):
         self.spin_timeout.setValue(120)
         self.spin_timeout.setSuffix(" s")
         cfg_form.addRow("timeout:", self.spin_timeout)
+        return cfg_group
 
-        v.addWidget(cfg_group)
+    def _apply_initial_vlm_config(self):
+        if not self._initial_cfg:
+            return
+        try:
+            self.combo_backend.setCurrentText(self._initial_cfg.backend or "openai")
+        except Exception:
+            pass
+        if self._initial_cfg.base_url:
+            self.edit_base_url.setText(self._initial_cfg.base_url)
+        if self._initial_cfg.api_key is not None:
+            self.edit_api_key.setText(self._initial_cfg.api_key)
+        if self._initial_cfg.model:
+            self.edit_model.setText(self._initial_cfg.model)
+        try:
+            self.spin_timeout.setValue(int(self._initial_cfg.timeout_seconds))
+        except Exception:
+            pass
 
-        # Apply initial values from settings.
-        if self._initial_cfg:
-            try:
-                self.combo_backend.setCurrentText(self._initial_cfg.backend or "openai")
-            except Exception:
-                pass
-            if self._initial_cfg.base_url:
-                self.edit_base_url.setText(self._initial_cfg.base_url)
-            if self._initial_cfg.api_key is not None:
-                self.edit_api_key.setText(self._initial_cfg.api_key)
-            if self._initial_cfg.model:
-                self.edit_model.setText(self._initial_cfg.model)
-            try:
-                self.spin_timeout.setValue(int(self._initial_cfg.timeout_seconds))
-            except Exception:
-                pass
-
+    def _build_batch_io_group(self) -> QGroupBox:
         io_group = QGroupBox("输入/输出")
         io_form = QFormLayout(io_group)
 
@@ -326,16 +383,14 @@ class VlmTagDialog(QDialog):
         row.addWidget(self.edit_tag_jsona)
         row.addWidget(btn_pick_tag)
         io_form.addRow("tag.jsona:", row)
+
         io_note = QLabel("输出目标固定为 output/nl.jsona；同一张图重复写入时会按图片路径更新 nl，而不是无限追加重复项。")
         io_note.setWordWrap(True)
         io_note.setStyleSheet("color: #999;")
         io_form.addRow(io_note)
+        return io_group
 
-        self.label_batch_status = QLabel("未开始。")
-        self.label_batch_status.setWordWrap(True)
-        v.addWidget(io_group)
-        v.addWidget(self.label_batch_status)
-
+    def _build_batch_inbox_group(self) -> QGroupBox:
         inbox_group = QGroupBox("无人值守 (VLM 审核箱)")
         inbox_form = QFormLayout(inbox_group)
 
@@ -348,12 +403,14 @@ class VlmTagDialog(QDialog):
         self.combo_inbox_full = QComboBox()
         self.combo_inbox_full.addItems(["pause", "stop"])
         inbox_form.addRow("满额动作:", self.combo_inbox_full)
+
         inbox_note = QLabel("pause: 暂停当前批量推理，保留现场。\nstop: 直接结束当前批量推理。")
         inbox_note.setWordWrap(True)
         inbox_note.setStyleSheet("color: #999;")
         inbox_form.addRow(inbox_note)
-        v.addWidget(inbox_group)
+        return inbox_group
 
+    def _build_batch_action_row(self) -> QHBoxLayout:
         btns = QHBoxLayout()
         self.btn_start = QPushButton("开始批量推理")
         self.btn_start.clicked.connect(self._start_batch)
@@ -369,10 +426,7 @@ class VlmTagDialog(QDialog):
         btns.addWidget(self.btn_refresh_manual)
 
         btns.addStretch(1)
-        v.addLayout(btns)
-
-        v.addStretch(1)
-        return w
+        return btns
 
     def _build_manual_tab(self):
         w = QDialog()

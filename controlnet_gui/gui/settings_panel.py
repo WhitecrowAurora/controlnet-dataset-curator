@@ -24,6 +24,7 @@ from ..core.parquet_source import ParquetDataSource, StreamingDataSource
 from ..core.jsona_backup import JsonaBackupManager
 from ..core.fusion_score_filter import FusionScoreFilter
 from ..core.progress_manager import ProgressManager
+from ..core.control_type_config import CONTROL_TYPES, PROFILE_THRESHOLD_KEYS, profile_thresholds_for
 from ..core.tag_formats import build_xml_fragment
 
 
@@ -547,6 +548,7 @@ class SettingsPanel(QWidget):
         self._connect_autosave_signals()
         self._last_saved_flat_settings = deepcopy(self._collect_flat_settings())
         self._settings_tracking_suspended = False
+        self._check_torch_availability()
 
         # Update JSONA statistics
         self._update_jsona_statistics()
@@ -557,9 +559,28 @@ class SettingsPanel(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
+        self._apply_panel_styles()
+        self._add_settings_groups(main_layout)
+        self._add_primary_action_buttons(main_layout)
+        self._add_runtime_control_buttons(main_layout)
+        self._add_reset_progress_button(main_layout)
+        main_layout.addStretch()
 
-        # Set panel style
-        self.setStyleSheet("""
+    def _apply_panel_styles(self):
+        self.setStyleSheet(self._panel_stylesheet())
+
+    def _panel_stylesheet(self) -> str:
+        sections = [
+            self._panel_base_stylesheet(),
+            self._panel_input_stylesheet(),
+            self._panel_toggle_and_button_stylesheet(),
+            self._panel_tab_stylesheet(),
+        ]
+        return "\n".join(section.strip() for section in sections if section)
+
+    @staticmethod
+    def _panel_base_stylesheet() -> str:
+        return """
             QWidget {
                 background-color: #1e1e1e;
                 color: #ffffff;
@@ -580,6 +601,11 @@ class SettingsPanel(QWidget):
             QLabel {
                 color: #cccccc;
             }
+        """
+
+    @staticmethod
+    def _panel_input_stylesheet() -> str:
+        return """
             QLineEdit {
                 background-color: #2d2d2d;
                 border: 1px solid #444;
@@ -619,6 +645,11 @@ class SettingsPanel(QWidget):
                 padding: 5px;
                 color: #ffffff;
             }
+        """
+
+    @staticmethod
+    def _panel_toggle_and_button_stylesheet() -> str:
+        return """
             QCheckBox {
                 color: #cccccc;
                 spacing: 5px;
@@ -647,6 +678,11 @@ class SettingsPanel(QWidget):
             QPushButton:pressed {
                 background-color: #2d2d2d;
             }
+        """
+
+    @staticmethod
+    def _panel_tab_stylesheet() -> str:
+        return """
             QTabBar::tab {
                 background-color: #2d2d2d;
                 color: #cccccc;
@@ -664,28 +700,25 @@ class SettingsPanel(QWidget):
             QTabBar::tab:!selected {
                 margin-top: 3px;
             }
-        """)
+        """
 
-        # Data source settings
+    def _add_settings_groups(self, main_layout: QVBoxLayout):
         data_source_group = self._create_data_source_group()
         main_layout.addWidget(data_source_group)
 
         mode_switch_group = self._create_mode_switch_group()
         main_layout.addWidget(mode_switch_group)
 
-        # Processing settings
         processing_group = self._create_processing_group()
         main_layout.addWidget(processing_group)
 
-        # Retry and custom tags settings
         advanced_group = self._create_advanced_group()
         main_layout.addWidget(advanced_group)
 
-        # Output settings
         output_group = self._create_output_group()
         main_layout.addWidget(output_group)
 
-        # Start button
+    def _add_primary_action_buttons(self, main_layout: QVBoxLayout):
         self.btn_start = QPushButton(tr('start_processing'))
         self.btn_start.setStyleSheet("""
             QPushButton {
@@ -707,7 +740,6 @@ class SettingsPanel(QWidget):
         self.btn_start.clicked.connect(self.start_processing.emit)
         main_layout.addWidget(self.btn_start)
 
-        # Reset button
         self.btn_reset = QPushButton('重置为默认配置')
         self.btn_reset.setStyleSheet("""
             QPushButton {
@@ -728,10 +760,9 @@ class SettingsPanel(QWidget):
         self.btn_reset.clicked.connect(self._reset_to_defaults)
         main_layout.addWidget(self.btn_reset)
 
-        # Control buttons layout
+    def _add_runtime_control_buttons(self, main_layout: QVBoxLayout):
         control_layout = QHBoxLayout()
 
-        # Pause button
         self.btn_pause = QPushButton(tr('pause_processing'))
         self.btn_pause.setEnabled(False)
         self.btn_pause.setStyleSheet("""
@@ -753,7 +784,6 @@ class SettingsPanel(QWidget):
         """)
         control_layout.addWidget(self.btn_pause)
 
-        # Stop button
         self.btn_stop = QPushButton(tr('stop_processing'))
         self.btn_stop.setEnabled(False)
         self.btn_stop.setStyleSheet("""
@@ -777,7 +807,7 @@ class SettingsPanel(QWidget):
 
         main_layout.addLayout(control_layout)
 
-        # Reset progress button
+    def _add_reset_progress_button(self, main_layout: QVBoxLayout):
         self.btn_reset_progress = QPushButton("重置断点续传")
         self.btn_reset_progress.setStyleSheet("""
             QPushButton {
@@ -795,14 +825,7 @@ class SettingsPanel(QWidget):
         self.btn_reset_progress.clicked.connect(self._on_reset_progress)
         main_layout.addWidget(self.btn_reset_progress)
 
-        main_layout.addStretch()
-
-    def _create_data_source_group(self) -> QGroupBox:
-        """Create data source settings group"""
-        group = QGroupBox(tr('data_source'))
-        layout = QVBoxLayout(group)
-
-        # Data source type selection
+    def _create_data_source_type_selector(self, layout: QVBoxLayout):
         type_layout = QHBoxLayout()
         type_layout.addWidget(QLabel(tr('type') + ':'))
         self.combo_source_type = QComboBox()
@@ -812,11 +835,10 @@ class SettingsPanel(QWidget):
         type_layout.addStretch()
         layout.addLayout(type_layout)
 
-        # Local parquet settings
+    def _create_local_parquet_widget(self, layout: QVBoxLayout):
         self.local_widget = QWidget()
         local_layout = QVBoxLayout(self.local_widget)
 
-        # Parquet files list
         parquet_label = QLabel(tr('parquet_files') + ':')
         local_layout.addWidget(parquet_label)
 
@@ -824,7 +846,6 @@ class SettingsPanel(QWidget):
         self.list_parquet_files.setMaximumHeight(100)
         local_layout.addWidget(self.list_parquet_files)
 
-        # Add/Remove buttons
         btn_layout = QHBoxLayout()
         self.btn_add_parquet = QPushButton(tr('add_file'))
         self.btn_add_parquet.clicked.connect(self._add_parquet_file)
@@ -836,7 +857,6 @@ class SettingsPanel(QWidget):
         btn_layout.addStretch()
         local_layout.addLayout(btn_layout)
 
-        # Extract directory
         extract_layout = QHBoxLayout()
         extract_layout.addWidget(QLabel(tr('extract_dir') + ':'))
         self.edit_extract_dir = QLineEdit("./extracted")
@@ -846,7 +866,6 @@ class SettingsPanel(QWidget):
         extract_layout.addWidget(btn_browse_extract)
         local_layout.addLayout(extract_layout)
 
-        # Num samples (0 = all)
         samples_layout = QHBoxLayout()
         samples_layout.addWidget(QLabel(tr('num_samples') + ':'))
         self.spin_local_samples = QSpinBox()
@@ -857,53 +876,17 @@ class SettingsPanel(QWidget):
         samples_layout.addStretch()
         local_layout.addLayout(samples_layout)
 
-        # Extract button
         self.btn_extract = QPushButton(tr('extract_data'))
         self.btn_extract.clicked.connect(self._extract_parquet_data)
         local_layout.addWidget(self.btn_extract)
 
-        # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         local_layout.addWidget(self.progress_bar)
 
         layout.addWidget(self.local_widget)
 
-        # Streaming dataset settings
-        self.streaming_widget = QWidget()
-        streaming_layout = QFormLayout(self.streaming_widget)
-
-        self.edit_dataset_id = QLineEdit()
-        self.edit_dataset_id.setPlaceholderText("username/dataset-name or https://huggingface.co/datasets/...")
-        streaming_layout.addRow(tr('dataset_id') + ':', self.edit_dataset_id)
-
-        self.edit_split = QLineEdit("")
-        self.edit_split.setPlaceholderText(tr('split_placeholder'))
-        streaming_layout.addRow(tr('split') + ':', self.edit_split)
-
-        self.edit_hf_token = QLineEdit()
-        self.edit_hf_token.setEchoMode(QLineEdit.Password)
-        self.edit_hf_token.setPlaceholderText(tr('hf_token_placeholder'))
-        streaming_layout.addRow(tr('hf_token') + ':', self.edit_hf_token)
-
-        # User prefix for multi-user collaboration
-        self.edit_user_prefix = QLineEdit()
-        self.edit_user_prefix.setPlaceholderText(tr('user_prefix_placeholder'))
-        streaming_layout.addRow(tr('user_prefix') + ':', self.edit_user_prefix)
-
-        # Skip count (starting position)
-        self.spin_skip_count = QSpinBox()
-        self.spin_skip_count.setRange(0, 100000000)
-        self.spin_skip_count.setValue(0)
-        self.spin_skip_count.setSingleStep(10000)
-        streaming_layout.addRow(tr('skip_count') + ':', self.spin_skip_count)
-
-        self.spin_num_samples = QSpinBox()
-        self.spin_num_samples.setRange(1, 1000000)
-        self.spin_num_samples.setValue(10000)
-        streaming_layout.addRow(tr('num_samples') + ':', self.spin_num_samples)
-
-        # Multi-threading option
+    def _create_streaming_multithread_row(self, streaming_layout: QFormLayout):
         multithread_layout = QHBoxLayout()
         self.check_multithread = QCheckBox(tr('enable_multithread'))
         self.check_multithread.setChecked(True)
@@ -913,14 +896,11 @@ class SettingsPanel(QWidget):
         multithread_layout.addWidget(QLabel(tr('thread_count') + ':'))
         self.spin_thread_count = QSpinBox()
         self.spin_thread_count.setRange(1, 32)
-        # Auto-detect CPU count and set default (leave 1 thread for system)
-        import os
         cpu_count = os.cpu_count() or 4
         default_threads = max(1, cpu_count - 1)
         self.spin_thread_count.setValue(default_threads)
         multithread_layout.addWidget(self.spin_thread_count)
 
-        # Auto button
         btn_auto_thread = QPushButton('自动')
         btn_auto_thread.setMaximumWidth(50)
         btn_auto_thread.clicked.connect(lambda: self.spin_thread_count.setValue(max(1, (os.cpu_count() or 4) - 1)))
@@ -929,21 +909,7 @@ class SettingsPanel(QWidget):
         multithread_layout.addStretch()
         streaming_layout.addRow('', multithread_layout)
 
-        # Extract directory for streaming
-        self.edit_streaming_extract_dir = QLineEdit("./extracted")
-        btn_browse_streaming = QPushButton(tr('browse'))
-        btn_browse_streaming.clicked.connect(lambda: self._browse_directory(self.edit_streaming_extract_dir))
-        streaming_extract_layout = QHBoxLayout()
-        streaming_extract_layout.addWidget(self.edit_streaming_extract_dir)
-        streaming_extract_layout.addWidget(btn_browse_streaming)
-        streaming_layout.addRow(tr('extract_dir') + ':', streaming_extract_layout)
-
-        # Extract button for streaming
-        self.btn_extract_streaming = QPushButton(tr('extract_data'))
-        self.btn_extract_streaming.clicked.connect(self._extract_streaming_data)
-        streaming_layout.addRow('', self.btn_extract_streaming)
-
-        # Progress log for streaming
+    def _create_streaming_progress_widgets(self, streaming_layout: QFormLayout):
         self.streaming_log = QTextEdit()
         self.streaming_log.setReadOnly(True)
         self.streaming_log.setMaximumHeight(150)
@@ -959,12 +925,10 @@ class SettingsPanel(QWidget):
         """)
         streaming_layout.addRow('', self.streaming_log)
 
-        # Progress bar for extraction
         self.extraction_progress = QProgressBar()
         self.extraction_progress.setVisible(False)
         self.extraction_progress.setFormat('%v / %m images (%p%) - 0 it/s')
         self.extraction_progress.setMinimumWidth(240)  # Set minimum width
-        # Set blue progress bar style
         self.extraction_progress.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #444;
@@ -983,9 +947,64 @@ class SettingsPanel(QWidget):
         self.extraction_last_time = 0
         streaming_layout.addRow('', self.extraction_progress)
 
+    def _create_streaming_dataset_widget(self, layout: QVBoxLayout):
+        self.streaming_widget = QWidget()
+        streaming_layout = QFormLayout(self.streaming_widget)
+
+        self.edit_dataset_id = QLineEdit()
+        self.edit_dataset_id.setPlaceholderText("username/dataset-name or https://huggingface.co/datasets/...")
+        streaming_layout.addRow(tr('dataset_id') + ':', self.edit_dataset_id)
+
+        self.edit_split = QLineEdit("")
+        self.edit_split.setPlaceholderText(tr('split_placeholder'))
+        streaming_layout.addRow(tr('split') + ':', self.edit_split)
+
+        self.edit_hf_token = QLineEdit()
+        self.edit_hf_token.setEchoMode(QLineEdit.Password)
+        self.edit_hf_token.setPlaceholderText(tr('hf_token_placeholder'))
+        streaming_layout.addRow(tr('hf_token') + ':', self.edit_hf_token)
+
+        self.edit_user_prefix = QLineEdit()
+        self.edit_user_prefix.setPlaceholderText(tr('user_prefix_placeholder'))
+        streaming_layout.addRow(tr('user_prefix') + ':', self.edit_user_prefix)
+
+        self.spin_skip_count = QSpinBox()
+        self.spin_skip_count.setRange(0, 100000000)
+        self.spin_skip_count.setValue(0)
+        self.spin_skip_count.setSingleStep(10000)
+        streaming_layout.addRow(tr('skip_count') + ':', self.spin_skip_count)
+
+        self.spin_num_samples = QSpinBox()
+        self.spin_num_samples.setRange(1, 1000000)
+        self.spin_num_samples.setValue(10000)
+        streaming_layout.addRow(tr('num_samples') + ':', self.spin_num_samples)
+
+        self._create_streaming_multithread_row(streaming_layout)
+
+        self.edit_streaming_extract_dir = QLineEdit("./extracted")
+        btn_browse_streaming = QPushButton(tr('browse'))
+        btn_browse_streaming.clicked.connect(lambda: self._browse_directory(self.edit_streaming_extract_dir))
+        streaming_extract_layout = QHBoxLayout()
+        streaming_extract_layout.addWidget(self.edit_streaming_extract_dir)
+        streaming_extract_layout.addWidget(btn_browse_streaming)
+        streaming_layout.addRow(tr('extract_dir') + ':', streaming_extract_layout)
+
+        self.btn_extract_streaming = QPushButton(tr('extract_data'))
+        self.btn_extract_streaming.clicked.connect(self._extract_streaming_data)
+        streaming_layout.addRow('', self.btn_extract_streaming)
+
+        self._create_streaming_progress_widgets(streaming_layout)
+
         layout.addWidget(self.streaming_widget)
         self.streaming_widget.hide()
 
+    def _create_data_source_group(self) -> QGroupBox:
+        """Create data source settings group"""
+        group = QGroupBox(tr('data_source'))
+        layout = QVBoxLayout(group)
+        self._create_data_source_type_selector(layout)
+        self._create_local_parquet_widget(layout)
+        self._create_streaming_dataset_widget(layout)
         return group
 
     def _create_mode_switch_group(self) -> QGroupBox:
@@ -1020,92 +1039,189 @@ class SettingsPanel(QWidget):
     def _get_settings_history_file_path(self) -> str:
         return os.path.join(self._get_repo_root(), 'settings_history.jsonl')
 
-    def _collect_flat_settings(self) -> dict:
-        unattended_action = 'pause' if self.combo_unattended_inbox_full_action.currentIndex() == 0 else 'stop'
-        local_parquet_files = [
+    def _collect_local_parquet_files(self) -> list:
+        return [
             self.list_parquet_files.item(i).text()
             for i in range(self.list_parquet_files.count())
         ]
-        return {
-            'data_source_type': self.combo_source_type.currentIndex(),
-            'local_parquet_files': local_parquet_files,
-            'local_num_samples': self.spin_local_samples.value(),
-            'dataset_id': self.edit_dataset_id.text(),
-            'split': self.edit_split.text(),
-            'hf_token': self.edit_hf_token.text(),
-            'num_samples': self.spin_num_samples.value(),
-            'user_prefix': self.edit_user_prefix.text(),
-            'skip_count': self.spin_skip_count.value(),
-            'enable_multithread': self.check_multithread.isChecked(),
-            'thread_count': self.spin_thread_count.value(),
-            'streaming_extract_dir': self.edit_streaming_extract_dir.text(),
-            'local_extract_dir': self.edit_extract_dir.text(),
-            'use_custom_dir': self.radio_use_custom_dir.isChecked(),
-            'custom_input_dir': self.edit_custom_input_dir.text(),
-            'processing_threads': self.spin_processing_threads.value(),
-            'preload_count': self.spin_preload_count.value(),
-            'processing_mode': self._current_processing_mode(),
-            'canny_enabled': self.check_canny.isChecked(),
-            'openpose_enabled': self.check_openpose.isChecked(),
-            'depth_enabled': self.check_depth.isChecked(),
-            'bbox_enabled': self.check_bbox.isChecked(),
-            'quality_profile': self.combo_quality_profile.currentText(),
-            'canny_accept': self.spin_canny_accept.value(),
-            'canny_reject': self.spin_canny_reject.value(),
-            'pose_accept': self.spin_pose_accept.value(),
-            'pose_reject': self.spin_pose_reject.value(),
-            'depth_accept': self.spin_depth_accept.value(),
-            'depth_reject': self.spin_depth_reject.value(),
-            'bbox_accept': self.spin_bbox_accept.value(),
-            'bbox_reject': self.spin_bbox_reject.value(),
-            'score_filter_enabled': self.check_score_filter_enabled.isChecked(),
-            'score_filter_checkpoint_path': self.edit_score_checkpoint_path.text(),
-            'score_filter_cache_root': self.edit_score_cache_root.text(),
-            'score_filter_device': self.combo_score_device.currentText(),
-            'score_filter_min_aesthetic': self.spin_score_min_aesthetic.value(),
-            'score_filter_require_in_domain': self.check_score_require_in_domain.isChecked(),
-            'score_filter_min_in_domain_prob': self.spin_score_min_in_domain_prob.value(),
-            'score_mode_auto_accept': self.spin_score_mode_auto_accept.value(),
-            'openpose_model': self.combo_openpose_model.currentText(),
-            'openpose_yolo_version': self.combo_yolo_version.currentText(),
-            'openpose_yolo_model_type': self.combo_yolo_model_type.currentText(),
-            'openpose_custom_path': self.edit_openpose_path.text(),
-            'depth_model': self.combo_depth_model.currentText(),
-            'depth_custom_path': self.edit_depth_path.text(),
-            'bbox_model': self.combo_bbox_model.currentText(),
-            'bbox_custom_path': self.edit_bbox_path.text(),
-            'bbox_conf_threshold': self.spin_bbox_conf.value(),
-            'bbox_iou_threshold': self.spin_bbox_iou.value(),
-            'bbox_person_only': self.check_bbox_person_only.isChecked(),
-            'parallel_threads': self.spin_parallel_threads.value(),
-            'auto_pass_no_review': self.check_auto_pass_no_review.isChecked(),
-            'single_jsona': self.check_single_jsona.isChecked(),
-            'jsona_backup_every_entries': self.spin_jsona_backup_every_entries.value(),
-            'jsona_backup_every_seconds': self.spin_jsona_backup_every_seconds.value(),
-            'jsona_backup_keep': self.spin_jsona_backup_keep.value(),
-            'unattended_mode': self.check_unattended_mode.isChecked(),
-            'unattended_inbox_max_mb': self.spin_unattended_inbox_max_mb.value(),
-            'unattended_inbox_full_action': unattended_action,
-            'vlm_backend': self.combo_vlm_backend.currentText(),
-            'vlm_base_url': self.edit_vlm_base_url.text(),
-            'vlm_model': self.edit_vlm_model.text(),
-            'vlm_api_key': self.edit_vlm_api_key.text(),
-            'vlm_timeout_seconds': self.spin_vlm_timeout.value(),
-            'xml_template_path': self.edit_xml_template_path.text(),
-            'xml_artist_field_path': self.combo_xml_artist_field.currentText().strip(),
-            'xml_artist_tag_index': self.spin_xml_artist_tag_index.value(),
-            'xml_character1_field_path': self.combo_xml_character1_field.currentText().strip(),
-            'xml_character1_tag_index': self.spin_xml_character1_tag_index.value(),
-            'xml_character2_field_path': self.combo_xml_character2_field.currentText().strip(),
-            'xml_character2_tag_index': self.spin_xml_character2_tag_index.value(),
-            'xml_custom_mappings': self._serialize_xml_custom_mappings(),
-            'enable_retry': self.check_enable_retry.isChecked(),
-            'max_retries': self.spin_max_retries.value(),
-            'append_tags': self.check_append_tags.isChecked(),
-            'custom_tags': self.edit_custom_tags.toPlainText(),
-            'output_dir': self.edit_output_dir.text(),
-            'discard_action': self.combo_discard_action.currentText(),
+
+    def _collect_unattended_inbox_full_action(self) -> str:
+        return 'pause' if self.combo_unattended_inbox_full_action.currentIndex() == 0 else 'stop'
+
+    @staticmethod
+    def _bbox_target_part_options() -> list:
+        return [
+            ('全身', 'person'),
+            ('头部', 'head'),
+            ('上半身', 'upper_body'),
+            ('下半身', 'lower_body'),
+        ]
+
+    def _bbox_target_part_to_key(self, text: str) -> str:
+        value = str(text or '').strip()
+        for label, key in self._bbox_target_part_options():
+            if value == label:
+                return key
+        return 'person'
+
+    def _bbox_target_part_from_key(self, key: str) -> str:
+        normalized = str(key or 'person').strip().lower()
+        alias = {
+            'person': 'person',
+            'full': 'person',
+            'full_body': 'person',
+            'head': 'head',
+            'face': 'head',
+            'upper': 'upper_body',
+            'upper_body': 'upper_body',
+            'torso': 'upper_body',
+            'lower': 'lower_body',
+            'lower_body': 'lower_body',
+            'legs': 'lower_body',
+        }.get(normalized, 'person')
+        for label, option_key in self._bbox_target_part_options():
+            if option_key == alias:
+                return label
+        return '全身'
+
+    def _collect_bbox_target_part_key(self) -> str:
+        if not hasattr(self, 'combo_bbox_target_part'):
+            return 'person'
+        return self._bbox_target_part_to_key(self.combo_bbox_target_part.currentText())
+
+    def _apply_bbox_target_part_key(self, value):
+        if not hasattr(self, 'combo_bbox_target_part'):
+            return
+        self.combo_bbox_target_part.setCurrentText(self._bbox_target_part_from_key(str(value)))
+
+    def _collect_bbox_specialized_model_path(self, part_key: str) -> str:
+        attr_map = {
+            'head': 'edit_bbox_specialized_head_path',
+            'upper_body': 'edit_bbox_specialized_upper_path',
+            'lower_body': 'edit_bbox_specialized_lower_path',
         }
+        attr = attr_map.get(str(part_key or '').strip(), '')
+        widget = getattr(self, attr, None)
+        if widget is None:
+            return ''
+        return widget.text().strip()
+
+    def _apply_bbox_specialized_model_path(self, part_key: str, value):
+        attr_map = {
+            'head': 'edit_bbox_specialized_head_path',
+            'upper_body': 'edit_bbox_specialized_upper_path',
+            'lower_body': 'edit_bbox_specialized_lower_path',
+        }
+        attr = attr_map.get(str(part_key or '').strip(), '')
+        widget = getattr(self, attr, None)
+        if widget is None:
+            return
+        widget.setText(str(value or '').strip())
+
+    def _flat_settings_collect_steps(self):
+        return (
+            ('data_source_type', lambda: self.combo_source_type.currentIndex()),
+            ('local_parquet_files', self._collect_local_parquet_files),
+            ('local_num_samples', lambda: self.spin_local_samples.value()),
+            ('dataset_id', lambda: self.edit_dataset_id.text()),
+            ('split', lambda: self.edit_split.text()),
+            ('hf_token', lambda: self.edit_hf_token.text()),
+            ('num_samples', lambda: self.spin_num_samples.value()),
+            ('user_prefix', lambda: self.edit_user_prefix.text()),
+            ('skip_count', lambda: self.spin_skip_count.value()),
+            ('enable_multithread', lambda: self.check_multithread.isChecked()),
+            ('thread_count', lambda: self.spin_thread_count.value()),
+            ('streaming_extract_dir', lambda: self.edit_streaming_extract_dir.text()),
+            ('local_extract_dir', lambda: self.edit_extract_dir.text()),
+            ('use_custom_dir', lambda: self.radio_use_custom_dir.isChecked()),
+            ('custom_input_dir', lambda: self.edit_custom_input_dir.text()),
+            ('processing_threads', lambda: self.spin_processing_threads.value()),
+            ('preload_count', lambda: self.spin_preload_count.value()),
+            ('processing_mode', self._current_processing_mode),
+            ('canny_enabled', lambda: self.check_canny.isChecked()),
+            ('openpose_enabled', lambda: self.check_openpose.isChecked()),
+            ('depth_enabled', lambda: self.check_depth.isChecked()),
+            ('bbox_enabled', lambda: self.check_bbox.isChecked()),
+            ('quality_profile', self._current_profile_key),
+            ('canny_accept', lambda: self.spin_canny_accept.value()),
+            ('canny_reject', lambda: self.spin_canny_reject.value()),
+            ('pose_accept', lambda: self.spin_pose_accept.value()),
+            ('pose_reject', lambda: self.spin_pose_reject.value()),
+            ('depth_accept', lambda: self.spin_depth_accept.value()),
+            ('depth_reject', lambda: self.spin_depth_reject.value()),
+            ('bbox_accept', lambda: self.spin_bbox_accept.value()),
+            ('bbox_reject', lambda: self.spin_bbox_reject.value()),
+            ('score_filter_enabled', lambda: self.check_score_filter_enabled.isChecked()),
+            ('score_filter_checkpoint_path', lambda: self.edit_score_checkpoint_path.text()),
+            ('score_filter_cache_root', lambda: self.edit_score_cache_root.text()),
+            ('score_filter_device', lambda: self.combo_score_device.currentText()),
+            ('score_filter_min_aesthetic', lambda: self.spin_score_min_aesthetic.value()),
+            ('score_filter_require_in_domain', lambda: self.check_score_require_in_domain.isChecked()),
+            ('score_filter_min_in_domain_prob', lambda: self.spin_score_min_in_domain_prob.value()),
+            ('score_mode_auto_accept', lambda: self.spin_score_mode_auto_accept.value()),
+            ('openpose_model', lambda: self.combo_openpose_model.currentText()),
+            ('openpose_yolo_version', lambda: self.combo_yolo_version.currentText()),
+            ('openpose_yolo_model_type', lambda: self.combo_yolo_model_type.currentText()),
+            ('openpose_custom_path', lambda: self.edit_openpose_path.text()),
+        ) + self._flat_settings_collect_steps_suffix()
+
+    def _flat_settings_collect_steps_suffix(self):
+        return (
+            ('depth_model', lambda: self.combo_depth_model.currentText()),
+            ('depth_custom_path', lambda: self.edit_depth_path.text()),
+            ('bbox_model', lambda: self.combo_bbox_model.currentText()),
+            ('bbox_custom_path', lambda: self.edit_bbox_path.text()),
+            ('bbox_conf_threshold', lambda: self.spin_bbox_conf.value()),
+            ('bbox_iou_threshold', lambda: self.spin_bbox_iou.value()),
+            ('bbox_person_only', lambda: self.check_bbox_person_only.isChecked()),
+            ('bbox_target_part', self._collect_bbox_target_part_key),
+            ('bbox_use_specialized_channels', lambda: self.check_bbox_specialized_channels.isChecked()),
+            ('bbox_specialized_head_model', lambda: self._collect_bbox_specialized_model_path('head')),
+            ('bbox_specialized_upper_body_model', lambda: self._collect_bbox_specialized_model_path('upper_body')),
+            ('bbox_specialized_lower_body_model', lambda: self._collect_bbox_specialized_model_path('lower_body')),
+            ('bbox_review_enabled', lambda: self.check_bbox_review_enabled.isChecked()),
+            ('bbox_review_override_score', lambda: self.check_bbox_review_override_score.isChecked()),
+            ('bbox_review_pass_threshold', lambda: self.spin_bbox_review_pass.value()),
+            ('bbox_review_fail_threshold', lambda: self.spin_bbox_review_fail.value()),
+            ('bbox_review_pose_enabled', lambda: self.check_bbox_review_pose_enabled.isChecked()),
+            ('bbox_review_pose_path', lambda: self.edit_bbox_review_pose_path.text().strip()),
+            ('bbox_review_sam_enabled', lambda: self.check_bbox_review_sam_enabled.isChecked()),
+            ('bbox_review_sam_path', lambda: self.edit_bbox_review_sam_path.text().strip()),
+            ('parallel_threads', lambda: self.spin_parallel_threads.value()),
+            ('auto_pass_no_review', lambda: self.check_auto_pass_no_review.isChecked()),
+            ('single_jsona', lambda: self.check_single_jsona.isChecked()),
+            ('jsona_backup_every_entries', lambda: self.spin_jsona_backup_every_entries.value()),
+            ('jsona_backup_every_seconds', lambda: self.spin_jsona_backup_every_seconds.value()),
+            ('jsona_backup_keep', lambda: self.spin_jsona_backup_keep.value()),
+            ('unattended_mode', lambda: self.check_unattended_mode.isChecked()),
+            ('unattended_inbox_max_mb', lambda: self.spin_unattended_inbox_max_mb.value()),
+            ('unattended_inbox_full_action', self._collect_unattended_inbox_full_action),
+            ('vlm_backend', lambda: self.combo_vlm_backend.currentText()),
+            ('vlm_base_url', lambda: self.edit_vlm_base_url.text()),
+            ('vlm_model', lambda: self.edit_vlm_model.text()),
+            ('vlm_api_key', lambda: self.edit_vlm_api_key.text()),
+            ('vlm_timeout_seconds', lambda: self.spin_vlm_timeout.value()),
+            ('xml_template_path', lambda: self.edit_xml_template_path.text()),
+            ('xml_artist_field_path', lambda: self.combo_xml_artist_field.currentText().strip()),
+            ('xml_artist_tag_index', lambda: self.spin_xml_artist_tag_index.value()),
+            ('xml_character1_field_path', lambda: self.combo_xml_character1_field.currentText().strip()),
+            ('xml_character1_tag_index', lambda: self.spin_xml_character1_tag_index.value()),
+            ('xml_character2_field_path', lambda: self.combo_xml_character2_field.currentText().strip()),
+            ('xml_character2_tag_index', lambda: self.spin_xml_character2_tag_index.value()),
+            ('xml_custom_mappings', self._serialize_xml_custom_mappings),
+            ('enable_retry', lambda: self.check_enable_retry.isChecked()),
+            ('max_retries', lambda: self.spin_max_retries.value()),
+            ('append_tags', lambda: self.check_append_tags.isChecked()),
+            ('custom_tags', lambda: self.edit_custom_tags.toPlainText()),
+            ('output_dir', lambda: self.edit_output_dir.text()),
+            ('discard_action', lambda: self.combo_discard_action.currentText()),
+        )
+
+    def _collect_flat_settings(self) -> dict:
+        settings = {}
+        for key, getter in self._flat_settings_collect_steps():
+            settings[key] = getter()
+        return settings
 
     def _get_settings_field_labels(self) -> dict:
         return {
@@ -1152,6 +1268,11 @@ class SettingsPanel(QWidget):
             'openpose_yolo_version': 'YOLO 版本',
             'openpose_yolo_model_type': 'Pose 检测器',
             'openpose_custom_path': 'Pose 自定义路径',
+        } | self._get_settings_field_labels_suffix()
+
+    @staticmethod
+    def _get_settings_field_labels_suffix() -> dict:
+        return {
             'depth_model': 'Depth 模型',
             'depth_custom_path': 'Depth 自定义路径',
             'bbox_model': 'BBox 模型',
@@ -1159,6 +1280,19 @@ class SettingsPanel(QWidget):
             'bbox_conf_threshold': 'BBox 置信度阈值',
             'bbox_iou_threshold': 'BBox IoU 阈值',
             'bbox_person_only': 'BBox 仅检测人物',
+            'bbox_target_part': 'BBox 检测部位',
+            'bbox_use_specialized_channels': 'BBox 启用专用通道',
+            'bbox_specialized_head_model': 'BBox 头部专用模型',
+            'bbox_specialized_upper_body_model': 'BBox 上半身专用模型',
+            'bbox_specialized_lower_body_model': 'BBox 下半身专用模型',
+            'bbox_review_enabled': 'BBox 启用复核',
+            'bbox_review_override_score': 'BBox 复核参与总分',
+            'bbox_review_pass_threshold': 'BBox 复核通过阈值',
+            'bbox_review_fail_threshold': 'BBox 复核失败阈值',
+            'bbox_review_pose_enabled': 'BBox Pose 复核',
+            'bbox_review_pose_path': 'BBox Pose 模型路径',
+            'bbox_review_sam_enabled': 'BBox SAM 复核',
+            'bbox_review_sam_path': 'BBox SAM 模型路径',
             'parallel_threads': '并行处理线程',
             'auto_pass_no_review': '自动通过无需审核',
             'single_jsona': '单个 JSONA',
@@ -1458,6 +1592,144 @@ class SettingsPanel(QWidget):
         self._apply_flat_settings(config)
         return
 
+    def _apply_flat_local_parquet_files(self, files):
+        self.list_parquet_files.clear()
+        for file_path in files or []:
+            self.list_parquet_files.addItem(str(file_path))
+
+    def _apply_flat_thread_count(self, value, config: dict):
+        saved_threads = int(value)
+        if saved_threads < 2 and bool(config.get('enable_multithread', self.check_multithread.isChecked())):
+            cpu_count = os.cpu_count() or 4
+            saved_threads = max(2, cpu_count - 1)
+        self.spin_thread_count.setValue(saved_threads)
+
+    def _apply_flat_use_custom_dir(self, value):
+        use_custom_dir = bool(value)
+        self.radio_use_custom_dir.setChecked(use_custom_dir)
+        self.radio_use_data_source.setChecked(not use_custom_dir)
+
+    def _apply_flat_quality_profile(self, value):
+        profile_value = str(value or '')
+        if profile_value == 'anime' or profile_value == tr('anime') or '动漫' in profile_value:
+            self.combo_quality_profile.setCurrentText(tr('anime'))
+        else:
+            self.combo_quality_profile.setCurrentText(tr('general'))
+
+    def _apply_flat_unattended_inbox_full_action(self, value):
+        action = str(value).lower()
+        self.combo_unattended_inbox_full_action.setCurrentIndex(0 if action == 'pause' else 1)
+
+    def _apply_flat_xml_template_path(self, value):
+        self.edit_xml_template_path.setText(str(value))
+        if self.edit_xml_template_path.text().strip():
+            try:
+                self._analyze_xml_template()
+            except Exception:
+                pass
+        else:
+            self._refresh_xml_field_options([])
+            self.label_xml_template_status.setText('未加载 XML 结构，当前使用默认字段。')
+
+    def _flat_settings_apply_steps(self, config: dict):
+        return (
+            ('data_source_type', lambda v: self.combo_source_type.setCurrentIndex(int(v))),
+            ('local_parquet_files', self._apply_flat_local_parquet_files),
+            ('local_num_samples', lambda v: self.spin_local_samples.setValue(int(v))),
+            ('dataset_id', lambda v: self.edit_dataset_id.setText(str(v))),
+            ('split', lambda v: self.edit_split.setText(str(v))),
+            ('hf_token', lambda v: self.edit_hf_token.setText(str(v))),
+            ('num_samples', lambda v: self.spin_num_samples.setValue(int(v))),
+            ('user_prefix', lambda v: self.edit_user_prefix.setText(str(v))),
+            ('skip_count', lambda v: self.spin_skip_count.setValue(int(v))),
+            ('enable_multithread', lambda v: self.check_multithread.setChecked(bool(v))),
+            ('thread_count', lambda v, cfg=config: self._apply_flat_thread_count(v, cfg)),
+            ('streaming_extract_dir', lambda v: self.edit_streaming_extract_dir.setText(str(v))),
+            ('local_extract_dir', lambda v: self.edit_extract_dir.setText(str(v))),
+            ('use_custom_dir', self._apply_flat_use_custom_dir),
+            ('custom_input_dir', lambda v: self.edit_custom_input_dir.setText(str(v))),
+            ('processing_threads', lambda v: self.spin_processing_threads.setValue(int(v))),
+            ('preload_count', lambda v: self.spin_preload_count.setValue(int(v))),
+            ('processing_mode', lambda v: self._set_processing_mode(str(v))),
+            ('canny_enabled', lambda v: self.check_canny.setChecked(bool(v))),
+            ('openpose_enabled', lambda v: self.check_openpose.setChecked(bool(v))),
+            ('depth_enabled', lambda v: self.check_depth.setChecked(bool(v))),
+            ('bbox_enabled', lambda v: self.check_bbox.setChecked(bool(v))),
+            ('openpose_model', lambda v: self.combo_openpose_model.setCurrentText(str(v))),
+            ('openpose_yolo_version', lambda v: self.combo_yolo_version.setCurrentText(str(v))),
+            ('openpose_yolo_model_type', lambda v: self.combo_yolo_model_type.setCurrentText(str(v))),
+            ('openpose_custom_path', lambda v: self.edit_openpose_path.setText(str(v))),
+            ('depth_model', lambda v: self.combo_depth_model.setCurrentText(str(v))),
+            ('depth_custom_path', lambda v: self.edit_depth_path.setText(str(v))),
+            ('bbox_model', lambda v: self.combo_bbox_model.setCurrentText(str(v))),
+            ('bbox_custom_path', lambda v: self.edit_bbox_path.setText(str(v))),
+            ('bbox_conf_threshold', lambda v: self.spin_bbox_conf.setValue(float(v))),
+            ('bbox_iou_threshold', lambda v: self.spin_bbox_iou.setValue(float(v))),
+            ('bbox_person_only', lambda v: self.check_bbox_person_only.setChecked(bool(v))),
+            ('bbox_target_part', self._apply_bbox_target_part_key),
+            ('bbox_use_specialized_channels', lambda v: self.check_bbox_specialized_channels.setChecked(bool(v))),
+            ('bbox_specialized_head_model', lambda v: self._apply_bbox_specialized_model_path('head', v)),
+            ('bbox_specialized_upper_body_model', lambda v: self._apply_bbox_specialized_model_path('upper_body', v)),
+            ('bbox_specialized_lower_body_model', lambda v: self._apply_bbox_specialized_model_path('lower_body', v)),
+            ('bbox_review_enabled', lambda v: self.check_bbox_review_enabled.setChecked(bool(v))),
+            ('bbox_review_override_score', lambda v: self.check_bbox_review_override_score.setChecked(bool(v))),
+            ('bbox_review_pass_threshold', lambda v: self.spin_bbox_review_pass.setValue(float(v))),
+            ('bbox_review_fail_threshold', lambda v: self.spin_bbox_review_fail.setValue(float(v))),
+            ('bbox_review_pose_enabled', lambda v: self.check_bbox_review_pose_enabled.setChecked(bool(v))),
+            ('bbox_review_pose_path', lambda v: self.edit_bbox_review_pose_path.setText(str(v))),
+            ('bbox_review_sam_enabled', lambda v: self.check_bbox_review_sam_enabled.setChecked(bool(v))),
+            ('bbox_review_sam_path', lambda v: self.edit_bbox_review_sam_path.setText(str(v))),
+            ('score_filter_enabled', lambda v: self.check_score_filter_enabled.setChecked(bool(v))),
+            ('score_filter_checkpoint_path', lambda v: self.edit_score_checkpoint_path.setText(str(v))),
+            ('score_filter_cache_root', lambda v: self.edit_score_cache_root.setText(str(v))),
+            ('score_filter_device', lambda v: self.combo_score_device.setCurrentText(str(v).lower())),
+            ('score_filter_min_aesthetic', lambda v: self.spin_score_min_aesthetic.setValue(float(v))),
+            ('score_filter_require_in_domain', lambda v: self.check_score_require_in_domain.setChecked(bool(v))),
+            ('score_filter_min_in_domain_prob', lambda v: self.spin_score_min_in_domain_prob.setValue(float(v))),
+            ('score_mode_auto_accept', lambda v: self.spin_score_mode_auto_accept.setValue(float(v))),
+            ('quality_profile', self._apply_flat_quality_profile),
+            ('canny_accept', lambda v: self.spin_canny_accept.setValue(int(v))),
+            ('canny_reject', lambda v: self.spin_canny_reject.setValue(int(v))),
+            ('pose_accept', lambda v: self.spin_pose_accept.setValue(int(v))),
+            ('pose_reject', lambda v: self.spin_pose_reject.setValue(int(v))),
+            ('depth_accept', lambda v: self.spin_depth_accept.setValue(int(v))),
+            ('depth_reject', lambda v: self.spin_depth_reject.setValue(int(v))),
+            ('bbox_accept', lambda v: self.spin_bbox_accept.setValue(int(v))),
+            ('bbox_reject', lambda v: self.spin_bbox_reject.setValue(int(v))),
+            ('parallel_threads', lambda v: self.spin_parallel_threads.setValue(int(v))),
+            ('auto_pass_no_review', lambda v: self.check_auto_pass_no_review.setChecked(bool(v))),
+            ('single_jsona', lambda v: self.check_single_jsona.setChecked(bool(v))),
+            ('jsona_backup_every_entries', lambda v: self.spin_jsona_backup_every_entries.setValue(int(v))),
+            ('jsona_backup_every_seconds', lambda v: self.spin_jsona_backup_every_seconds.setValue(int(v))),
+            ('jsona_backup_keep', lambda v: self.spin_jsona_backup_keep.setValue(int(v))),
+            ('unattended_mode', lambda v: self.check_unattended_mode.setChecked(bool(v))),
+            ('unattended_inbox_max_mb', lambda v: self.spin_unattended_inbox_max_mb.setValue(int(v))),
+            ('unattended_inbox_full_action', self._apply_flat_unattended_inbox_full_action),
+            ('vlm_backend', lambda v: self.combo_vlm_backend.setCurrentText(str(v))),
+            ('vlm_base_url', lambda v: self.edit_vlm_base_url.setText(str(v))),
+            ('vlm_model', lambda v: self.edit_vlm_model.setText(str(v))),
+            ('vlm_api_key', lambda v: self.edit_vlm_api_key.setText(str(v))),
+            ('vlm_timeout_seconds', lambda v: self.spin_vlm_timeout.setValue(int(v))),
+            ('xml_template_path', self._apply_flat_xml_template_path),
+        ) + self._flat_settings_apply_steps_suffix()
+
+    def _flat_settings_apply_steps_suffix(self):
+        return (
+            ('xml_artist_field_path', lambda v: self.combo_xml_artist_field.setCurrentText(str(v))),
+            ('xml_artist_tag_index', lambda v: self.spin_xml_artist_tag_index.setValue(int(v))),
+            ('xml_character1_field_path', lambda v: self.combo_xml_character1_field.setCurrentText(str(v))),
+            ('xml_character1_tag_index', lambda v: self.spin_xml_character1_tag_index.setValue(int(v))),
+            ('xml_character2_field_path', lambda v: self.combo_xml_character2_field.setCurrentText(str(v))),
+            ('xml_character2_tag_index', lambda v: self.spin_xml_character2_tag_index.setValue(int(v))),
+            ('xml_custom_mappings', self._load_xml_custom_mappings),
+            ('enable_retry', lambda v: self.check_enable_retry.setChecked(bool(v))),
+            ('max_retries', lambda v: self.spin_max_retries.setValue(int(v))),
+            ('append_tags', lambda v: self.check_append_tags.setChecked(bool(v))),
+            ('custom_tags', lambda v: self.edit_custom_tags.setPlainText(str(v))),
+            ('output_dir', lambda v: self.edit_output_dir.setText(str(v))),
+            ('discard_action', lambda v: self.combo_discard_action.setCurrentText(str(v))),
+        )
+
     def _apply_flat_settings(self, config: dict):
         if not isinstance(config, dict):
             return
@@ -1465,184 +1737,16 @@ class SettingsPanel(QWidget):
         previous_state = self._settings_tracking_suspended
         self._settings_tracking_suspended = True
         try:
-            if 'data_source_type' in config:
-                self.combo_source_type.setCurrentIndex(int(config['data_source_type']))
-            if 'local_parquet_files' in config:
-                self.list_parquet_files.clear()
-                for file_path in config.get('local_parquet_files') or []:
-                    self.list_parquet_files.addItem(str(file_path))
-            if 'local_num_samples' in config:
-                self.spin_local_samples.setValue(int(config['local_num_samples']))
-            if 'dataset_id' in config:
-                self.edit_dataset_id.setText(str(config['dataset_id']))
-            if 'split' in config:
-                self.edit_split.setText(str(config['split']))
-            if 'hf_token' in config:
-                self.edit_hf_token.setText(str(config['hf_token']))
-            if 'num_samples' in config:
-                self.spin_num_samples.setValue(int(config['num_samples']))
-            if 'user_prefix' in config:
-                self.edit_user_prefix.setText(str(config['user_prefix']))
-            if 'skip_count' in config:
-                self.spin_skip_count.setValue(int(config['skip_count']))
-            if 'enable_multithread' in config:
-                self.check_multithread.setChecked(bool(config['enable_multithread']))
-            if 'thread_count' in config:
-                saved_threads = int(config['thread_count'])
-                if saved_threads < 2 and bool(config.get('enable_multithread', self.check_multithread.isChecked())):
-                    cpu_count = os.cpu_count() or 4
-                    saved_threads = max(2, cpu_count - 1)
-                self.spin_thread_count.setValue(saved_threads)
-            if 'streaming_extract_dir' in config:
-                self.edit_streaming_extract_dir.setText(str(config['streaming_extract_dir']))
-            if 'local_extract_dir' in config:
-                self.edit_extract_dir.setText(str(config['local_extract_dir']))
-            if 'use_custom_dir' in config:
-                use_custom_dir = bool(config['use_custom_dir'])
-                self.radio_use_custom_dir.setChecked(use_custom_dir)
-                self.radio_use_data_source.setChecked(not use_custom_dir)
-            if 'custom_input_dir' in config:
-                self.edit_custom_input_dir.setText(str(config['custom_input_dir']))
-            if 'processing_threads' in config:
-                self.spin_processing_threads.setValue(int(config['processing_threads']))
-            if 'preload_count' in config:
-                self.spin_preload_count.setValue(int(config['preload_count']))
-            if 'processing_mode' in config:
-                self._set_processing_mode(str(config['processing_mode']))
-            if 'canny_enabled' in config:
-                self.check_canny.setChecked(bool(config['canny_enabled']))
-            if 'openpose_enabled' in config:
-                self.check_openpose.setChecked(bool(config['openpose_enabled']))
-            if 'depth_enabled' in config:
-                self.check_depth.setChecked(bool(config['depth_enabled']))
-            if 'bbox_enabled' in config:
-                self.check_bbox.setChecked(bool(config['bbox_enabled']))
-            if 'openpose_model' in config:
-                self.combo_openpose_model.setCurrentText(str(config['openpose_model']))
-            if 'openpose_yolo_version' in config:
-                self.combo_yolo_version.setCurrentText(str(config['openpose_yolo_version']))
-            if 'openpose_yolo_model_type' in config:
-                self.combo_yolo_model_type.setCurrentText(str(config['openpose_yolo_model_type']))
-            if 'openpose_custom_path' in config:
-                self.edit_openpose_path.setText(str(config['openpose_custom_path']))
-            if 'depth_model' in config:
-                self.combo_depth_model.setCurrentText(str(config['depth_model']))
-            if 'depth_custom_path' in config:
-                self.edit_depth_path.setText(str(config['depth_custom_path']))
-            if 'bbox_model' in config:
-                self.combo_bbox_model.setCurrentText(str(config['bbox_model']))
-            if 'bbox_custom_path' in config:
-                self.edit_bbox_path.setText(str(config['bbox_custom_path']))
-            if 'bbox_conf_threshold' in config:
-                self.spin_bbox_conf.setValue(float(config['bbox_conf_threshold']))
-            if 'bbox_iou_threshold' in config:
-                self.spin_bbox_iou.setValue(float(config['bbox_iou_threshold']))
-            if 'bbox_person_only' in config:
-                self.check_bbox_person_only.setChecked(bool(config['bbox_person_only']))
-            if 'score_filter_enabled' in config:
-                self.check_score_filter_enabled.setChecked(bool(config['score_filter_enabled']))
-            if 'score_filter_checkpoint_path' in config:
-                self.edit_score_checkpoint_path.setText(str(config['score_filter_checkpoint_path']))
-            if 'score_filter_cache_root' in config:
-                self.edit_score_cache_root.setText(str(config['score_filter_cache_root']))
-            if 'score_filter_device' in config:
-                self.combo_score_device.setCurrentText(str(config['score_filter_device']).lower())
-            if 'score_filter_min_aesthetic' in config:
-                self.spin_score_min_aesthetic.setValue(float(config['score_filter_min_aesthetic']))
-            if 'score_filter_require_in_domain' in config:
-                self.check_score_require_in_domain.setChecked(bool(config['score_filter_require_in_domain']))
-            if 'score_filter_min_in_domain_prob' in config:
-                self.spin_score_min_in_domain_prob.setValue(float(config['score_filter_min_in_domain_prob']))
-            if 'score_mode_auto_accept' in config:
-                self.spin_score_mode_auto_accept.setValue(float(config['score_mode_auto_accept']))
-            if 'quality_profile' in config:
-                self.combo_quality_profile.setCurrentText(str(config['quality_profile']))
-            if 'canny_accept' in config:
-                self.spin_canny_accept.setValue(int(config['canny_accept']))
-            if 'canny_reject' in config:
-                self.spin_canny_reject.setValue(int(config['canny_reject']))
-            if 'pose_accept' in config:
-                self.spin_pose_accept.setValue(int(config['pose_accept']))
-            if 'pose_reject' in config:
-                self.spin_pose_reject.setValue(int(config['pose_reject']))
-            if 'depth_accept' in config:
-                self.spin_depth_accept.setValue(int(config['depth_accept']))
-            if 'depth_reject' in config:
-                self.spin_depth_reject.setValue(int(config['depth_reject']))
-            if 'bbox_accept' in config:
-                self.spin_bbox_accept.setValue(int(config['bbox_accept']))
-            if 'bbox_reject' in config:
-                self.spin_bbox_reject.setValue(int(config['bbox_reject']))
-            if 'parallel_threads' in config:
-                self.spin_parallel_threads.setValue(int(config['parallel_threads']))
-            if 'auto_pass_no_review' in config:
-                self.check_auto_pass_no_review.setChecked(bool(config['auto_pass_no_review']))
-            if 'single_jsona' in config:
-                self.check_single_jsona.setChecked(bool(config['single_jsona']))
-            if 'jsona_backup_every_entries' in config:
-                self.spin_jsona_backup_every_entries.setValue(int(config['jsona_backup_every_entries']))
-            if 'jsona_backup_every_seconds' in config:
-                self.spin_jsona_backup_every_seconds.setValue(int(config['jsona_backup_every_seconds']))
-            if 'jsona_backup_keep' in config:
-                self.spin_jsona_backup_keep.setValue(int(config['jsona_backup_keep']))
-            if 'unattended_mode' in config:
-                self.check_unattended_mode.setChecked(bool(config['unattended_mode']))
-            if 'unattended_inbox_max_mb' in config:
-                self.spin_unattended_inbox_max_mb.setValue(int(config['unattended_inbox_max_mb']))
-            if 'unattended_inbox_full_action' in config:
-                action = str(config['unattended_inbox_full_action']).lower()
-                self.combo_unattended_inbox_full_action.setCurrentIndex(0 if action == 'pause' else 1)
-            if 'vlm_backend' in config:
-                self.combo_vlm_backend.setCurrentText(str(config['vlm_backend']))
-            if 'vlm_base_url' in config:
-                self.edit_vlm_base_url.setText(str(config['vlm_base_url']))
-            if 'vlm_model' in config:
-                self.edit_vlm_model.setText(str(config['vlm_model']))
-            if 'vlm_api_key' in config:
-                self.edit_vlm_api_key.setText(str(config['vlm_api_key']))
-            if 'vlm_timeout_seconds' in config:
-                self.spin_vlm_timeout.setValue(int(config['vlm_timeout_seconds']))
-            if 'xml_template_path' in config:
-                self.edit_xml_template_path.setText(str(config['xml_template_path']))
-                if self.edit_xml_template_path.text().strip():
-                    try:
-                        self._analyze_xml_template()
-                    except Exception:
-                        pass
-                else:
-                    self._refresh_xml_field_options([])
-                    self.label_xml_template_status.setText('未加载 XML 结构，当前使用默认字段。')
-            if 'xml_artist_field_path' in config:
-                self.combo_xml_artist_field.setCurrentText(str(config['xml_artist_field_path']))
-            if 'xml_artist_tag_index' in config:
-                self.spin_xml_artist_tag_index.setValue(int(config['xml_artist_tag_index']))
-            if 'xml_character1_field_path' in config:
-                self.combo_xml_character1_field.setCurrentText(str(config['xml_character1_field_path']))
-            if 'xml_character1_tag_index' in config:
-                self.spin_xml_character1_tag_index.setValue(int(config['xml_character1_tag_index']))
-            if 'xml_character2_field_path' in config:
-                self.combo_xml_character2_field.setCurrentText(str(config['xml_character2_field_path']))
-            if 'xml_character2_tag_index' in config:
-                self.spin_xml_character2_tag_index.setValue(int(config['xml_character2_tag_index']))
-            if 'xml_custom_mappings' in config:
-                self._load_xml_custom_mappings(config['xml_custom_mappings'])
-            if 'enable_retry' in config:
-                self.check_enable_retry.setChecked(bool(config['enable_retry']))
-            if 'max_retries' in config:
-                self.spin_max_retries.setValue(int(config['max_retries']))
-            if 'append_tags' in config:
-                self.check_append_tags.setChecked(bool(config['append_tags']))
-            if 'custom_tags' in config:
-                self.edit_custom_tags.setPlainText(str(config['custom_tags']))
-            if 'output_dir' in config:
-                self.edit_output_dir.setText(str(config['output_dir']))
-            if 'discard_action' in config:
-                self.combo_discard_action.setCurrentText(str(config['discard_action']))
+            for key, applier in self._flat_settings_apply_steps(config):
+                if key in config:
+                    applier(config[key])
         finally:
             self._settings_tracking_suspended = previous_state
 
         self._update_score_filter_controls()
         self._update_processing_mode_controls()
+        self._update_bbox_specialized_controls()
+        self._update_bbox_review_controls()
         self._refresh_score_filter_status()
         self._schedule_score_filter_progress_count_refresh()
         self._refresh_xml_preview()
@@ -1650,7 +1754,12 @@ class SettingsPanel(QWidget):
 
     def _connect_autosave_signals(self):
         """Connect signals to auto-save settings when changed"""
-        # Data source
+        self._connect_data_source_autosave_signals()
+        self._connect_processing_output_autosave_signals()
+        self._connect_advanced_autosave_signals()
+        self._connect_threshold_and_score_autosave_signals()
+
+    def _connect_data_source_autosave_signals(self):
         self.combo_source_type.currentIndexChanged.connect(lambda: self.save_settings())
         self.edit_dataset_id.textChanged.connect(lambda: self.save_settings())
         self.edit_split.textChanged.connect(lambda: self.save_settings())
@@ -1665,7 +1774,7 @@ class SettingsPanel(QWidget):
         self.edit_extract_dir.textChanged.connect(lambda: self.save_settings())
         self.edit_output_dir.textChanged.connect(lambda: self._update_jsona_statistics())
 
-        # Processing and output settings
+    def _connect_processing_output_autosave_signals(self):
         self.radio_use_custom_dir.toggled.connect(lambda: self.save_settings())
         self.edit_custom_input_dir.textChanged.connect(lambda: self.save_settings())
         self.radio_use_custom_dir.toggled.connect(lambda _checked: self._schedule_score_filter_progress_count_refresh())
@@ -1689,12 +1798,25 @@ class SettingsPanel(QWidget):
         self.spin_bbox_conf.valueChanged.connect(lambda: self.save_settings())
         self.spin_bbox_iou.valueChanged.connect(lambda: self.save_settings())
         self.check_bbox_person_only.stateChanged.connect(lambda: self.save_settings())
+        self.combo_bbox_target_part.currentTextChanged.connect(lambda: self.save_settings())
+        self.check_bbox_specialized_channels.stateChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_specialized_head_path.textChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_specialized_upper_path.textChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_specialized_lower_path.textChanged.connect(lambda: self.save_settings())
+        self.check_bbox_review_enabled.stateChanged.connect(lambda: self.save_settings())
+        self.check_bbox_review_override_score.stateChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_review_pass.valueChanged.connect(lambda: self.save_settings())
+        self.spin_bbox_review_fail.valueChanged.connect(lambda: self.save_settings())
+        self.check_bbox_review_pose_enabled.stateChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_review_pose_path.textChanged.connect(lambda: self.save_settings())
+        self.check_bbox_review_sam_enabled.stateChanged.connect(lambda: self.save_settings())
+        self.edit_bbox_review_sam_path.textChanged.connect(lambda: self.save_settings())
         self.check_append_tags.stateChanged.connect(lambda: self.save_settings())
         self.edit_custom_tags.textChanged.connect(lambda: self.save_settings())
         self.edit_output_dir.textChanged.connect(lambda: self.save_settings())
         self.combo_discard_action.currentIndexChanged.connect(lambda: self.save_settings())
 
-        # Advanced settings
+    def _connect_advanced_autosave_signals(self):
         self.spin_parallel_threads.valueChanged.connect(lambda: self.save_settings())
         self.check_auto_pass_no_review.stateChanged.connect(lambda: self.save_settings())
         self.check_single_jsona.stateChanged.connect(lambda: self.save_settings())
@@ -1726,7 +1848,7 @@ class SettingsPanel(QWidget):
         self.spin_xml_character2_tag_index.valueChanged.connect(lambda: self._refresh_xml_preview())
         self.edit_xml_preview_tags.textChanged.connect(self._refresh_xml_preview)
 
-        # Threshold spinboxes
+    def _connect_threshold_and_score_autosave_signals(self):
         self.spin_canny_accept.valueChanged.connect(lambda: self.save_settings())
         self.spin_canny_reject.valueChanged.connect(lambda: self.save_settings())
         self.spin_pose_accept.valueChanged.connect(lambda: self.save_settings())
@@ -1754,28 +1876,60 @@ class SettingsPanel(QWidget):
         scoring = self.config.get('scoring', {})
         profiles = scoring.get('profiles', {})
 
-        # Map translated text back to English key
-        profile_text = self.combo_quality_profile.currentText()
-        if profile_text == tr('general') or '通用' in profile_text:
-            profile_key = 'general'
-        elif profile_text == tr('anime') or '动漫' in profile_text:
-            profile_key = 'anime'
-        else:
-            profile_key = 'general'
+        profile_key = self._current_profile_key()
 
         profile = profiles.get(profile_key, {})
         default_accept = int(profile.get('auto_accept', 55))
         default_reject = int(profile.get('auto_reject', 40))
-
-        self.spin_canny_accept.setValue(int(profile.get('canny_auto_accept', default_accept)))
-        self.spin_canny_reject.setValue(int(profile.get('canny_auto_reject', default_reject)))
-        self.spin_pose_accept.setValue(int(profile.get('pose_auto_accept', default_accept)))
-        self.spin_pose_reject.setValue(int(profile.get('pose_auto_reject', default_reject)))
-        self.spin_depth_accept.setValue(int(profile.get('depth_auto_accept', default_accept)))
-        self.spin_depth_reject.setValue(int(profile.get('depth_auto_reject', default_reject)))
-        self.spin_bbox_accept.setValue(int(profile.get('bbox_auto_accept', default_accept)))
-        self.spin_bbox_reject.setValue(int(profile.get('bbox_auto_reject', default_reject)))
+        self._apply_profile_thresholds(profile, default_accept, default_reject)
         self.save_settings()
+
+    def _current_profile_key(self) -> str:
+        profile_text = self.combo_quality_profile.currentText()
+        if profile_text == tr('anime') or '动漫' in profile_text:
+            return 'anime'
+        return 'general'
+
+    def _threshold_spin_pairs(self) -> dict:
+        return {
+            'canny': (self.spin_canny_accept, self.spin_canny_reject),
+            'openpose': (self.spin_pose_accept, self.spin_pose_reject),
+            'depth': (self.spin_depth_accept, self.spin_depth_reject),
+            'bbox': (self.spin_bbox_accept, self.spin_bbox_reject),
+        }
+
+    def _apply_profile_thresholds(
+        self,
+        profile: dict,
+        default_accept: int = 55,
+        default_reject: int = 40,
+    ):
+        profile = profile if isinstance(profile, dict) else {}
+        spin_pairs = self._threshold_spin_pairs()
+        for control_type in CONTROL_TYPES:
+            if control_type not in spin_pairs:
+                continue
+            accept_spin, reject_spin = spin_pairs[control_type]
+            accept_value, reject_value = profile_thresholds_for(
+                profile,
+                control_type,
+                default_accept=default_accept,
+                default_reject=default_reject,
+            )
+            accept_spin.setValue(int(accept_value))
+            reject_spin.setValue(int(reject_value))
+
+    def _persist_profile_thresholds(self, profile_store: dict):
+        if not isinstance(profile_store, dict):
+            return
+        spin_pairs = self._threshold_spin_pairs()
+        for control_type in CONTROL_TYPES:
+            if control_type not in spin_pairs or control_type not in PROFILE_THRESHOLD_KEYS:
+                continue
+            accept_spin, reject_spin = spin_pairs[control_type]
+            accept_key, reject_key = PROFILE_THRESHOLD_KEYS[control_type]
+            profile_store[accept_key] = int(accept_spin.value())
+            profile_store[reject_key] = int(reject_spin.value())
 
     def _create_advanced_group(self) -> QGroupBox:
         """Create advanced settings group."""
@@ -1783,19 +1937,37 @@ class SettingsPanel(QWidget):
         main_layout = QHBoxLayout(group)
 
         left_layout = QVBoxLayout()
-        self.advanced_mode_stack = QStackedWidget()
-        self.advanced_mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.advanced_mode_stack = self._create_advanced_mode_stack()
+        left_layout.addWidget(self.advanced_mode_stack)
+        left_layout.addWidget(self._create_jsona_backup_group())
+        left_layout.addWidget(self._create_unattended_group())
+        left_layout.addWidget(self._create_append_tags_group())
+        left_layout.addStretch()
+        main_layout.addLayout(left_layout, 1)
 
-        controlnet_page = QWidget()
-        controlnet_page_layout = QVBoxLayout(controlnet_page)
-        controlnet_page_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(self._create_share_group())
+        right_layout.addWidget(self._create_jsona_stats_group())
+        right_layout.addStretch()
+        main_layout.addLayout(right_layout)
+        return group
 
-        controlnet_note = QLabel(
-            '当前是 ControlNet 模式扩展设置：这里放生成控制图时才会用到的运行策略。'
-        )
-        controlnet_note.setWordWrap(True)
-        controlnet_note.setStyleSheet('color: #888;')
-        controlnet_page_layout.addWidget(controlnet_note)
+    def _create_advanced_mode_stack(self) -> QStackedWidget:
+        stack = QStackedWidget()
+        stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        stack.addWidget(self._create_controlnet_advanced_page())
+        stack.addWidget(self._create_score_advanced_page())
+        return stack
+
+    def _create_controlnet_advanced_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+
+        note = QLabel('当前是 ControlNet 模式扩展设置：这里放生成控制图时才会用到的运行策略。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888;')
+        page_layout.addWidget(note)
 
         retry_layout = QHBoxLayout()
         self.check_enable_retry = QCheckBox(tr('enable_retry'))
@@ -1807,7 +1979,7 @@ class SettingsPanel(QWidget):
         self.spin_max_retries.setValue(2)
         retry_layout.addWidget(self.spin_max_retries)
         retry_layout.addStretch()
-        controlnet_page_layout.addLayout(retry_layout)
+        page_layout.addLayout(retry_layout)
 
         parallel_layout = QHBoxLayout()
         parallel_layout.addWidget(QLabel('并行处理线程数:'))
@@ -1815,11 +1987,11 @@ class SettingsPanel(QWidget):
         self.spin_parallel_threads.setRange(1, 8)
         self.spin_parallel_threads.setValue(3)
         self.spin_parallel_threads.setToolTip(
-            "同时处理 Canny/OpenPose/Depth 的线程数\n"
-            "• 1 线程: 顺序处理 (最省显存)\n"
-            "• 2-3 线程: 推荐 (平衡速度和显存)\n"
-            "• 4+ 线程: 高速处理 (需要更多显存)\n"
-            "根据显卡显存调整: 8GB → 2-3, 12GB+ → 3-4"
+            '同时处理 Canny/OpenPose/Depth 的线程数\n'
+            '• 1 线程: 顺序处理 (最省显存)\n'
+            '• 2-3 线程: 推荐 (平衡速度和显存)\n'
+            '• 4+ 线程: 高速处理 (需要更多显存)\n'
+            '根据显卡显存调整: 8GB → 2-3, 12GB+ → 3-4'
         )
         parallel_layout.addWidget(self.spin_parallel_threads)
         btn_auto_parallel = QPushButton('自动')
@@ -1827,44 +1999,50 @@ class SettingsPanel(QWidget):
         btn_auto_parallel.clicked.connect(lambda: self.spin_parallel_threads.setValue(3))
         parallel_layout.addWidget(btn_auto_parallel)
         parallel_layout.addStretch()
-        controlnet_page_layout.addLayout(parallel_layout)
+        page_layout.addLayout(parallel_layout)
 
         auto_pass_layout = QHBoxLayout()
         self.check_auto_pass_no_review = QCheckBox('自动通过无需审核')
         self.check_auto_pass_no_review.setChecked(True)
         self.check_auto_pass_no_review.setToolTip(
-            "勾选后，自动通过的图片不会在预览区显示\n"
-            "取消勾选后，所有图片都会显示在预览区供审核"
+            '勾选后，自动通过的图片不会在预览区显示\n'
+            '取消勾选后，所有图片都会显示在预览区供审核'
         )
         auto_pass_layout.addWidget(self.check_auto_pass_no_review)
         auto_pass_layout.addStretch()
-        controlnet_page_layout.addLayout(auto_pass_layout)
+        page_layout.addLayout(auto_pass_layout)
 
         single_jsona_layout = QHBoxLayout()
         self.check_single_jsona = QCheckBox('合并为单个 JSONA 文件')
         self.check_single_jsona.setChecked(False)
         self.check_single_jsona.setToolTip(
-            "勾选后，所有 control type 的 metadata 写入同一个 metadata.jsona 文件\n"
-            "取消勾选后，分别写入 canny.jsona、pose.jsona、depth.jsona、bbox.jsona"
+            '勾选后，所有 control type 的 metadata 写入同一个 metadata.jsona 文件\n'
+            '取消勾选后，分别写入 canny.jsona、pose.jsona、depth.jsona、bbox.jsona'
         )
         single_jsona_layout.addWidget(self.check_single_jsona)
         single_jsona_layout.addStretch()
-        controlnet_page_layout.addLayout(single_jsona_layout)
-        controlnet_page_layout.addStretch()
+        page_layout.addLayout(single_jsona_layout)
+        page_layout.addStretch()
+        return page
 
-        score_page = QWidget()
-        score_page_layout = QVBoxLayout(score_page)
-        score_page_layout.setContentsMargins(0, 0, 0, 0)
+    def _create_score_advanced_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
 
-        score_note = QLabel(
-            '当前是图片评分模式扩展设置：这里放 VLM 辅助核对和 XML / 文本输出映射。'
-        )
-        score_note.setWordWrap(True)
-        score_note.setStyleSheet('color: #888;')
-        score_page_layout.addWidget(score_note)
+        note = QLabel('当前是图片评分模式扩展设置：这里放 VLM 辅助核对和 XML / 文本输出映射。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888;')
+        page_layout.addWidget(note)
 
-        vlm_group = QGroupBox('VLM 推理 (Tag 核对 / NL 重写)')
-        vlm_layout = QFormLayout(vlm_group)
+        page_layout.addWidget(self._create_vlm_group())
+        page_layout.addWidget(self._create_xml_group())
+        page_layout.addStretch()
+        return page
+
+    def _create_vlm_group(self) -> QGroupBox:
+        group = QGroupBox('VLM 推理 (Tag 核对 / NL 重写)')
+        layout = QFormLayout(group)
 
         self.combo_vlm_backend = QComboBox()
         self.combo_vlm_backend.addItems(['openai', 'ollama'])
@@ -1873,302 +2051,266 @@ class SettingsPanel(QWidget):
             'ollama: 使用 Ollama 的本地接口 (/api/chat)\n'
             'CPU/GPU 由你选择的后端决定 (本工具只负责调用)。'
         )
-        vlm_layout.addRow('后端:', self.combo_vlm_backend)
+        layout.addRow('后端:', self.combo_vlm_backend)
 
         self.edit_vlm_base_url = QLineEdit('http://127.0.0.1:1234')
-        self.edit_vlm_base_url.setToolTip('例如: http://127.0.0.1:1234 (LM Studio) 或 http://127.0.0.1:11434 (Ollama)')
-        vlm_layout.addRow('Base URL:', self.edit_vlm_base_url)
+        self.edit_vlm_base_url.setToolTip(
+            '例如: http://127.0.0.1:1234 (LM Studio) 或 http://127.0.0.1:11434 (Ollama)'
+        )
+        layout.addRow('Base URL:', self.edit_vlm_base_url)
 
         self.edit_vlm_model = QLineEdit('')
         self.edit_vlm_model.setToolTip('模型名由后端决定，例如 qwen2.5-vl、llava 等')
-        vlm_layout.addRow('Model:', self.edit_vlm_model)
+        layout.addRow('Model:', self.edit_vlm_model)
 
         self.edit_vlm_api_key = QLineEdit('')
         self.edit_vlm_api_key.setEchoMode(QLineEdit.Password)
         self.edit_vlm_api_key.setToolTip('仅 openai 后端需要 (本地后端通常可留空)')
-        vlm_layout.addRow('API Key:', self.edit_vlm_api_key)
+        layout.addRow('API Key:', self.edit_vlm_api_key)
 
         self.spin_vlm_timeout = QSpinBox()
         self.spin_vlm_timeout.setRange(10, 600)
         self.spin_vlm_timeout.setValue(120)
         self.spin_vlm_timeout.setSuffix(' 秒')
-        vlm_layout.addRow('超时:', self.spin_vlm_timeout)
-        score_page_layout.addWidget(vlm_group)
+        layout.addRow('超时:', self.spin_vlm_timeout)
+        return group
 
-        xml_group = QGroupBox('XML 配置')
-        xml_layout = QVBoxLayout(xml_group)
+    def _create_xml_group(self) -> QGroupBox:
+        group = QGroupBox('XML 配置')
+        layout = QVBoxLayout(group)
 
-        xml_template_row = QHBoxLayout()
-        xml_template_row.addStretch()
+        template_row = QHBoxLayout()
+        template_row.addStretch()
         btn_browse_xml_template = QPushButton('从XML文件加载结构')
         btn_browse_xml_template.clicked.connect(self._browse_xml_template)
-        xml_template_row.addWidget(btn_browse_xml_template)
-        xml_layout.addLayout(xml_template_row)
+        template_row.addWidget(btn_browse_xml_template)
+        layout.addLayout(template_row)
 
         self.edit_xml_template_path = QLineEdit('')
         self.edit_xml_template_path.setVisible(False)
-        xml_layout.addWidget(self.edit_xml_template_path)
+        layout.addWidget(self.edit_xml_template_path)
 
         self.label_xml_template_status = QLabel('未加载 XML 结构，当前使用默认字段。')
         self.label_xml_template_status.setWordWrap(True)
         self.label_xml_template_status.setStyleSheet('color: #999;')
-        xml_layout.addWidget(self.label_xml_template_status)
+        layout.addWidget(self.label_xml_template_status)
 
         self.label_xml_fields_hint = QLabel('可选字段: artist, character_1, character_2')
         self.label_xml_fields_hint.setWordWrap(True)
         self.label_xml_fields_hint.setStyleSheet('color: #999;')
-        xml_layout.addWidget(self.label_xml_fields_hint)
+        layout.addWidget(self.label_xml_fields_hint)
 
-        standard_form = QFormLayout()
+        layout.addLayout(self._create_xml_standard_form())
+        layout.addWidget(self._create_xml_custom_mapping_group())
+        layout.addWidget(self._create_xml_preview_group())
+        return group
+
+    def _create_xml_standard_form(self) -> QFormLayout:
+        form = QFormLayout()
         self.combo_xml_artist_field = self._create_xml_field_combo('artist')
         self.spin_xml_artist_tag_index = self._create_xml_tag_index_spin(1)
-        standard_form.addRow('artist:', self._create_xml_mapping_widget(self.combo_xml_artist_field, self.spin_xml_artist_tag_index))
+        form.addRow(
+            'artist:',
+            self._create_xml_mapping_widget(self.combo_xml_artist_field, self.spin_xml_artist_tag_index),
+        )
 
         self.combo_xml_character1_field = self._create_xml_field_combo('character_1')
         self.spin_xml_character1_tag_index = self._create_xml_tag_index_spin(2)
-        standard_form.addRow('character_1:', self._create_xml_mapping_widget(self.combo_xml_character1_field, self.spin_xml_character1_tag_index))
+        form.addRow(
+            'character_1:',
+            self._create_xml_mapping_widget(self.combo_xml_character1_field, self.spin_xml_character1_tag_index),
+        )
 
         self.combo_xml_character2_field = self._create_xml_field_combo('character_2')
         self.spin_xml_character2_tag_index = self._create_xml_tag_index_spin(3)
-        standard_form.addRow('character_2:', self._create_xml_mapping_widget(self.combo_xml_character2_field, self.spin_xml_character2_tag_index))
-        xml_layout.addLayout(standard_form)
+        form.addRow(
+            'character_2:',
+            self._create_xml_mapping_widget(self.combo_xml_character2_field, self.spin_xml_character2_tag_index),
+        )
+        return form
 
-        xml_custom_group = QGroupBox('自定义 XML 字段映射')
-        xml_custom_layout = QVBoxLayout(xml_custom_group)
-        xml_custom_note = QLabel('从上面的可选字段里选择，或直接手动输入字段路径。索引从 1 开始。')
-        xml_custom_note.setWordWrap(True)
-        xml_custom_note.setStyleSheet('color: #999;')
-        xml_custom_layout.addWidget(xml_custom_note)
+    def _create_xml_custom_mapping_group(self) -> QGroupBox:
+        group = QGroupBox('自定义 XML 字段映射')
+        layout = QVBoxLayout(group)
+
+        note = QLabel('从上面的可选字段里选择，或直接手动输入字段路径。索引从 1 开始。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #999;')
+        layout.addWidget(note)
 
         self.xml_custom_map_layout = QVBoxLayout()
-        xml_custom_layout.addLayout(self.xml_custom_map_layout)
+        layout.addLayout(self.xml_custom_map_layout)
 
-        xml_custom_btn_row = QHBoxLayout()
+        button_row = QHBoxLayout()
         btn_add_xml_mapping = QPushButton('新增映射')
         btn_add_xml_mapping.clicked.connect(lambda: self._add_xml_custom_mapping_row())
-        xml_custom_btn_row.addWidget(btn_add_xml_mapping)
-        xml_custom_btn_row.addStretch()
-        xml_custom_layout.addLayout(xml_custom_btn_row)
-        xml_layout.addWidget(xml_custom_group)
+        button_row.addWidget(btn_add_xml_mapping)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+        return group
 
-        xml_preview_group = QGroupBox('XML 预览')
-        xml_preview_layout = QVBoxLayout(xml_preview_group)
-        xml_preview_note = QLabel('在这里输入一串 tag，下面会按当前 XML 映射配置实时生成预览。')
-        xml_preview_note.setWordWrap(True)
-        xml_preview_note.setStyleSheet('color: #999;')
-        xml_preview_layout.addWidget(xml_preview_note)
+    def _create_xml_preview_group(self) -> QGroupBox:
+        group = QGroupBox('XML 预览')
+        layout = QVBoxLayout(group)
+
+        note = QLabel('在这里输入一串 tag，下面会按当前 XML 映射配置实时生成预览。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #999;')
+        layout.addWidget(note)
 
         self.edit_xml_preview_tags = QTextEdit()
         self.edit_xml_preview_tags.setMaximumHeight(72)
         self.edit_xml_preview_tags.setPlaceholderText('例如: artist_name, character_a, character_b, copyright_name')
-        xml_preview_layout.addWidget(self.edit_xml_preview_tags)
+        layout.addWidget(self.edit_xml_preview_tags)
 
         self.edit_xml_preview_output = QTextEdit()
         self.edit_xml_preview_output.setReadOnly(True)
         self.edit_xml_preview_output.setMinimumHeight(96)
         self.edit_xml_preview_output.setPlaceholderText('这里会显示 XML 片段预览')
-        xml_preview_layout.addWidget(self.edit_xml_preview_output)
+        layout.addWidget(self.edit_xml_preview_output)
 
-        xml_preview_btn_row = QHBoxLayout()
-        xml_preview_btn_row.addStretch()
+        button_row = QHBoxLayout()
+        button_row.addStretch()
         btn_copy_xml_preview = QPushButton('复制结果')
         btn_copy_xml_preview.clicked.connect(self._copy_xml_preview_output)
-        xml_preview_btn_row.addWidget(btn_copy_xml_preview)
-        xml_preview_layout.addLayout(xml_preview_btn_row)
-        xml_layout.addWidget(xml_preview_group)
-        score_page_layout.addWidget(xml_group)
-        score_page_layout.addStretch()
+        button_row.addWidget(btn_copy_xml_preview)
+        layout.addLayout(button_row)
+        return group
 
-        self.advanced_mode_stack.addWidget(controlnet_page)
-        self.advanced_mode_stack.addWidget(score_page)
-        left_layout.addWidget(self.advanced_mode_stack)
-
-        jsona_backup_group = QGroupBox('JSONA 备份策略')
-        jsona_backup_layout = QFormLayout(jsona_backup_group)
+    def _create_jsona_backup_group(self) -> QGroupBox:
+        group = QGroupBox('JSONA 备份策略')
+        layout = QFormLayout(group)
 
         self.spin_jsona_backup_every_entries = QSpinBox()
         self.spin_jsona_backup_every_entries.setRange(10, 5000)
         self.spin_jsona_backup_every_entries.setValue(200)
         self.spin_jsona_backup_every_entries.setSingleStep(10)
-        self.spin_jsona_backup_every_entries.setToolTip('每追加多少条 JSONA 记录后创建一次滚动备份。')
-        jsona_backup_layout.addRow('按条数备份:', self.spin_jsona_backup_every_entries)
+        self.spin_jsona_backup_every_entries.setToolTip('每追加多少条 JSONA 记录后创建一次过程备份。')
+        layout.addRow('按条数备份:', self.spin_jsona_backup_every_entries)
 
         self.spin_jsona_backup_every_seconds = QSpinBox()
         self.spin_jsona_backup_every_seconds.setRange(30, 86400)
         self.spin_jsona_backup_every_seconds.setValue(600)
         self.spin_jsona_backup_every_seconds.setSingleStep(30)
         self.spin_jsona_backup_every_seconds.setSuffix(' 秒')
-        self.spin_jsona_backup_every_seconds.setToolTip('即使新增条数未达到阈值，也会按这个时间间隔补一次备份。')
-        jsona_backup_layout.addRow('按时间备份:', self.spin_jsona_backup_every_seconds)
+        self.spin_jsona_backup_every_seconds.setToolTip('即使新增条数未达到阈值，也会按这个时间间隔做一次备份。')
+        layout.addRow('按时间备份:', self.spin_jsona_backup_every_seconds)
 
         self.spin_jsona_backup_keep = QSpinBox()
         self.spin_jsona_backup_keep.setRange(1, 100)
         self.spin_jsona_backup_keep.setValue(10)
-        self.spin_jsona_backup_keep.setToolTip('每个 JSONA 文件保留的最新滚动备份数量。')
-        jsona_backup_layout.addRow('保留份数:', self.spin_jsona_backup_keep)
-        left_layout.addWidget(jsona_backup_group)
+        self.spin_jsona_backup_keep.setToolTip('每个 JSONA 文件保留的最新过程备份份数。')
+        layout.addRow('保留份数:', self.spin_jsona_backup_keep)
+        return group
 
-        unattended_group = QGroupBox('无人值守 (审核箱)')
-        unattended_layout = QFormLayout(unattended_group)
+    def _create_unattended_group(self) -> QGroupBox:
+        group = QGroupBox('无人值守 (实验性)')
+        layout = QFormLayout(group)
 
         self.check_unattended_mode = QCheckBox('无人值守模式 (不显示中间审核图片)')
         self.check_unattended_mode.setToolTip(
-            '开启后：需要人工审核的条目会保存到 output/review_inbox，界面不再堆积图片，适合挂机跑一整晚。'
+            '开启后，所有需要人工决策的条目会保存到 output/review_inbox，界面不再堆积图片，适合挂机跑一整晚。'
         )
-        unattended_layout.addRow(self.check_unattended_mode)
+        layout.addRow(self.check_unattended_mode)
 
         self.spin_unattended_inbox_max_mb = QSpinBox()
         self.spin_unattended_inbox_max_mb.setRange(100, 102400)
         self.spin_unattended_inbox_max_mb.setValue(2048)
         self.spin_unattended_inbox_max_mb.setSingleStep(100)
         self.spin_unattended_inbox_max_mb.setSuffix(' MB')
-        self.spin_unattended_inbox_max_mb.setToolTip('审核箱临时文件夹最大大小，超过后会按“满额动作”处理。')
-        unattended_layout.addRow('最大大小:', self.spin_unattended_inbox_max_mb)
+        self.spin_unattended_inbox_max_mb.setToolTip('临时审核文件夹最大大小。超过后会按配置的动作暂停或停止处理。')
+        layout.addRow('最大大小:', self.spin_unattended_inbox_max_mb)
 
         self.combo_unattended_inbox_full_action = QComboBox()
         self.combo_unattended_inbox_full_action.addItems(['自动暂停', '自动停止'])
-        self.combo_unattended_inbox_full_action.setToolTip('审核箱达到最大大小后的处理方式。')
-        unattended_layout.addRow('满额动作:', self.combo_unattended_inbox_full_action)
-        left_layout.addWidget(unattended_group)
+        self.combo_unattended_inbox_full_action.setToolTip('超过最大大小时的处理方式。')
+        layout.addRow('超限动作:', self.combo_unattended_inbox_full_action)
+        return group
 
-        tags_group = QGroupBox('追加标签')
-        tags_layout = QVBoxLayout(tags_group)
+    def _create_append_tags_group(self) -> QGroupBox:
+        group = QGroupBox('追加标签')
+        layout = QVBoxLayout(group)
         self.check_append_tags = QCheckBox(tr('append_tags'))
-        tags_layout.addWidget(self.check_append_tags)
+        layout.addWidget(self.check_append_tags)
 
         self.edit_custom_tags = QTextEdit()
         self.edit_custom_tags.setMaximumHeight(60)
         self.edit_custom_tags.setPlaceholderText(tr('tag_placeholder'))
         self.edit_custom_tags.setEnabled(False)
         self.check_append_tags.toggled.connect(self.edit_custom_tags.setEnabled)
-        tags_layout.addWidget(self.edit_custom_tags)
-        left_layout.addWidget(tags_group)
-        left_layout.addStretch()
+        layout.addWidget(self.edit_custom_tags)
+        return group
 
-        main_layout.addLayout(left_layout, 1)
+    def _create_jsona_stats_row(self, prefix: str, file_type: str):
+        row_layout = QHBoxLayout()
+        label = QLabel(f'{prefix}: 0 张图' if file_type in {'canny', 'pose', 'depth', 'bbox'} else f'{prefix}: 0 条')
+        row_layout.addWidget(label)
+        button = QPushButton('重置')
+        button.setMaximumWidth(60)
+        button.clicked.connect(lambda: self._reset_jsona_file(file_type))
+        row_layout.addWidget(button)
+        return row_layout, label, button
 
-        # Right side: JSONA statistics
-        right_layout = QVBoxLayout()
-        stats_group = QGroupBox('JSONA 文件统计')
-        stats_layout = QVBoxLayout(stats_group)
+    def _create_jsona_stats_group(self) -> QGroupBox:
+        group = QGroupBox('JSONA 文件统计')
+        layout = QVBoxLayout(group)
 
-        # Canny statistics
-        canny_stat_layout = QHBoxLayout()
-        self.label_canny_count = QLabel('Canny: 0 张图')
-        canny_stat_layout.addWidget(self.label_canny_count)
-        self.btn_reset_canny_jsona = QPushButton('重置')
-        self.btn_reset_canny_jsona.setMaximumWidth(60)
-        self.btn_reset_canny_jsona.clicked.connect(lambda: self._reset_jsona_file('canny'))
-        canny_stat_layout.addWidget(self.btn_reset_canny_jsona)
-        stats_layout.addLayout(canny_stat_layout)
+        canny_row, self.label_canny_count, self.btn_reset_canny_jsona = self._create_jsona_stats_row('Canny', 'canny')
+        layout.addLayout(canny_row)
+        pose_row, self.label_pose_count, self.btn_reset_pose_jsona = self._create_jsona_stats_row('Pose', 'pose')
+        layout.addLayout(pose_row)
+        depth_row, self.label_depth_count, self.btn_reset_depth_jsona = self._create_jsona_stats_row('Depth', 'depth')
+        layout.addLayout(depth_row)
+        bbox_row, self.label_bbox_count, self.btn_reset_bbox_jsona = self._create_jsona_stats_row('BBox', 'bbox')
+        layout.addLayout(bbox_row)
 
-        # Pose statistics
-        pose_stat_layout = QHBoxLayout()
-        self.label_pose_count = QLabel('Pose: 0 张图')
-        pose_stat_layout.addWidget(self.label_pose_count)
-        self.btn_reset_pose_jsona = QPushButton('重置')
-        self.btn_reset_pose_jsona.setMaximumWidth(60)
-        self.btn_reset_pose_jsona.clicked.connect(lambda: self._reset_jsona_file('pose'))
-        pose_stat_layout.addWidget(self.btn_reset_pose_jsona)
-        stats_layout.addLayout(pose_stat_layout)
-
-        # Depth statistics
-        depth_stat_layout = QHBoxLayout()
-        self.label_depth_count = QLabel('Depth: 0 张图')
-        depth_stat_layout.addWidget(self.label_depth_count)
-        self.btn_reset_depth_jsona = QPushButton('重置')
-        self.btn_reset_depth_jsona.setMaximumWidth(60)
-        self.btn_reset_depth_jsona.clicked.connect(lambda: self._reset_jsona_file('depth'))
-        depth_stat_layout.addWidget(self.btn_reset_depth_jsona)
-        stats_layout.addLayout(depth_stat_layout)
-
-        bbox_stat_layout = QHBoxLayout()
-        self.label_bbox_count = QLabel('BBox: 0 张图')
-        bbox_stat_layout.addWidget(self.label_bbox_count)
-        self.btn_reset_bbox_jsona = QPushButton('重置')
-        self.btn_reset_bbox_jsona.setMaximumWidth(60)
-        self.btn_reset_bbox_jsona.clicked.connect(lambda: self._reset_jsona_file('bbox'))
-        bbox_stat_layout.addWidget(self.btn_reset_bbox_jsona)
-        stats_layout.addLayout(bbox_stat_layout)
-
-        # Metadata statistics
-        metadata_stat_layout = QHBoxLayout()
-        self.label_metadata_count = QLabel('Metadata: 0 条')
-        metadata_stat_layout.addWidget(self.label_metadata_count)
-        self.btn_reset_metadata_jsona = QPushButton('重置')
-        self.btn_reset_metadata_jsona.setMaximumWidth(60)
-        self.btn_reset_metadata_jsona.clicked.connect(lambda: self._reset_jsona_file('metadata'))
-        metadata_stat_layout.addWidget(self.btn_reset_metadata_jsona)
-        stats_layout.addLayout(metadata_stat_layout)
-
-        # Tag/NL/XML statistics
-        tag_stat_layout = QHBoxLayout()
-        self.label_tag_count = QLabel('Tag: 0 条')
-        tag_stat_layout.addWidget(self.label_tag_count)
-        self.btn_reset_tag_jsona = QPushButton('重置')
-        self.btn_reset_tag_jsona.setMaximumWidth(60)
-        self.btn_reset_tag_jsona.clicked.connect(lambda: self._reset_jsona_file('tag'))
-        tag_stat_layout.addWidget(self.btn_reset_tag_jsona)
-        stats_layout.addLayout(tag_stat_layout)
-
-        nl_stat_layout = QHBoxLayout()
-        self.label_nl_count = QLabel('NL: 0 条')
-        nl_stat_layout.addWidget(self.label_nl_count)
-        self.btn_reset_nl_jsona = QPushButton('重置')
-        self.btn_reset_nl_jsona.setMaximumWidth(60)
-        self.btn_reset_nl_jsona.clicked.connect(lambda: self._reset_jsona_file('nl'))
-        nl_stat_layout.addWidget(self.btn_reset_nl_jsona)
-        stats_layout.addLayout(nl_stat_layout)
-
-        xml_stat_layout = QHBoxLayout()
-        self.label_xml_count = QLabel('XML: 0 条')
-        xml_stat_layout.addWidget(self.label_xml_count)
-        self.btn_reset_xml_jsona = QPushButton('重置')
-        self.btn_reset_xml_jsona.setMaximumWidth(60)
-        self.btn_reset_xml_jsona.clicked.connect(lambda: self._reset_jsona_file('xml'))
-        xml_stat_layout.addWidget(self.btn_reset_xml_jsona)
-        stats_layout.addLayout(xml_stat_layout)
+        metadata_row, self.label_metadata_count, self.btn_reset_metadata_jsona = self._create_jsona_stats_row(
+            'Metadata',
+            'metadata',
+        )
+        layout.addLayout(metadata_row)
+        tag_row, self.label_tag_count, self.btn_reset_tag_jsona = self._create_jsona_stats_row('Tag', 'tag')
+        layout.addLayout(tag_row)
+        nl_row, self.label_nl_count, self.btn_reset_nl_jsona = self._create_jsona_stats_row('NL', 'nl')
+        layout.addLayout(nl_row)
+        xml_row, self.label_xml_count, self.btn_reset_xml_jsona = self._create_jsona_stats_row('XML', 'xml')
+        layout.addLayout(xml_row)
 
         self.label_jsona_mode = QLabel('当前模式: 分类型 JSONA')
         self.label_jsona_mode.setStyleSheet('color: #888; font-size: 11px;')
-        stats_layout.addWidget(self.label_jsona_mode)
+        layout.addWidget(self.label_jsona_mode)
 
-        # Refresh button
         btn_refresh_stats = QPushButton('刷新统计')
         btn_refresh_stats.clicked.connect(self._update_jsona_statistics)
-        stats_layout.addWidget(btn_refresh_stats)
+        layout.addWidget(btn_refresh_stats)
+        return group
 
-        share_group = QGroupBox('参数工具')
-        share_layout = QVBoxLayout(share_group)
+    def _create_share_group(self) -> QGroupBox:
+        group = QGroupBox('参数共享')
+        layout = QVBoxLayout(group)
 
-        share_note = QLabel('复制关键参数给别人粘贴导入，并保留带时间戳的设置修改历史。')
-        share_note.setWordWrap(True)
-        share_note.setStyleSheet('color: #888;')
-        share_layout.addWidget(share_note)
+        note = QLabel('复制关键参数后可粘贴给他人，也可以导入，且会记录最近参数修改历史。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888;')
+        layout.addWidget(note)
 
         btn_copy_key_params = QPushButton('复制关键参数')
         btn_copy_key_params.clicked.connect(self._copy_key_parameters)
-        share_layout.addWidget(btn_copy_key_params)
+        layout.addWidget(btn_copy_key_params)
 
         btn_import_key_params = QPushButton('导入关键参数')
         btn_import_key_params.clicked.connect(self._import_key_parameters)
-        share_layout.addWidget(btn_import_key_params)
+        layout.addWidget(btn_import_key_params)
 
         btn_view_history = QPushButton('查看参数历史')
         btn_view_history.clicked.connect(self._show_settings_history)
-        share_layout.addWidget(btn_view_history)
+        layout.addWidget(btn_view_history)
 
         self.label_settings_history_status = QLabel('历史记录: 0 条')
         self.label_settings_history_status.setStyleSheet('color: #888; font-size: 11px;')
-        share_layout.addWidget(self.label_settings_history_status)
+        layout.addWidget(self.label_settings_history_status)
 
-        share_layout.addStretch()
-        right_layout.addWidget(share_group)
-        right_layout.addWidget(stats_group)
-        right_layout.addStretch()
-
-        main_layout.addLayout(right_layout)
-
+        layout.addStretch()
         return group
 
     def _create_processing_group(self) -> QGroupBox:
@@ -2176,7 +2318,17 @@ class SettingsPanel(QWidget):
         group = QGroupBox(tr('processing'))
         main_layout = QVBoxLayout(group)
 
-        common_form = QFormLayout()
+        main_layout.addLayout(self._create_processing_common_form())
+        self.processing_mode_stack = self._create_processing_mode_stack()
+        main_layout.addWidget(self.processing_mode_stack)
+
+        self._update_processing_mode_controls()
+        self._update_score_filter_controls()
+        self._refresh_score_filter_status()
+        return group
+
+    def _create_processing_common_form(self) -> QFormLayout:
+        form = QFormLayout()
 
         input_source_layout = QHBoxLayout()
         self.radio_use_data_source = QRadioButton(tr('use_data_source_dir'))
@@ -2185,17 +2337,17 @@ class SettingsPanel(QWidget):
         input_source_layout.addWidget(self.radio_use_data_source)
         input_source_layout.addWidget(self.radio_use_custom_dir)
         input_source_layout.addStretch()
-        common_form.addRow(tr('input_source') + ':', input_source_layout)
+        form.addRow(tr('input_source') + ':', input_source_layout)
 
         custom_input_layout = QHBoxLayout()
-        self.edit_custom_input_dir = QLineEdit("./images")
+        self.edit_custom_input_dir = QLineEdit('./images')
         self.edit_custom_input_dir.setEnabled(False)
         custom_input_layout.addWidget(self.edit_custom_input_dir)
         btn_browse_custom_input = QPushButton(tr('browse'))
         btn_browse_custom_input.setEnabled(False)
         btn_browse_custom_input.clicked.connect(lambda: self._browse_directory(self.edit_custom_input_dir))
         custom_input_layout.addWidget(btn_browse_custom_input)
-        common_form.addRow('', custom_input_layout)
+        form.addRow('', custom_input_layout)
 
         self.radio_use_custom_dir.toggled.connect(lambda checked: self.edit_custom_input_dir.setEnabled(checked))
         self.radio_use_custom_dir.toggled.connect(lambda checked: btn_browse_custom_input.setEnabled(checked))
@@ -2210,231 +2362,44 @@ class SettingsPanel(QWidget):
         btn_auto_processing.clicked.connect(lambda: self.spin_processing_threads.setValue(max(1, (os.cpu_count() or 4) - 1)))
         thread_layout.addWidget(btn_auto_processing)
         thread_layout.addStretch()
-        common_form.addRow(tr('threads') + ':', thread_layout)
+        form.addRow(tr('threads') + ':', thread_layout)
 
         self.spin_preload_count = QSpinBox()
         self.spin_preload_count.setRange(5, 50)
         self.spin_preload_count.setValue(15)
-        common_form.addRow(tr('preload_count') + ':', self.spin_preload_count)
-        main_layout.addLayout(common_form)
+        form.addRow(tr('preload_count') + ':', self.spin_preload_count)
+        return form
 
-        self.processing_mode_stack = QStackedWidget()
-        self.processing_mode_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+    def _create_processing_mode_stack(self) -> QStackedWidget:
+        stack = QStackedWidget()
+        stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        stack.addWidget(self._create_controlnet_processing_page())
+        stack.addWidget(self._create_score_processing_page())
+        return stack
 
-        controlnet_page = QWidget()
-        controlnet_page_layout = QVBoxLayout(controlnet_page)
-        controlnet_page_layout.setContentsMargins(0, 0, 0, 0)
+    def _create_controlnet_processing_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
 
-        controlnet_note = QLabel(
-            '当前页只显示 ControlNet 图生成会直接用到的参数。'
-        )
-        controlnet_note.setWordWrap(True)
-        controlnet_note.setStyleSheet('color: #888;')
-        controlnet_page_layout.addWidget(controlnet_note)
+        note = QLabel('当前页只显示 ControlNet 图生成会直接用到的参数。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888;')
+        page_layout.addWidget(note)
 
-        controlnet_form = QFormLayout()
+        quality_form = QFormLayout()
         self.combo_quality_profile = QComboBox()
         self.combo_quality_profile.addItems([tr('general'), tr('anime')])
-        controlnet_form.addRow(tr('quality_profile') + ':', self.combo_quality_profile)
-        controlnet_page_layout.addLayout(controlnet_form)
+        quality_form.addRow(tr('quality_profile') + ':', self.combo_quality_profile)
+        page_layout.addLayout(quality_form)
 
-        threshold_group = QGroupBox('自动判定阈值')
-        threshold_layout = QVBoxLayout(threshold_group)
+        page_layout.addWidget(self._create_controlnet_threshold_group())
+        page_layout.addWidget(self._create_control_types_group())
 
-        canny_threshold_layout = QHBoxLayout()
-        canny_threshold_layout.addWidget(QLabel('Canny 自动接受:'))
-        self.spin_canny_accept = QSpinBox()
-        self.spin_canny_accept.setRange(0, 100)
-        self.spin_canny_accept.setValue(55)
-        self.spin_canny_accept.setSuffix(' 分')
-        canny_threshold_layout.addWidget(self.spin_canny_accept)
-        canny_threshold_layout.addWidget(QLabel('  拒绝:'))
-        self.spin_canny_reject = QSpinBox()
-        self.spin_canny_reject.setRange(0, 100)
-        self.spin_canny_reject.setValue(40)
-        self.spin_canny_reject.setSuffix(' 分')
-        canny_threshold_layout.addWidget(self.spin_canny_reject)
-        canny_threshold_layout.addStretch()
-        threshold_layout.addLayout(canny_threshold_layout)
-
-        pose_threshold_layout = QHBoxLayout()
-        pose_threshold_layout.addWidget(QLabel('Pose 自动接受:'))
-        self.spin_pose_accept = QSpinBox()
-        self.spin_pose_accept.setRange(0, 100)
-        self.spin_pose_accept.setValue(60)
-        self.spin_pose_accept.setSuffix(' 分')
-        pose_threshold_layout.addWidget(self.spin_pose_accept)
-        pose_threshold_layout.addWidget(QLabel('  拒绝:'))
-        self.spin_pose_reject = QSpinBox()
-        self.spin_pose_reject.setRange(0, 100)
-        self.spin_pose_reject.setValue(40)
-        self.spin_pose_reject.setSuffix(' 分')
-        pose_threshold_layout.addWidget(self.spin_pose_reject)
-        pose_threshold_layout.addStretch()
-        threshold_layout.addLayout(pose_threshold_layout)
-
-        depth_threshold_layout = QHBoxLayout()
-        depth_threshold_layout.addWidget(QLabel('Depth 自动接受:'))
-        self.spin_depth_accept = QSpinBox()
-        self.spin_depth_accept.setRange(0, 100)
-        self.spin_depth_accept.setValue(80)
-        self.spin_depth_accept.setSuffix(' 分')
-        depth_threshold_layout.addWidget(self.spin_depth_accept)
-        depth_threshold_layout.addWidget(QLabel('  拒绝:'))
-        self.spin_depth_reject = QSpinBox()
-        self.spin_depth_reject.setRange(0, 100)
-        self.spin_depth_reject.setValue(40)
-        self.spin_depth_reject.setSuffix(' 分')
-        depth_threshold_layout.addWidget(self.spin_depth_reject)
-        depth_threshold_layout.addStretch()
-        threshold_layout.addLayout(depth_threshold_layout)
-
-        bbox_threshold_layout = QHBoxLayout()
-        bbox_threshold_layout.addWidget(QLabel('BBox 自动接受:'))
-        self.spin_bbox_accept = QSpinBox()
-        self.spin_bbox_accept.setRange(0, 100)
-        self.spin_bbox_accept.setValue(60)
-        self.spin_bbox_accept.setSuffix(' 分')
-        bbox_threshold_layout.addWidget(self.spin_bbox_accept)
-        bbox_threshold_layout.addWidget(QLabel('  拒绝:'))
-        self.spin_bbox_reject = QSpinBox()
-        self.spin_bbox_reject.setRange(0, 100)
-        self.spin_bbox_reject.setValue(40)
-        self.spin_bbox_reject.setSuffix(' 分')
-        bbox_threshold_layout.addWidget(self.spin_bbox_reject)
-        bbox_threshold_layout.addStretch()
-        threshold_layout.addLayout(bbox_threshold_layout)
-        controlnet_page_layout.addWidget(threshold_group)
-
-        control_group = QGroupBox(tr('control_types'))
-        control_layout = QVBoxLayout(control_group)
-
-        canny_layout = QHBoxLayout()
-        self.check_canny = QCheckBox("Canny")
-        self.check_canny.setChecked(True)
-        canny_layout.addWidget(self.check_canny)
-        canny_layout.addWidget(QLabel("(OpenCV - No model needed)"))
-        canny_layout.addStretch()
-        control_layout.addLayout(canny_layout)
-
-        openpose_layout = QHBoxLayout()
-        self.check_openpose = QCheckBox("OpenPose")
-        openpose_layout.addWidget(self.check_openpose)
-        self.btn_install_torch_openpose = QPushButton("安装 PyTorch")
-        self.btn_install_torch_openpose.clicked.connect(self._on_install_torch_clicked)
-        self.btn_install_torch_openpose.setVisible(False)
-        openpose_layout.addWidget(self.btn_install_torch_openpose)
-        openpose_layout.addWidget(QLabel(tr('model') + ':'))
-        self.combo_openpose_model = QComboBox()
-        self.combo_openpose_model.addItems([
-            'DWpose (Default) (推荐10系20系老卡使用)',
-            'SDPose-Wholebody (30,40,50系新卡推荐使用)',
-            'ViTPose (30,40,50系新卡推荐使用)',
-            'Openpose (推荐10系20系老卡使用)',
-            'Custom Path'
-        ])
-        self.combo_openpose_model.setEnabled(False)
-        openpose_layout.addWidget(self.combo_openpose_model)
-        openpose_layout.addWidget(QLabel('YOLO:'))
-        self.combo_yolo_version = QComboBox()
-        self.combo_yolo_version.addItems(['YOLO26 (推荐)', 'YOLOv11', 'YOLOv8'])
-        self.combo_yolo_version.setEnabled(False)
-        self.combo_yolo_version.setVisible(False)
-        openpose_layout.addWidget(self.combo_yolo_version)
-        openpose_layout.addWidget(QLabel('检测器:'))
-        self.combo_yolo_model_type = QComboBox()
-        self.combo_yolo_model_type.addItems(['通用 (General)', '动漫专用 (Anime)'])
-        self.combo_yolo_model_type.setEnabled(False)
-        self.combo_yolo_model_type.setVisible(False)
-        openpose_layout.addWidget(self.combo_yolo_model_type)
-        self.edit_openpose_path = QLineEdit()
-        self.edit_openpose_path.setPlaceholderText(tr('model_path_placeholder'))
-        self.edit_openpose_path.setEnabled(False)
-        self.edit_openpose_path.setVisible(False)
-        openpose_layout.addWidget(self.edit_openpose_path)
-        self.btn_browse_openpose = QPushButton(tr('browse'))
-        self.btn_browse_openpose.setEnabled(False)
-        self.btn_browse_openpose.setVisible(False)
-        self.btn_browse_openpose.clicked.connect(lambda: self._browse_directory(self.edit_openpose_path))
-        openpose_layout.addWidget(self.btn_browse_openpose)
-        openpose_layout.addStretch()
-        control_layout.addLayout(openpose_layout)
-
-        depth_layout = QHBoxLayout()
-        self.check_depth = QCheckBox("Depth")
-        depth_layout.addWidget(self.check_depth)
-        self.btn_install_torch_depth = QPushButton("安装 PyTorch")
-        self.btn_install_torch_depth.clicked.connect(self._on_install_torch_clicked)
-        self.btn_install_torch_depth.setVisible(False)
-        depth_layout.addWidget(self.btn_install_torch_depth)
-        depth_layout.addWidget(QLabel(tr('model') + ':'))
-        self.combo_depth_model = QComboBox()
-        self.combo_depth_model.addItems(['Depth Anything V2', 'Custom Path'])
-        self.combo_depth_model.setEnabled(False)
-        depth_layout.addWidget(self.combo_depth_model)
-        self.edit_depth_path = QLineEdit()
-        self.edit_depth_path.setPlaceholderText(tr('model_path_placeholder'))
-        self.edit_depth_path.setEnabled(False)
-        self.edit_depth_path.setVisible(False)
-        depth_layout.addWidget(self.edit_depth_path)
-        self.btn_browse_depth = QPushButton(tr('browse'))
-        self.btn_browse_depth.setEnabled(False)
-        self.btn_browse_depth.setVisible(False)
-        self.btn_browse_depth.clicked.connect(lambda: self._browse_directory(self.edit_depth_path))
-        depth_layout.addWidget(self.btn_browse_depth)
-        depth_layout.addStretch()
-        control_layout.addLayout(depth_layout)
-
-        bbox_layout = QHBoxLayout()
-        self.check_bbox = QCheckBox("BBox")
-        bbox_layout.addWidget(self.check_bbox)
-        bbox_layout.addWidget(QLabel('模型:'))
-        self.combo_bbox_model = QComboBox()
-        self.combo_bbox_model.addItems(['YOLOv11', 'YOLO26', 'YOLOv8', '动漫专用 (Anime)', 'Custom Path'])
-        self.combo_bbox_model.setEnabled(False)
-        bbox_layout.addWidget(self.combo_bbox_model)
-
-        self.edit_bbox_path = QLineEdit()
-        self.edit_bbox_path.setPlaceholderText('BBox model path (.pt)')
-        self.edit_bbox_path.setEnabled(False)
-        self.edit_bbox_path.setVisible(False)
-        bbox_layout.addWidget(self.edit_bbox_path)
-
-        self.btn_browse_bbox = QPushButton(tr('browse'))
-        self.btn_browse_bbox.setEnabled(False)
-        self.btn_browse_bbox.setVisible(False)
-        self.btn_browse_bbox.clicked.connect(self._browse_bbox_model_file)
-        bbox_layout.addWidget(self.btn_browse_bbox)
-
-        bbox_layout.addWidget(QLabel('置信度:'))
-        self.spin_bbox_conf = QDoubleSpinBox()
-        self.spin_bbox_conf.setRange(0.05, 0.95)
-        self.spin_bbox_conf.setSingleStep(0.05)
-        self.spin_bbox_conf.setDecimals(2)
-        self.spin_bbox_conf.setValue(0.25)
-        self.spin_bbox_conf.setEnabled(False)
-        bbox_layout.addWidget(self.spin_bbox_conf)
-
-        bbox_layout.addWidget(QLabel('IoU:'))
-        self.spin_bbox_iou = QDoubleSpinBox()
-        self.spin_bbox_iou.setRange(0.05, 0.95)
-        self.spin_bbox_iou.setSingleStep(0.05)
-        self.spin_bbox_iou.setDecimals(2)
-        self.spin_bbox_iou.setValue(0.45)
-        self.spin_bbox_iou.setEnabled(False)
-        bbox_layout.addWidget(self.spin_bbox_iou)
-
-        self.check_bbox_person_only = QCheckBox('仅人物')
-        self.check_bbox_person_only.setChecked(True)
-        self.check_bbox_person_only.setEnabled(False)
-        bbox_layout.addWidget(self.check_bbox_person_only)
-        bbox_layout.addStretch()
-        control_layout.addLayout(bbox_layout)
-        controlnet_page_layout.addWidget(control_group)
         self.label_controlnet_mode_note = QLabel('原图评分预筛与自动通过阈值请切换到上方“图片评分模式”页配置。')
         self.label_controlnet_mode_note.setWordWrap(True)
         self.label_controlnet_mode_note.setStyleSheet('color: #999; font-size: 11px;')
-        controlnet_page_layout.addWidget(self.label_controlnet_mode_note)
+        page_layout.addWidget(self.label_controlnet_mode_note)
 
         self.check_openpose.toggled.connect(self._on_openpose_toggled)
         self.combo_openpose_model.currentTextChanged.connect(self._on_openpose_model_changed)
@@ -2443,55 +2408,422 @@ class SettingsPanel(QWidget):
         self.combo_depth_model.currentTextChanged.connect(self._on_depth_model_changed)
         self.check_bbox.toggled.connect(self._on_bbox_toggled)
         self.combo_bbox_model.currentTextChanged.connect(self._on_bbox_model_changed)
+        self.combo_bbox_target_part.currentTextChanged.connect(self._on_bbox_target_part_changed)
+        self.check_bbox_specialized_channels.toggled.connect(self._on_bbox_specialized_channels_toggled)
+        self.check_bbox_review_enabled.toggled.connect(self._on_bbox_review_enabled_toggled)
+        self.check_bbox_review_pose_enabled.toggled.connect(self._on_bbox_review_pose_toggled)
+        self.check_bbox_review_sam_enabled.toggled.connect(self._on_bbox_review_sam_toggled)
         self._check_torch_availability()
-        controlnet_page_layout.addStretch()
 
-        score_page = QWidget()
-        score_page_layout = QVBoxLayout(score_page)
-        score_page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addStretch()
+        return page
 
-        score_filter_group = QGroupBox('原图评分筛选')
-        score_filter_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        score_filter_layout = QVBoxLayout(score_filter_group)
+    def _create_controlnet_threshold_group(self) -> QGroupBox:
+        group = QGroupBox('自动判定阈值')
+        layout = QVBoxLayout(group)
 
-        score_enable_layout = QVBoxLayout()
-        score_enable_row = QHBoxLayout()
-        self.check_score_filter_enabled = QCheckBox('启用原图评分筛选 (二次元 / furry)')
-        self.check_score_filter_enabled.setChecked(False)
-        score_enable_row.addWidget(self.check_score_filter_enabled)
-        score_enable_row.addStretch()
-        score_enable_layout.addLayout(score_enable_row)
-        score_enable_action_row = QHBoxLayout()
-        score_enable_action_row.addStretch()
-        self.btn_refresh_score_filter_status = QPushButton('检查环境')
-        self.btn_refresh_score_filter_status.clicked.connect(self._refresh_score_filter_status)
-        score_enable_action_row.addWidget(self.btn_refresh_score_filter_status)
-        score_enable_layout.addLayout(score_enable_action_row)
-        score_filter_layout.addLayout(score_enable_layout)
+        self._add_threshold_row(layout, 'Canny 自动接受:', 'spin_canny_accept', 'spin_canny_reject', 55, 40)
+        self._add_threshold_row(layout, 'Pose 自动接受:', 'spin_pose_accept', 'spin_pose_reject', 60, 40)
+        self._add_threshold_row(layout, 'Depth 自动接受:', 'spin_depth_accept', 'spin_depth_reject', 80, 40)
+        self._add_threshold_row(layout, 'BBox 自动接受:', 'spin_bbox_accept', 'spin_bbox_reject', 60, 40)
+        return group
+
+    def _add_threshold_row(
+        self,
+        parent_layout: QVBoxLayout,
+        title: str,
+        accept_attr: str,
+        reject_attr: str,
+        accept_value: int,
+        reject_value: int,
+    ):
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(QLabel(title))
+
+        accept_spin = QSpinBox()
+        accept_spin.setRange(0, 100)
+        accept_spin.setValue(accept_value)
+        accept_spin.setSuffix(' 分')
+        setattr(self, accept_attr, accept_spin)
+        row_layout.addWidget(accept_spin)
+
+        row_layout.addWidget(QLabel('  拒绝:'))
+        reject_spin = QSpinBox()
+        reject_spin.setRange(0, 100)
+        reject_spin.setValue(reject_value)
+        reject_spin.setSuffix(' 分')
+        setattr(self, reject_attr, reject_spin)
+        row_layout.addWidget(reject_spin)
+        row_layout.addStretch()
+        parent_layout.addLayout(row_layout)
+
+    def _create_control_types_group(self) -> QGroupBox:
+        group = QGroupBox(tr('control_types'))
+        layout = QVBoxLayout(group)
+
+        self._add_canny_control_row(layout)
+        self._add_openpose_control_row(layout)
+        self._add_depth_control_row(layout)
+        self._add_bbox_control_row(layout)
+        return group
+
+    def _add_canny_control_row(self, parent_layout: QVBoxLayout):
+        row = QHBoxLayout()
+        self.check_canny = QCheckBox('Canny')
+        self.check_canny.setChecked(True)
+        row.addWidget(self.check_canny)
+        row.addWidget(QLabel('(OpenCV - No model needed)'))
+        row.addStretch()
+        parent_layout.addLayout(row)
+
+    def _add_openpose_control_row(self, parent_layout: QVBoxLayout):
+        row = QHBoxLayout()
+        self.check_openpose = QCheckBox('OpenPose')
+        row.addWidget(self.check_openpose)
+
+        self.btn_install_torch_openpose = QPushButton('安装 PyTorch')
+        self.btn_install_torch_openpose.clicked.connect(self._on_install_torch_clicked)
+        self.btn_install_torch_openpose.setVisible(False)
+        row.addWidget(self.btn_install_torch_openpose)
+
+        row.addWidget(QLabel(tr('model') + ':'))
+        self.combo_openpose_model = QComboBox()
+        self.combo_openpose_model.addItems([
+            'DWpose (Default) (推荐10系20系老卡使用)',
+            'SDPose-Wholebody (30,40,50系新卡推荐使用)',
+            'ViTPose (30,40,50系新卡推荐使用)',
+            'Openpose (推荐10系20系老卡使用)',
+            'Custom Path',
+        ])
+        self.combo_openpose_model.setEnabled(False)
+        row.addWidget(self.combo_openpose_model)
+
+        row.addWidget(QLabel('YOLO:'))
+        self.combo_yolo_version = QComboBox()
+        self.combo_yolo_version.addItems(['YOLO26 (推荐)', 'YOLOv11', 'YOLOv8'])
+        self.combo_yolo_version.setEnabled(False)
+        self.combo_yolo_version.setVisible(False)
+        row.addWidget(self.combo_yolo_version)
+
+        row.addWidget(QLabel('检测器:'))
+        self.combo_yolo_model_type = QComboBox()
+        self.combo_yolo_model_type.addItems(['通用 (General)', '动漫专用 (Anime)'])
+        self.combo_yolo_model_type.setEnabled(False)
+        self.combo_yolo_model_type.setVisible(False)
+        row.addWidget(self.combo_yolo_model_type)
+
+        self.edit_openpose_path = QLineEdit()
+        self.edit_openpose_path.setPlaceholderText(tr('model_path_placeholder'))
+        self.edit_openpose_path.setEnabled(False)
+        self.edit_openpose_path.setVisible(False)
+        row.addWidget(self.edit_openpose_path)
+
+        self.btn_browse_openpose = QPushButton(tr('browse'))
+        self.btn_browse_openpose.setEnabled(False)
+        self.btn_browse_openpose.setVisible(False)
+        self.btn_browse_openpose.clicked.connect(lambda: self._browse_directory(self.edit_openpose_path))
+        row.addWidget(self.btn_browse_openpose)
+
+        row.addStretch()
+        parent_layout.addLayout(row)
+
+    def _add_depth_control_row(self, parent_layout: QVBoxLayout):
+        row = QHBoxLayout()
+        self.check_depth = QCheckBox('Depth')
+        row.addWidget(self.check_depth)
+
+        self.btn_install_torch_depth = QPushButton('安装 PyTorch')
+        self.btn_install_torch_depth.clicked.connect(self._on_install_torch_clicked)
+        self.btn_install_torch_depth.setVisible(False)
+        row.addWidget(self.btn_install_torch_depth)
+
+        row.addWidget(QLabel(tr('model') + ':'))
+        self.combo_depth_model = QComboBox()
+        self.combo_depth_model.addItems(['Depth Anything V2', 'Custom Path'])
+        self.combo_depth_model.setEnabled(False)
+        row.addWidget(self.combo_depth_model)
+
+        self.edit_depth_path = QLineEdit()
+        self.edit_depth_path.setPlaceholderText(tr('model_path_placeholder'))
+        self.edit_depth_path.setEnabled(False)
+        self.edit_depth_path.setVisible(False)
+        row.addWidget(self.edit_depth_path)
+
+        self.btn_browse_depth = QPushButton(tr('browse'))
+        self.btn_browse_depth.setEnabled(False)
+        self.btn_browse_depth.setVisible(False)
+        self.btn_browse_depth.clicked.connect(lambda: self._browse_directory(self.edit_depth_path))
+        row.addWidget(self.btn_browse_depth)
+
+        row.addStretch()
+        parent_layout.addLayout(row)
+
+    def _add_bbox_control_row(self, parent_layout: QVBoxLayout):
+        row = QHBoxLayout()
+        self.check_bbox = QCheckBox('BBox')
+        row.addWidget(self.check_bbox)
+        row.addWidget(QLabel('模型:'))
+
+        self.combo_bbox_model = QComboBox()
+        self.combo_bbox_model.addItems(['YOLOv11', 'YOLO26', 'YOLOv8', '动漫专用 (Anime)', 'Custom Path'])
+        self.combo_bbox_model.setEnabled(False)
+        row.addWidget(self.combo_bbox_model)
+
+        self.edit_bbox_path = QLineEdit()
+        self.edit_bbox_path.setPlaceholderText('BBox model path (.pt)')
+        self.edit_bbox_path.setEnabled(False)
+        self.edit_bbox_path.setVisible(False)
+        row.addWidget(self.edit_bbox_path)
+
+        self.btn_browse_bbox = QPushButton(tr('browse'))
+        self.btn_browse_bbox.setEnabled(False)
+        self.btn_browse_bbox.setVisible(False)
+        self.btn_browse_bbox.clicked.connect(self._browse_bbox_model_file)
+        row.addWidget(self.btn_browse_bbox)
+
+        row.addWidget(QLabel('置信度:'))
+        self.spin_bbox_conf = QDoubleSpinBox()
+        self.spin_bbox_conf.setRange(0.05, 0.95)
+        self.spin_bbox_conf.setSingleStep(0.05)
+        self.spin_bbox_conf.setDecimals(2)
+        self.spin_bbox_conf.setValue(0.25)
+        self.spin_bbox_conf.setEnabled(False)
+        row.addWidget(self.spin_bbox_conf)
+
+        row.addWidget(QLabel('IoU:'))
+        self.spin_bbox_iou = QDoubleSpinBox()
+        self.spin_bbox_iou.setRange(0.05, 0.95)
+        self.spin_bbox_iou.setSingleStep(0.05)
+        self.spin_bbox_iou.setDecimals(2)
+        self.spin_bbox_iou.setValue(0.45)
+        self.spin_bbox_iou.setEnabled(False)
+        row.addWidget(self.spin_bbox_iou)
+
+        self.check_bbox_person_only = QCheckBox('仅人物')
+        self.check_bbox_person_only.setChecked(True)
+        self.check_bbox_person_only.setEnabled(False)
+        row.addWidget(self.check_bbox_person_only)
+
+        row.addWidget(QLabel('部位:'))
+        self.combo_bbox_target_part = QComboBox()
+        self.combo_bbox_target_part.addItems([label for label, _ in self._bbox_target_part_options()])
+        self.combo_bbox_target_part.setCurrentText('全身')
+        self.combo_bbox_target_part.setEnabled(False)
+        row.addWidget(self.combo_bbox_target_part)
+        row.addStretch()
+        parent_layout.addLayout(row)
+
+        toggle_row = QHBoxLayout()
+        self.check_bbox_specialized_channels = QCheckBox('启用专用部位模型通道')
+        self.check_bbox_specialized_channels.setToolTip(
+            '启用后，头部/上半身/下半身可使用对应专用模型；若路径为空或加载失败会自动回退主模型。'
+        )
+        self.check_bbox_specialized_channels.setEnabled(False)
+        toggle_row.addWidget(self.check_bbox_specialized_channels)
+        toggle_row.addStretch()
+        parent_layout.addLayout(toggle_row)
+
+        parent_layout.addLayout(
+            self._create_bbox_specialized_path_row(
+                label_text='头部模型:',
+                edit_attr='edit_bbox_specialized_head_path',
+                button_attr='btn_browse_bbox_specialized_head',
+                part_key='head',
+            )
+        )
+        parent_layout.addLayout(
+            self._create_bbox_specialized_path_row(
+                label_text='上半身模型:',
+                edit_attr='edit_bbox_specialized_upper_path',
+                button_attr='btn_browse_bbox_specialized_upper',
+                part_key='upper_body',
+            )
+        )
+        parent_layout.addLayout(
+            self._create_bbox_specialized_path_row(
+                label_text='下半身模型:',
+                edit_attr='edit_bbox_specialized_lower_path',
+                button_attr='btn_browse_bbox_specialized_lower',
+                part_key='lower_body',
+            )
+        )
+        parent_layout.addWidget(self._create_bbox_review_group())
+
+    def _create_bbox_specialized_path_row(self, label_text: str, edit_attr: str, button_attr: str, part_key: str):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label_text))
+
+        edit = QLineEdit()
+        edit.setPlaceholderText('模型路径 (.pt/.onnx)')
+        edit.setEnabled(False)
+        row.addWidget(edit)
+        setattr(self, edit_attr, edit)
+
+        button = QPushButton(tr('browse'))
+        button.setEnabled(False)
+        button.clicked.connect(
+            lambda _checked=False, target_edit=edit, target_part=part_key: self._browse_bbox_specialized_model_file(
+                target_edit,
+                target_part,
+            )
+        )
+        row.addWidget(button)
+        setattr(self, button_attr, button)
+
+        row.addStretch()
+        return row
+
+    def _create_bbox_review_group(self) -> QGroupBox:
+        group = QGroupBox('BBox 复核')
+        layout = QVBoxLayout(group)
+
+        toggle_row = QHBoxLayout()
+        self.check_bbox_review_enabled = QCheckBox('启用中心复核')
+        self.check_bbox_review_enabled.setToolTip('启用后会对每个检测框做中心可靠性复核。')
+        self.check_bbox_review_enabled.setChecked(False)
+        self.check_bbox_review_enabled.setEnabled(False)
+        toggle_row.addWidget(self.check_bbox_review_enabled)
+
+        self.check_bbox_review_override_score = QCheckBox('复核分参与总分')
+        self.check_bbox_review_override_score.setToolTip('启用后使用检测分与复核分融合得到最终 BBox 分数。')
+        self.check_bbox_review_override_score.setChecked(False)
+        self.check_bbox_review_override_score.setEnabled(False)
+        toggle_row.addWidget(self.check_bbox_review_override_score)
+        toggle_row.addStretch()
+        layout.addLayout(toggle_row)
+
+        threshold_row = QHBoxLayout()
+        threshold_row.addWidget(QLabel('通过阈值:'))
+        self.spin_bbox_review_pass = QDoubleSpinBox()
+        self.spin_bbox_review_pass.setRange(0.0, 1.0)
+        self.spin_bbox_review_pass.setSingleStep(0.01)
+        self.spin_bbox_review_pass.setDecimals(2)
+        self.spin_bbox_review_pass.setValue(0.72)
+        self.spin_bbox_review_pass.setEnabled(False)
+        threshold_row.addWidget(self.spin_bbox_review_pass)
+
+        threshold_row.addWidget(QLabel('失败阈值:'))
+        self.spin_bbox_review_fail = QDoubleSpinBox()
+        self.spin_bbox_review_fail.setRange(0.0, 1.0)
+        self.spin_bbox_review_fail.setSingleStep(0.01)
+        self.spin_bbox_review_fail.setDecimals(2)
+        self.spin_bbox_review_fail.setValue(0.45)
+        self.spin_bbox_review_fail.setEnabled(False)
+        threshold_row.addWidget(self.spin_bbox_review_fail)
+        threshold_row.addStretch()
+        layout.addLayout(threshold_row)
+
+        pose_row = QHBoxLayout()
+        self.check_bbox_review_pose_enabled = QCheckBox('Pose 复核')
+        self.check_bbox_review_pose_enabled.setChecked(False)
+        self.check_bbox_review_pose_enabled.setEnabled(False)
+        pose_row.addWidget(self.check_bbox_review_pose_enabled)
+
+        self.edit_bbox_review_pose_path = QLineEdit()
+        self.edit_bbox_review_pose_path.setPlaceholderText('ViTPose ONNX 路径 (.onnx)')
+        self.edit_bbox_review_pose_path.setEnabled(False)
+        pose_row.addWidget(self.edit_bbox_review_pose_path)
+
+        self.btn_browse_bbox_review_pose = QPushButton(tr('browse'))
+        self.btn_browse_bbox_review_pose.setEnabled(False)
+        self.btn_browse_bbox_review_pose.clicked.connect(self._browse_bbox_review_pose_model_file)
+        pose_row.addWidget(self.btn_browse_bbox_review_pose)
+        layout.addLayout(pose_row)
+
+        sam_row = QHBoxLayout()
+        self.check_bbox_review_sam_enabled = QCheckBox('SAM 复核')
+        self.check_bbox_review_sam_enabled.setChecked(False)
+        self.check_bbox_review_sam_enabled.setEnabled(False)
+        sam_row.addWidget(self.check_bbox_review_sam_enabled)
+
+        self.edit_bbox_review_sam_path = QLineEdit()
+        self.edit_bbox_review_sam_path.setPlaceholderText('SAM 路径 (.pt/.pth)')
+        self.edit_bbox_review_sam_path.setEnabled(False)
+        sam_row.addWidget(self.edit_bbox_review_sam_path)
+
+        self.btn_browse_bbox_review_sam = QPushButton(tr('browse'))
+        self.btn_browse_bbox_review_sam.setEnabled(False)
+        self.btn_browse_bbox_review_sam.clicked.connect(self._browse_bbox_review_sam_model_file)
+        sam_row.addWidget(self.btn_browse_bbox_review_sam)
+        layout.addLayout(sam_row)
+
+        note = QLabel('建议先只开“中心复核”，确认效果后再开启 Pose/SAM。')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #888; font-size: 11px;')
+        layout.addWidget(note)
+        return group
+
+    def _create_score_processing_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.addWidget(self._create_score_filter_group())
+        page_layout.addStretch()
+        return page
+
+    def _create_score_filter_group(self) -> QGroupBox:
+        group = QGroupBox('原图评分筛选')
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        layout = QVBoxLayout(group)
+
+        self._add_score_filter_enable_section(layout)
 
         self.label_score_filter_status = QLabel('未启用')
         self.label_score_filter_status.setWordWrap(True)
         self.label_score_filter_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.label_score_filter_status.setMinimumWidth(0)
         self.label_score_filter_status.setStyleSheet('color: #888;')
-        score_filter_layout.addWidget(self.label_score_filter_status)
+        layout.addWidget(self.label_score_filter_status)
 
-        score_action_layout = QVBoxLayout()
-        score_action_row1 = QHBoxLayout()
+        layout.addLayout(self._create_score_filter_action_layout())
+        layout.addLayout(self._create_score_filter_path_form())
+        layout.addLayout(self._create_score_filter_runtime_form())
+        layout.addWidget(self._create_score_filter_progress_group())
+
+        self.label_score_mode_note = self._create_score_filter_note_label()
+        layout.addWidget(self.label_score_mode_note)
+        return group
+
+    def _add_score_filter_enable_section(self, parent_layout: QVBoxLayout):
+        section_layout = QVBoxLayout()
+
+        row = QHBoxLayout()
+        self.check_score_filter_enabled = QCheckBox('启用原图评分筛选 (二次元 / furry)')
+        self.check_score_filter_enabled.setChecked(False)
+        row.addWidget(self.check_score_filter_enabled)
+        row.addStretch()
+        section_layout.addLayout(row)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self.btn_refresh_score_filter_status = QPushButton('检查环境')
+        self.btn_refresh_score_filter_status.clicked.connect(self._refresh_score_filter_status)
+        action_row.addWidget(self.btn_refresh_score_filter_status)
+        section_layout.addLayout(action_row)
+
+        parent_layout.addLayout(section_layout)
+
+    def _create_score_filter_action_layout(self) -> QVBoxLayout:
+        layout = QVBoxLayout()
+        row = QHBoxLayout()
+
         self.btn_install_score_filter_deps = QPushButton('安装评分依赖')
         self.btn_install_score_filter_deps.clicked.connect(self._install_score_filter_dependencies)
         self.btn_install_score_filter_deps.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        score_action_row1.addWidget(self.btn_install_score_filter_deps)
+        row.addWidget(self.btn_install_score_filter_deps)
+
         self.btn_install_missing_score_models = QPushButton('安装缺失模型')
         self.btn_install_missing_score_models.clicked.connect(self._show_score_model_manager)
         self.btn_install_missing_score_models.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        score_action_row1.addWidget(self.btn_install_missing_score_models)
-        score_action_layout.addLayout(score_action_row1)
-        score_filter_layout.addLayout(score_action_layout)
+        row.addWidget(self.btn_install_missing_score_models)
 
-        score_path_form = QFormLayout()
-        score_path_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        score_path_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        layout.addLayout(row)
+        return layout
+
+    def _create_score_filter_path_form(self) -> QFormLayout:
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         score_ckpt_widget = QWidget()
         score_ckpt_layout = QHBoxLayout(score_ckpt_widget)
@@ -2501,7 +2833,7 @@ class SettingsPanel(QWidget):
         self.btn_browse_score_checkpoint = QPushButton(tr('browse'))
         self.btn_browse_score_checkpoint.clicked.connect(self._browse_score_checkpoint)
         score_ckpt_layout.addWidget(self.btn_browse_score_checkpoint)
-        score_path_form.addRow('评分 checkpoint:', score_ckpt_widget)
+        form.addRow('评分 checkpoint:', score_ckpt_widget)
 
         score_cache_widget = QWidget()
         score_cache_layout = QHBoxLayout(score_cache_widget)
@@ -2511,34 +2843,35 @@ class SettingsPanel(QWidget):
         self.btn_browse_score_cache_root = QPushButton(tr('browse'))
         self.btn_browse_score_cache_root.clicked.connect(lambda: self._browse_directory(self.edit_score_cache_root))
         score_cache_layout.addWidget(self.btn_browse_score_cache_root)
-        score_path_form.addRow('模型缓存目录:', score_cache_widget)
-        score_filter_layout.addLayout(score_path_form)
+        form.addRow('模型缓存目录:', score_cache_widget)
+        return form
 
-        score_runtime_form = QFormLayout()
-        score_runtime_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        score_runtime_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+    def _create_score_filter_runtime_form(self) -> QFormLayout:
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self.combo_score_device = QComboBox()
         self.combo_score_device.addItems(['auto', 'cuda', 'cpu'])
-        score_runtime_form.addRow('设备:', self.combo_score_device)
+        form.addRow('设备:', self.combo_score_device)
 
         self.spin_score_min_aesthetic = QDoubleSpinBox()
         self.spin_score_min_aesthetic.setRange(0.0, 5.0)
         self.spin_score_min_aesthetic.setDecimals(2)
         self.spin_score_min_aesthetic.setSingleStep(0.1)
         self.spin_score_min_aesthetic.setValue(2.5)
-        score_runtime_form.addRow('最低美学分:', self.spin_score_min_aesthetic)
+        form.addRow('最低美学分:', self.spin_score_min_aesthetic)
 
         self.check_score_require_in_domain = QCheckBox('同时要求目标域命中')
         self.check_score_require_in_domain.setChecked(True)
-        score_runtime_form.addRow('目标域限制:', self.check_score_require_in_domain)
+        form.addRow('目标域限制:', self.check_score_require_in_domain)
 
         self.spin_score_min_in_domain_prob = QDoubleSpinBox()
         self.spin_score_min_in_domain_prob.setRange(0.0, 1.0)
         self.spin_score_min_in_domain_prob.setDecimals(2)
         self.spin_score_min_in_domain_prob.setSingleStep(0.05)
         self.spin_score_min_in_domain_prob.setValue(0.5)
-        score_runtime_form.addRow('最低目标域概率:', self.spin_score_min_in_domain_prob)
+        form.addRow('最低目标域概率:', self.spin_score_min_in_domain_prob)
 
         self.spin_score_mode_auto_accept = QDoubleSpinBox()
         self.spin_score_mode_auto_accept.setRange(0.0, 5.0)
@@ -2549,49 +2882,40 @@ class SettingsPanel(QWidget):
             '仅在“图片评分模式”下生效。\n'
             '达到该美学分的原图会自动通过，低于它但未触发自动拒绝的图片进入人工审核。'
         )
-        score_runtime_form.addRow('评分模式自动接受:', self.spin_score_mode_auto_accept)
-        score_filter_layout.addLayout(score_runtime_form)
+        form.addRow('评分模式自动接受:', self.spin_score_mode_auto_accept)
+        return form
 
-        score_progress_group = QGroupBox('评分进度')
-        score_progress_layout = QVBoxLayout(score_progress_group)
+    def _create_score_filter_progress_group(self) -> QGroupBox:
+        group = QGroupBox('评分进度')
+        layout = QVBoxLayout(group)
 
-        score_progress_row = QHBoxLayout()
+        row = QHBoxLayout()
         self.label_score_filter_progress_count = QLabel('已处理总数 (-- / --)')
         self.label_score_filter_progress_count.setStyleSheet('color: #cccccc;')
-        score_progress_row.addWidget(self.label_score_filter_progress_count)
-        score_progress_row.addStretch()
+        row.addWidget(self.label_score_filter_progress_count)
+        row.addStretch()
+
         self.btn_reset_score_filter_progress = QPushButton('重置')
         self.btn_reset_score_filter_progress.clicked.connect(self._reset_score_filter_progress)
-        score_progress_row.addWidget(self.btn_reset_score_filter_progress)
-        score_progress_layout.addLayout(score_progress_row)
+        row.addWidget(self.btn_reset_score_filter_progress)
+        layout.addLayout(row)
 
         self.progress_score_filter_count = QProgressBar()
         self.progress_score_filter_count.setRange(0, 100)
         self.progress_score_filter_count.setValue(0)
         self.progress_score_filter_count.setFormat('就绪')
         self.progress_score_filter_count.setTextVisible(True)
-        score_progress_layout.addWidget(self.progress_score_filter_count)
-        score_filter_layout.addWidget(score_progress_group)
+        layout.addWidget(self.progress_score_filter_count)
+        return group
 
-        self.label_score_mode_note = QLabel(
+    def _create_score_filter_note_label(self) -> QLabel:
+        label = QLabel(
             '低于阈值的原图会在生成 Canny / Pose / Depth / BBox 前直接自动拒绝。'
             '若本地没有 JTP-3 / CLIP 缓存，首次运行可能仍需联网下载。'
         )
-        self.label_score_mode_note.setWordWrap(True)
-        self.label_score_mode_note.setStyleSheet('color: #999; font-size: 11px;')
-        score_filter_layout.addWidget(self.label_score_mode_note)
-        score_page_layout.addWidget(score_filter_group)
-        score_page_layout.addStretch()
-
-        self.processing_mode_stack.addWidget(controlnet_page)
-        self.processing_mode_stack.addWidget(score_page)
-        main_layout.addWidget(self.processing_mode_stack)
-
-        self._update_processing_mode_controls()
-        self._update_score_filter_controls()
-        self._refresh_score_filter_status()
-
-        return group
+        label.setWordWrap(True)
+        label.setStyleSheet('color: #999; font-size: 11px;')
+        return label
 
     def _build_score_filter_config(self) -> dict:
         device = str(self.combo_score_device.currentText() or 'auto').strip().lower()
@@ -2967,70 +3291,22 @@ class SettingsPanel(QWidget):
         waifu_exists = (not needs_waifu) or targets['waifu_head'].exists()
         jtp_exists = targets['jtp_model_py'].exists() and targets['jtp_weights'].exists()
 
-        installed_models = []
-        missing_models = []
-        checkpoint_item = {
-            'key': 'score_checkpoint',
-            'label': '评分模型 checkpoint',
-            'paths': [str(targets['checkpoint_path'])],
-            'installed_action': None,
-            'missing_action': '选择文件',
-        }
-        if checkpoint_exists:
-            installed_models.append(checkpoint_item)
-        else:
-            missing_models.append(checkpoint_item)
-        if needs_waifu:
-            waifu_item = {
-                'key': 'waifu_head',
-                'label': 'waifu scorer head',
-                'paths': [str(targets['waifu_head'])],
-                'installed_action': '卸载',
-                'missing_action': '下载',
-            }
-            if waifu_exists:
-                installed_models.append(waifu_item)
-            else:
-                missing_models.append(waifu_item)
-        if jtp_exists:
-            installed_models.append({
-                'key': 'jtp3_repo',
-                'label': 'JTP-3 本地仓库',
-                'paths': [str(targets['jtp_model_py']), str(targets['jtp_weights'])],
-                'installed_action': '卸载',
-                'missing_action': '下载',
-            })
-        else:
-            missing_models.append({
-                'key': 'jtp3_repo',
-                'label': 'JTP-3 本地仓库',
-                'paths': [str(targets['jtp_model_py']), str(targets['jtp_weights'])],
-                'installed_action': '卸载',
-                'missing_action': '下载',
-            })
+        installed_models, missing_models = self._build_score_model_lists(
+            targets,
+            checkpoint_exists,
+            needs_waifu,
+            waifu_exists,
+            jtp_exists,
+        )
 
         missing_dependencies = list(probe.get('missing_dependencies', []) or [])
-        status_lines = []
-        detailed_lines = []
-
-        if not probe.get('enabled', False):
-            status_lines.append('未启用')
-        else:
-            if missing_dependencies:
-                status_lines.append('缺少依赖: ' + ', '.join(missing_dependencies))
-                detailed_lines.append('缺少依赖: ' + ', '.join(missing_dependencies))
-            if not checkpoint_exists:
-                status_lines.append('缺少文件: 评分 checkpoint')
-                detailed_lines.append(f"评分 checkpoint: {targets['checkpoint_path']}")
-            if missing_models:
-                status_lines.append('缺少模型: ' + ', '.join(item['label'] for item in missing_models))
-                for item in missing_models:
-                    for model_path in item['paths']:
-                        detailed_lines.append(f"{item['label']}: {model_path}")
-            if not status_lines:
-                status_lines.append('已就绪')
-            if not detailed_lines:
-                detailed_lines.append('评分环境已就绪。')
+        status_lines, detailed_lines = self._build_score_environment_status_lines(
+            probe,
+            missing_dependencies,
+            checkpoint_exists,
+            targets,
+            missing_models,
+        )
 
         return {
             'targets': targets,
@@ -3046,13 +3322,115 @@ class SettingsPanel(QWidget):
             'can_open_model_manager': bool(installed_models or missing_models),
         }
 
+    def _build_score_model_lists(
+        self,
+        targets: dict,
+        checkpoint_exists: bool,
+        needs_waifu: bool,
+        waifu_exists: bool,
+        jtp_exists: bool,
+    ) -> tuple[list, list]:
+        installed_models = []
+        missing_models = []
+
+        checkpoint_item = {
+            'key': 'score_checkpoint',
+            'label': '评分模型 checkpoint',
+            'paths': [str(targets['checkpoint_path'])],
+            'installed_action': None,
+            'missing_action': '选择文件',
+        }
+        if checkpoint_exists:
+            installed_models.append(checkpoint_item)
+        else:
+            missing_models.append(checkpoint_item)
+
+        if needs_waifu:
+            waifu_item = {
+                'key': 'waifu_head',
+                'label': 'waifu scorer head',
+                'paths': [str(targets['waifu_head'])],
+                'installed_action': '卸载',
+                'missing_action': '下载',
+            }
+            if waifu_exists:
+                installed_models.append(waifu_item)
+            else:
+                missing_models.append(waifu_item)
+
+        jtp_item = {
+            'key': 'jtp3_repo',
+            'label': 'JTP-3 本地仓库',
+            'paths': [str(targets['jtp_model_py']), str(targets['jtp_weights'])],
+            'installed_action': '卸载',
+            'missing_action': '下载',
+        }
+        if jtp_exists:
+            installed_models.append(jtp_item)
+        else:
+            missing_models.append(jtp_item)
+        return installed_models, missing_models
+
+    def _build_score_environment_status_lines(
+        self,
+        probe: dict,
+        missing_dependencies: list,
+        checkpoint_exists: bool,
+        targets: dict,
+        missing_models: list,
+    ) -> tuple[list, list]:
+        status_lines = []
+        detailed_lines = []
+
+        if not probe.get('enabled', False):
+            status_lines.append('未启用')
+            return status_lines, detailed_lines
+
+        if missing_dependencies:
+            deps_text = ', '.join(missing_dependencies)
+            status_lines.append('缺少依赖: ' + deps_text)
+            detailed_lines.append('缺少依赖: ' + deps_text)
+
+        if not checkpoint_exists:
+            status_lines.append('缺少文件: 评分 checkpoint')
+            detailed_lines.append(f"评分 checkpoint: {targets['checkpoint_path']}")
+
+        if missing_models:
+            status_lines.append('缺少模型: ' + ', '.join(item['label'] for item in missing_models))
+            for item in missing_models:
+                for model_path in item['paths']:
+                    detailed_lines.append(f"{item['label']}: {model_path}")
+
+        if not status_lines:
+            status_lines.append('已就绪')
+        if not detailed_lines:
+            detailed_lines.append('评分环境已就绪。')
+        return status_lines, detailed_lines
+
     def _show_score_model_manager(self):
+        dialog, installed_layout, missing_layout, btn_refresh, btn_close = self._create_score_model_manager_dialog()
+
+        def refresh_view():
+            report = self._build_score_environment_report()
+            self._render_score_model_manager_lists(
+                installed_layout,
+                missing_layout,
+                report,
+                dialog,
+                refresh_view,
+            )
+
+        btn_refresh.clicked.connect(refresh_view)
+        btn_close.clicked.connect(dialog.accept)
+        refresh_view()
+        dialog.exec_()
+
+    def _create_score_model_manager_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle('评分模型管理')
         dialog.resize(760, 480)
 
         layout = QVBoxLayout(dialog)
-
         installed_group = QGroupBox('已安装模型')
         installed_layout = QVBoxLayout(installed_group)
         layout.addWidget(installed_group, 1)
@@ -3064,82 +3442,94 @@ class SettingsPanel(QWidget):
         button_row = QHBoxLayout()
         btn_refresh = QPushButton('刷新')
         btn_close = QPushButton('关闭')
-
         button_row.addWidget(btn_refresh)
         button_row.addStretch()
         button_row.addWidget(btn_close)
         layout.addLayout(button_row)
+        return dialog, installed_layout, missing_layout, btn_refresh, btn_close
 
-        def clear_layout(target_layout):
-            while target_layout.count():
-                item = target_layout.takeAt(0)
-                widget = item.widget()
-                child_layout = item.layout()
-                if widget is not None:
-                    widget.deleteLater()
-                elif child_layout is not None:
-                    clear_layout(child_layout)
+    def _clear_layout_recursive(self, target_layout):
+        while target_layout.count():
+            item = target_layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout_recursive(child_layout)
 
-        def build_model_row(item: dict, button_text: str = '', callback=None):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
+    def _build_score_model_row_widget(self, item: dict, button_text: str = '', callback=None) -> QWidget:
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
 
-            text_layout = QVBoxLayout()
-            title = QLabel(item['label'])
-            title.setStyleSheet('color: #ffffff; font-weight: bold;')
-            text_layout.addWidget(title)
-            for model_path in item.get('paths', []):
-                path_label = QLabel(model_path)
-                path_label.setWordWrap(True)
-                path_label.setStyleSheet('color: #999; font-size: 11px;')
-                text_layout.addWidget(path_label)
-            row_layout.addLayout(text_layout, 1)
+        text_layout = QVBoxLayout()
+        title = QLabel(item['label'])
+        title.setStyleSheet('color: #ffffff; font-weight: bold;')
+        text_layout.addWidget(title)
+        for model_path in item.get('paths', []):
+            path_label = QLabel(model_path)
+            path_label.setWordWrap(True)
+            path_label.setStyleSheet('color: #999; font-size: 11px;')
+            text_layout.addWidget(path_label)
+        row_layout.addLayout(text_layout, 1)
 
-            if button_text and callback is not None:
-                button = QPushButton(button_text)
-                button.clicked.connect(lambda _checked=False, key=item['key']: callback(key))
-                row_layout.addWidget(button)
-            return row
+        if button_text and callable(callback):
+            button = QPushButton(button_text)
+            button.clicked.connect(lambda _checked=False, key=item['key']: callback(key))
+            row_layout.addWidget(button)
+        return row
 
-        def refresh_view():
-            report = self._build_score_environment_report()
-            clear_layout(installed_layout)
-            clear_layout(missing_layout)
+    def _render_score_model_manager_lists(
+        self,
+        installed_layout,
+        missing_layout,
+        report: dict,
+        dialog: QDialog,
+        refresh_view,
+    ):
+        self._clear_layout_recursive(installed_layout)
+        self._clear_layout_recursive(missing_layout)
 
-            if report['installed_models']:
-                for item in report['installed_models']:
-                    installed_layout.addWidget(
-                        build_model_row(
-                            item,
-                            item.get('installed_action') or '',
-                            lambda key: self._uninstall_score_model_item(key, dialog, refresh_view)
-                        )
+        installed_models = list(report.get('installed_models') or [])
+        missing_models = list(report.get('missing_models') or [])
+
+        if installed_models:
+            for item in installed_models:
+                installed_layout.addWidget(
+                    self._build_score_model_row_widget(
+                        item,
+                        str(item.get('installed_action') or ''),
+                        lambda key, d=dialog, rf=refresh_view: self._uninstall_score_model_item(key, d, rf),
                     )
-            else:
-                installed_layout.addWidget(QLabel('当前没有已安装模型'))
+                )
+        else:
+            installed_layout.addWidget(QLabel('当前没有已安装模型'))
 
-            if report['missing_models']:
-                for item in report['missing_models']:
-                    action_text = str(item.get('missing_action') or '')
-                    action_callback = self._download_score_model_item
-                    if item.get('key') == 'score_checkpoint':
-                        action_callback = self._choose_score_checkpoint_file
-                    missing_layout.addWidget(
-                        build_model_row(
-                            item,
-                            action_text,
-                            lambda key, cb=action_callback: cb(key, dialog, refresh_view)
-                        )
+        if missing_models:
+            for item in missing_models:
+                key = str(item.get('key') or '')
+                if key == 'score_checkpoint':
+                    callback = lambda model_key, d=dialog, rf=refresh_view: self._choose_score_checkpoint_file(
+                        model_key,
+                        d,
+                        rf,
                     )
-            else:
-                missing_layout.addWidget(QLabel('当前没有缺失模型'))
-
-        btn_refresh.clicked.connect(refresh_view)
-        btn_close.clicked.connect(dialog.accept)
-
-        refresh_view()
-        dialog.exec_()
+                else:
+                    callback = lambda model_key, d=dialog, rf=refresh_view: self._download_score_model_item(
+                        model_key,
+                        d,
+                        rf,
+                    )
+                missing_layout.addWidget(
+                    self._build_score_model_row_widget(
+                        item,
+                        str(item.get('missing_action') or ''),
+                        callback,
+                    )
+                )
+        else:
+            missing_layout.addWidget(QLabel('当前没有缺失模型'))
 
     def _choose_score_checkpoint_file(self, model_key: str, parent_dialog=None, on_finished=None):
         if model_key != 'score_checkpoint':
@@ -3155,57 +3545,87 @@ class SettingsPanel(QWidget):
     def _download_score_model_item(self, model_key: str, parent_dialog=None, on_finished=None):
         import importlib.util
 
-        if importlib.util.find_spec('huggingface_hub') is None:
-            reply = QMessageBox.question(
-                parent_dialog or self,
-                '评分模型管理',
-                '当前缺少模型下载依赖 huggingface-hub。\n\n是否先安装评分依赖？',
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes
-            )
-            if reply == QMessageBox.Yes:
-                self._install_score_filter_dependencies(skip_confirm=True)
+        if not self._ensure_score_model_download_dependency(importlib.util, parent_dialog):
             return False
 
         report = self._build_score_environment_report()
-        item_map = {item['key']: item for item in report['missing_models']}
-        if model_key not in item_map:
-            QMessageBox.information(parent_dialog or self, '评分模型管理', '该模型当前不是缺失状态。')
+        item = self._resolve_missing_score_model_item(report, model_key, parent_dialog)
+        if item is None:
             return False
 
         targets = report['targets']
-        script_path = targets['prefetch_script']
-        if not script_path.exists():
-            QMessageBox.warning(
-                parent_dialog or self,
-                '评分模型管理',
-                f'未找到模型预取脚本:\n{script_path}'
-            )
+        script_path = self._resolve_score_prefetch_script(targets, parent_dialog)
+        if script_path is None:
             return False
 
+        if not self._confirm_score_model_download(model_key, item, parent_dialog):
+            return False
+
+        args = self._build_score_model_download_args(model_key, script_path, targets['cache_root'], parent_dialog)
+        if args is None:
+            return False
+        return self._run_score_model_download(model_key, args, parent_dialog, on_finished)
+
+    def _ensure_score_model_download_dependency(self, importlib_util, parent_dialog=None) -> bool:
+        if importlib_util.find_spec('huggingface_hub') is not None:
+            return True
+        reply = QMessageBox.question(
+            parent_dialog or self,
+            '评分模型管理',
+            '当前缺少模型下载依赖 huggingface-hub。\n\n是否先安装评分依赖？',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply == QMessageBox.Yes:
+            self._install_score_filter_dependencies(skip_confirm=True)
+        return False
+
+    def _resolve_missing_score_model_item(self, report: dict, model_key: str, parent_dialog=None):
+        item_map = {item['key']: item for item in report['missing_models']}
+        if model_key in item_map:
+            return item_map[model_key]
+        QMessageBox.information(parent_dialog or self, '评分模型管理', '该模型当前不是缺失状态。')
+        return None
+
+    def _resolve_score_prefetch_script(self, targets: dict, parent_dialog=None):
+        script_path = targets['prefetch_script']
+        if script_path.exists():
+            return script_path
+        QMessageBox.warning(
+            parent_dialog or self,
+            '评分模型管理',
+            f'未找到模型预取脚本:\n{script_path}'
+        )
+        return None
+
+    def _confirm_score_model_download(self, model_key: str, item: dict, parent_dialog=None) -> bool:
         reply = QMessageBox.question(
             parent_dialog or self,
             '评分模型管理',
             (
-                f"将下载模型:\n\n{item_map[model_key]['label']}\n\n"
+                f"将下载模型:\n\n{item['label']}\n\n"
                 + ('JTP-3 下载时会顺带预取 open-clip 缓存。\n\n' if model_key == 'jtp3_repo' else '')
                 + '是否继续？'
             ),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes
         )
-        if reply != QMessageBox.Yes:
-            return False
+        return reply == QMessageBox.Yes
 
-        args = ['-X', 'utf8', str(script_path), '--root', str(targets['cache_root'])]
+    def _build_score_model_download_args(
+        self, model_key: str, script_path, cache_root, parent_dialog=None
+    ):
+        args = ['-X', 'utf8', str(script_path), '--root', str(cache_root)]
         if model_key == 'waifu_head':
             args.extend(['--no-prefetch-jtp3', '--no-prefetch-openclip'])
-        elif model_key == 'jtp3_repo':
+            return args
+        if model_key == 'jtp3_repo':
             args.append('--no-prefetch-waifu-head')
-        else:
-            QMessageBox.warning(parent_dialog or self, '评分模型管理', f'暂不支持该模型类型: {model_key}')
-            return False
+            return args
+        QMessageBox.warning(parent_dialog or self, '评分模型管理', f'暂不支持该模型类型: {model_key}')
+        return None
 
+    def _run_score_model_download(self, model_key: str, args: list, parent_dialog=None, on_finished=None) -> bool:
         dialog = ProcessConsoleDialog(
             parent_dialog or self,
             '下载评分模型',
@@ -3539,6 +3959,19 @@ class SettingsPanel(QWidget):
             'bbox_conf_threshold',
             'bbox_iou_threshold',
             'bbox_person_only',
+            'bbox_target_part',
+            'bbox_use_specialized_channels',
+            'bbox_specialized_head_model',
+            'bbox_specialized_upper_body_model',
+            'bbox_specialized_lower_body_model',
+            'bbox_review_enabled',
+            'bbox_review_override_score',
+            'bbox_review_pass_threshold',
+            'bbox_review_fail_threshold',
+            'bbox_review_pose_enabled',
+            'bbox_review_pose_path',
+            'bbox_review_sam_enabled',
+            'bbox_review_sam_path',
             'parallel_threads',
             'auto_pass_no_review',
             'single_jsona',
@@ -3586,6 +4019,34 @@ class SettingsPanel(QWidget):
         )
 
     def _import_key_parameters(self):
+        raw_text = self._prompt_key_parameter_import_text()
+        if raw_text is None:
+            return
+
+        data = self._parse_key_parameter_payload(raw_text)
+        if data is None:
+            return
+
+        config = self._extract_key_parameter_config(data)
+        filtered_config = self._filter_allowed_key_parameters(config)
+        if not filtered_config:
+            QMessageBox.warning(self, '导入关键参数', '未找到可识别的关键参数字段。')
+            return
+
+        filtered_config, skipped_labels = self._strip_custom_path_model_params(filtered_config)
+        if not filtered_config:
+            QMessageBox.warning(
+                self,
+                '导入关键参数',
+                '导入内容只包含 Custom Path 模型选择，但关键参数不会携带机器路径。\n\n为避免导入后模型状态与路径不一致，本次未应用这些字段。'
+            )
+            return
+
+        self._apply_flat_settings(filtered_config)
+        self.save_settings(history_reason='import_key_params', force_history=True)
+        self._show_key_parameter_import_result(filtered_config, skipped_labels)
+
+    def _prompt_key_parameter_import_text(self):
         clipboard_text = QApplication.clipboard().text().strip()
         initial_text = clipboard_text if clipboard_text.startswith('{') else ''
         dialog = TextImportDialog(
@@ -3595,34 +4056,34 @@ class SettingsPanel(QWidget):
             parent=self,
         )
         if dialog.exec_() != QDialog.Accepted:
-            return
-
+            return None
         raw_text = dialog.get_text().strip()
-        if not raw_text:
-            QMessageBox.warning(self, '导入关键参数', '没有检测到可导入的内容。')
-            return
+        if raw_text:
+            return raw_text
+        QMessageBox.warning(self, '导入关键参数', '没有检测到可导入的内容。')
+        return None
 
+    def _parse_key_parameter_payload(self, raw_text: str):
         try:
             data = json.loads(raw_text)
-        except Exception as e:
-            QMessageBox.warning(self, '导入关键参数', f'JSON 解析失败:\n{e}')
-            return
+        except Exception as exc:
+            QMessageBox.warning(self, '导入关键参数', f'JSON 解析失败:\n{exc}')
+            return None
+        if isinstance(data, dict):
+            return data
+        QMessageBox.warning(self, '导入关键参数', '导入内容必须是 JSON 对象。')
+        return None
 
-        if not isinstance(data, dict):
-            QMessageBox.warning(self, '导入关键参数', '导入内容必须是 JSON 对象。')
-            return
-
+    def _extract_key_parameter_config(self, data: dict) -> dict:
         if 'params' in data and isinstance(data.get('params'), dict):
-            config = data.get('params', {})
-        else:
-            config = data
+            return data.get('params', {})
+        return data
 
+    def _filter_allowed_key_parameters(self, config: dict) -> dict:
         allowed_keys = set(self._get_shareable_setting_keys())
-        filtered_config = {key: value for key, value in config.items() if key in allowed_keys}
-        if not filtered_config:
-            QMessageBox.warning(self, '导入关键参数', '未找到可识别的关键参数字段。')
-            return
+        return {key: value for key, value in config.items() if key in allowed_keys}
 
+    def _strip_custom_path_model_params(self, filtered_config: dict):
         skipped_labels = []
         openpose_model = str(filtered_config.get('openpose_model', '') or '')
         if openpose_model == 'Custom Path':
@@ -3634,17 +4095,9 @@ class SettingsPanel(QWidget):
             filtered_config.pop('depth_model', None)
             skipped_labels.append('Depth 模型(Custom Path)')
 
-        if not filtered_config:
-            QMessageBox.warning(
-                self,
-                '导入关键参数',
-                '导入内容只包含 Custom Path 模型选择，但关键参数不会携带机器路径。\n\n为避免导入后模型状态与路径不一致，本次未应用这些字段。'
-            )
-            return
+        return filtered_config, skipped_labels
 
-        self._apply_flat_settings(filtered_config)
-        self.save_settings(history_reason='import_key_params', force_history=True)
-
+    def _show_key_parameter_import_result(self, filtered_config: dict, skipped_labels: list):
         field_labels = self._get_settings_field_labels()
         changed_labels = [field_labels.get(key, key) for key in filtered_config.keys()]
         preview = '、'.join(changed_labels[:6])
@@ -3945,15 +4398,20 @@ class SettingsPanel(QWidget):
         self.combo_bbox_model.setEnabled(checked)
         self.spin_bbox_conf.setEnabled(checked)
         self.spin_bbox_iou.setEnabled(checked)
-        self.check_bbox_person_only.setEnabled(checked)
+        self.combo_bbox_target_part.setEnabled(checked)
+        self.check_bbox_specialized_channels.setEnabled(checked)
         if checked:
             self._on_bbox_model_changed()
+            self._on_bbox_target_part_changed()
         else:
             self.edit_bbox_path.setEnabled(False)
             self.btn_browse_bbox.setEnabled(False)
             self.edit_bbox_path.setVisible(False)
             self.btn_browse_bbox.setVisible(False)
-            self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+            self.check_bbox_person_only.setEnabled(False)
+        self._update_bbox_specialized_controls()
+        self._update_bbox_review_controls()
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
 
     def _on_bbox_model_changed(self):
         """Handle BBox model selection change."""
@@ -3963,6 +4421,60 @@ class SettingsPanel(QWidget):
         self.edit_bbox_path.setVisible(is_custom)
         self.btn_browse_bbox.setVisible(is_custom)
         self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_target_part_changed(self):
+        target_part = self._collect_bbox_target_part_key()
+        if target_part != 'person' and not self.check_bbox_person_only.isChecked():
+            self.check_bbox_person_only.setChecked(True)
+        allow_person_toggle = self.check_bbox.isChecked() and target_part == 'person'
+        self.check_bbox_person_only.setEnabled(allow_person_toggle)
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_specialized_channels_toggled(self, _checked=False):
+        self._update_bbox_specialized_controls()
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_review_enabled_toggled(self, _checked=False):
+        self._update_bbox_review_controls()
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_review_pose_toggled(self, _checked=False):
+        self._update_bbox_review_controls()
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _on_bbox_review_sam_toggled(self, _checked=False):
+        self._update_bbox_review_controls()
+        self._shrink_stack_to_current_page(getattr(self, 'processing_mode_stack', None))
+
+    def _update_bbox_specialized_controls(self):
+        enabled = self.check_bbox.isChecked() and self.check_bbox_specialized_channels.isChecked()
+        for widget in [
+            getattr(self, 'edit_bbox_specialized_head_path', None),
+            getattr(self, 'btn_browse_bbox_specialized_head', None),
+            getattr(self, 'edit_bbox_specialized_upper_path', None),
+            getattr(self, 'btn_browse_bbox_specialized_upper', None),
+            getattr(self, 'edit_bbox_specialized_lower_path', None),
+            getattr(self, 'btn_browse_bbox_specialized_lower', None),
+        ]:
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _update_bbox_review_controls(self):
+        bbox_enabled = self.check_bbox.isChecked()
+        review_enabled = bbox_enabled and self.check_bbox_review_enabled.isChecked()
+        pose_enabled = review_enabled and self.check_bbox_review_pose_enabled.isChecked()
+        sam_enabled = review_enabled and self.check_bbox_review_sam_enabled.isChecked()
+
+        self.check_bbox_review_enabled.setEnabled(bbox_enabled)
+        self.check_bbox_review_override_score.setEnabled(review_enabled)
+        self.spin_bbox_review_pass.setEnabled(review_enabled)
+        self.spin_bbox_review_fail.setEnabled(review_enabled)
+        self.check_bbox_review_pose_enabled.setEnabled(review_enabled)
+        self.check_bbox_review_sam_enabled.setEnabled(review_enabled)
+        self.edit_bbox_review_pose_path.setEnabled(pose_enabled)
+        self.btn_browse_bbox_review_pose.setEnabled(pose_enabled)
+        self.edit_bbox_review_sam_path.setEnabled(sam_enabled)
+        self.btn_browse_bbox_review_sam.setEnabled(sam_enabled)
 
     def _check_torch_availability(self):
         """Check if torch is available and update UI accordingly"""
@@ -4003,9 +4515,41 @@ class SettingsPanel(QWidget):
             self.spin_bbox_conf.setEnabled(False)
             self.spin_bbox_iou.setEnabled(False)
             self.check_bbox_person_only.setEnabled(False)
+            self.combo_bbox_target_part.setEnabled(False)
+            self.check_bbox_specialized_channels.setEnabled(False)
+            self.edit_bbox_specialized_head_path.setEnabled(False)
+            self.btn_browse_bbox_specialized_head.setEnabled(False)
+            self.edit_bbox_specialized_upper_path.setEnabled(False)
+            self.btn_browse_bbox_specialized_upper.setEnabled(False)
+            self.edit_bbox_specialized_lower_path.setEnabled(False)
+            self.btn_browse_bbox_specialized_lower.setEnabled(False)
+            self.check_bbox_review_enabled.setEnabled(False)
+            self.check_bbox_review_override_score.setEnabled(False)
+            self.spin_bbox_review_pass.setEnabled(False)
+            self.spin_bbox_review_fail.setEnabled(False)
+            self.check_bbox_review_pose_enabled.setEnabled(False)
+            self.edit_bbox_review_pose_path.setEnabled(False)
+            self.btn_browse_bbox_review_pose.setEnabled(False)
+            self.check_bbox_review_sam_enabled.setEnabled(False)
+            self.edit_bbox_review_sam_path.setEnabled(False)
+            self.btn_browse_bbox_review_sam.setEnabled(False)
             self._apply_blur_effect(self.combo_bbox_model)
             self._apply_blur_effect(self.edit_bbox_path)
             self._apply_blur_effect(self.btn_browse_bbox)
+            self._apply_blur_effect(self.combo_bbox_target_part)
+            self._apply_blur_effect(self.check_bbox_specialized_channels)
+            self._apply_blur_effect(self.edit_bbox_specialized_head_path)
+            self._apply_blur_effect(self.btn_browse_bbox_specialized_head)
+            self._apply_blur_effect(self.edit_bbox_specialized_upper_path)
+            self._apply_blur_effect(self.btn_browse_bbox_specialized_upper)
+            self._apply_blur_effect(self.edit_bbox_specialized_lower_path)
+            self._apply_blur_effect(self.btn_browse_bbox_specialized_lower)
+            self._apply_blur_effect(self.check_bbox_review_enabled)
+            self._apply_blur_effect(self.check_bbox_review_override_score)
+            self._apply_blur_effect(self.edit_bbox_review_pose_path)
+            self._apply_blur_effect(self.btn_browse_bbox_review_pose)
+            self._apply_blur_effect(self.edit_bbox_review_sam_path)
+            self._apply_blur_effect(self.btn_browse_bbox_review_sam)
         else:
             # Hide install buttons
             self.btn_install_torch_openpose.setVisible(False)
@@ -4024,10 +4568,8 @@ class SettingsPanel(QWidget):
 
     def _download_model_files(self, download_urls, model_type):
         """Download model files with progress dialog"""
-        from PyQt5.QtWidgets import QProgressDialog, QMessageBox
         from PyQt5.QtCore import QThread, pyqtSignal
         import urllib.request
-        import os
 
         class DownloadThread(QThread):
             progress = pyqtSignal(str, int, int)  # filename, downloaded, total
@@ -4052,7 +4594,34 @@ class SettingsPanel(QWidget):
                 except Exception as e:
                     self.finished.emit(False, str(e))
 
-        # Create progress dialog
+        progress_dialog = self._create_model_download_progress_dialog()
+        download_thread = DownloadThread(download_urls)
+        self._active_model_download_thread = download_thread
+
+        download_thread.progress.connect(
+            lambda filename, downloaded, total: self._update_model_download_progress(
+                progress_dialog,
+                filename,
+                downloaded,
+                total,
+            )
+        )
+        download_thread.finished.connect(
+            lambda success, error_msg: self._finish_model_download(
+                progress_dialog,
+                success,
+                error_msg,
+                model_type,
+            )
+        )
+        download_thread.start()
+
+        progress_dialog.exec_()
+        self._install_vitpose_dependencies_via_main_window()
+
+    def _create_model_download_progress_dialog(self):
+        from PyQt5.QtWidgets import QProgressDialog
+
         progress_dialog = QProgressDialog(self)
         progress_dialog.setWindowTitle("下载模型文件")
         progress_dialog.setLabelText("准备下载...")
@@ -4061,52 +4630,40 @@ class SettingsPanel(QWidget):
         progress_dialog.setWindowModality(Qt.WindowModal)
         progress_dialog.setCancelButton(None)
         progress_dialog.setAutoClose(False)
+        return progress_dialog
 
-        # Create and start download thread
-        download_thread = DownloadThread(download_urls)
+    def _update_model_download_progress(self, progress_dialog, filename: str, downloaded: int, total: int):
+        if total > 0:
+            percent = int((downloaded / total) * 100)
+            progress_dialog.setValue(percent)
+            size_mb = downloaded / (1024 * 1024)
+            total_mb = total / (1024 * 1024)
+            progress_dialog.setLabelText(f"下载 {filename}\n{size_mb:.1f} MB / {total_mb:.1f} MB ({percent}%)")
+        else:
+            progress_dialog.setLabelText(f"下载 {filename}\n正在连接...")
 
-        # Store reference to self for nested functions
-        parent_widget = self
+    def _finish_model_download(self, progress_dialog, success: bool, error_msg: str, model_type: str):
+        progress_dialog.close()
+        self._active_model_download_thread = None
+        if success:
+            QMessageBox.information(
+                self,
+                "下载完成",
+                f"模型文件下载成功！\n\n现在可以使用 {model_type} 模型了。",
+            )
+            return
+        QMessageBox.critical(
+            self,
+            "下载失败",
+            f"模型文件下载失败:\n\n{error_msg}\n\n请检查网络连接或手动下载。",
+        )
+        self.combo_openpose_model.blockSignals(True)
+        self.combo_openpose_model.setCurrentText('DWpose (Default) (推荐10系20系老卡使用)')
+        self.combo_openpose_model.blockSignals(False)
 
-        def update_progress(filename, downloaded, total):
-            if total > 0:
-                percent = int((downloaded / total) * 100)
-                progress_dialog.setValue(percent)
-                size_mb = downloaded / (1024 * 1024)
-                total_mb = total / (1024 * 1024)
-                progress_dialog.setLabelText(f"下载 {filename}\n{size_mb:.1f} MB / {total_mb:.1f} MB ({percent}%)")
-            else:
-                progress_dialog.setLabelText(f"下载 {filename}\n正在连接...")
-
-        def download_finished(success, error_msg):
-            progress_dialog.close()
-            if success:
-                QMessageBox.information(
-                    parent_widget,
-                    "下载完成",
-                    f"模型文件下载成功！\n\n现在可以使用 {model_type} 模型了。"
-                )
-            else:
-                QMessageBox.critical(
-                    parent_widget,
-                    "下载失败",
-                    f"模型文件下载失败:\n\n{error_msg}\n\n请检查网络连接或手动下载。"
-                )
-                # Revert to DWpose
-                parent_widget.combo_openpose_model.blockSignals(True)
-                parent_widget.combo_openpose_model.setCurrentText('DWpose (Default) (推荐10系20系老卡使用)')
-                parent_widget.combo_openpose_model.blockSignals(False)
-
-        download_thread.progress.connect(update_progress)
-        download_thread.finished.connect(download_finished)
-        download_thread.start()
-
-        progress_dialog.exec_()
-        """Install ViTPose/SDPose-Wholebody dependencies"""
-        # Get main window to use its InstallProgressDialog
+    def _install_vitpose_dependencies_via_main_window(self):
         main_window = self.window()
         if not hasattr(main_window, '_run_pip_install'):
-            from PyQt5.QtWidgets import QMessageBox
             QMessageBox.critical(
                 self,
                 "错误",
@@ -4120,80 +4677,100 @@ class SettingsPanel(QWidget):
 
     def _check_vitpose_model_files(self, model_type):
         """Check if ViTPose model files exist"""
-        import os
+        yolo_dir, vitpose_dir = self._ensure_vitpose_model_dirs()
+        yolo_file, yolo_url, yolo_model_type = self._resolve_yolo_model_target(yolo_dir)
+        vitpose_file, vitpose_url = self._resolve_vitpose_model_target(model_type, vitpose_dir)
+        missing_files, download_urls = self._collect_missing_vitpose_targets(
+            yolo_file, yolo_url, vitpose_file, vitpose_url
+        )
+        if not missing_files:
+            return
 
-        # Create models directory structure
+        if self._confirm_vitpose_model_download(model_type, missing_files, yolo_model_type, yolo_file, vitpose_file):
+            self._download_model_files(download_urls, model_type)
+            return
+        self._revert_openpose_model_to_default()
+
+    def _ensure_vitpose_model_dirs(self):
         models_dir = 'models'
         yolo_dir = os.path.join(models_dir, 'yolo')
         vitpose_dir = os.path.join(models_dir, 'vitpose')
         os.makedirs(yolo_dir, exist_ok=True)
         os.makedirs(vitpose_dir, exist_ok=True)
+        return yolo_dir, vitpose_dir
 
-        # Get YOLO model filename based on version and type
+    def _resolve_yolo_model_target(self, yolo_dir: str):
         yolo_model_type = self.combo_yolo_model_type.currentText()
         yolo_version = self.combo_yolo_version.currentText()
-
         if '动漫专用' in yolo_model_type:
-            # Use anime person detection model
             yolo_file = os.path.join(yolo_dir, 'anime_person_detect_v1.3_s.pt')
             yolo_url = 'https://huggingface.co/deepghs/anime_person_detection/resolve/main/person_detect_v1.3_s/model.pt'
-        elif 'YOLO26' in yolo_version:
+            return yolo_file, yolo_url, yolo_model_type
+        if 'YOLO26' in yolo_version:
             yolo_file = os.path.join(yolo_dir, 'yolo26n.pt')
             yolo_url = 'https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt'
-        elif 'YOLOv11' in yolo_version:
+            return yolo_file, yolo_url, yolo_model_type
+        if 'YOLOv11' in yolo_version:
             yolo_file = os.path.join(yolo_dir, 'yolo11n.pt')
             yolo_url = 'https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt'
-        else:  # YOLOv8
-            yolo_file = os.path.join(yolo_dir, 'yolov8n.pt')
-            yolo_url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
+            return yolo_file, yolo_url, yolo_model_type
+        yolo_file = os.path.join(yolo_dir, 'yolov8n.pt')
+        yolo_url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
+        return yolo_file, yolo_url, yolo_model_type
 
-        # Different ViTPose models for different tasks
+    def _resolve_vitpose_model_target(self, model_type: str, vitpose_dir: str):
         if model_type == 'SDPose-Wholebody':
             vitpose_file = os.path.join(vitpose_dir, 'vitpose-l-wholebody.onnx')
             vitpose_url = 'https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/wholebody/vitpose-l-wholebody.onnx'
-        else:  # ViTPose
-            vitpose_file = os.path.join(vitpose_dir, 'vitpose-l-coco.onnx')
-            vitpose_url = 'https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/coco/vitpose-l-coco.onnx'
+            return vitpose_file, vitpose_url
+        vitpose_file = os.path.join(vitpose_dir, 'vitpose-l-coco.onnx')
+        vitpose_url = 'https://huggingface.co/JunkyByte/easy_ViTPose/resolve/main/onnx/coco/vitpose-l-coco.onnx'
+        return vitpose_file, vitpose_url
 
-        yolo_exists = os.path.exists(yolo_file)
-        vitpose_exists = os.path.exists(vitpose_file)
+    def _collect_missing_vitpose_targets(
+        self, yolo_file: str, yolo_url: str, vitpose_file: str, vitpose_url: str
+    ):
+        missing_files = []
+        download_urls = []
+        if not os.path.exists(yolo_file):
+            missing_files.append(yolo_file)
+            download_urls.append((yolo_file, yolo_url))
+        if not os.path.exists(vitpose_file):
+            missing_files.append(vitpose_file)
+            download_urls.append((vitpose_file, vitpose_url))
+        return missing_files, download_urls
 
-        if not yolo_exists or not vitpose_exists:
-            missing_files = []
-            download_urls = []
+    def _confirm_vitpose_model_download(
+        self, model_type: str, missing_files: list, yolo_model_type: str, yolo_file: str, vitpose_file: str
+    ) -> bool:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("缺少模型文件")
+        msg.setText(f"使用 {model_type} 需要以下模型文件:\n\n" + "\n".join(f"  • {file}" for file in missing_files))
+        msg.setInformativeText(
+            f"是否自动下载这些文件?{self._format_missing_vitpose_size_text(missing_files, yolo_model_type, yolo_file, vitpose_file)}\n\n下载完成后会保存到程序根目录。"
+        )
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        return msg.exec_() == QMessageBox.Yes
 
-            if not yolo_exists:
-                missing_files.append(yolo_file)
-                download_urls.append((yolo_file, yolo_url))
-            if not vitpose_exists:
-                missing_files.append(vitpose_file)
-                download_urls.append((vitpose_file, vitpose_url))
-
-            msg = QMessageBox(self)
-            msg.setIcon(QMessageBox.Question)
-            msg.setWindowTitle("缺少模型文件")
-            msg.setText(f"使用 {model_type} 需要以下模型文件:\n\n" + "\n".join(f"  • {f}" for f in missing_files))
-
-            file_sizes = ""
-            if not yolo_exists:
-                if '动漫专用' in yolo_model_type:
-                    file_sizes += f"\n{yolo_file}: ~22.5 MB"
-                else:
-                    file_sizes += f"\n{yolo_file}: ~6 MB"
-            if not vitpose_exists:
-                file_sizes += f"\n{vitpose_file}: ~1.23 GB"
-
-            msg.setInformativeText(f"是否自动下载这些文件?{file_sizes}\n\n下载完成后会保存到程序根目录。")
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            msg.setDefaultButton(QMessageBox.Yes)
-
-            if msg.exec_() == QMessageBox.Yes:
-                self._download_model_files(download_urls, model_type)
+    def _format_missing_vitpose_size_text(
+        self, missing_files: list, yolo_model_type: str, yolo_file: str, vitpose_file: str
+    ) -> str:
+        file_sizes = ""
+        if yolo_file in missing_files:
+            if '动漫专用' in yolo_model_type:
+                file_sizes += f"\n{yolo_file}: ~22.5 MB"
             else:
-                # Revert to DWpose
-                self.combo_openpose_model.blockSignals(True)
-                self.combo_openpose_model.setCurrentText('DWpose (Default)')
-                self.combo_openpose_model.blockSignals(False)
+                file_sizes += f"\n{yolo_file}: ~6 MB"
+        if vitpose_file in missing_files:
+            file_sizes += f"\n{vitpose_file}: ~1.23 GB"
+        return file_sizes
+
+    def _revert_openpose_model_to_default(self):
+        self.combo_openpose_model.blockSignals(True)
+        self.combo_openpose_model.setCurrentText('DWpose (Default)')
+        self.combo_openpose_model.blockSignals(False)
 
     def _on_reset_progress(self):
         """Handle reset progress button click"""
@@ -4495,21 +5072,36 @@ class SettingsPanel(QWidget):
         if directory:
             line_edit.setText(directory)
 
-    def _browse_bbox_model_file(self):
-        """Browse for BBox model file."""
+    def _browse_bbox_model_file_to_line_edit(self, line_edit: QLineEdit, title: str):
         path, _ = QFileDialog.getOpenFileName(
             self,
-            '选择 BBox 模型文件',
-            self.edit_bbox_path.text() or self.edit_output_dir.text() or '.',
+            title,
+            line_edit.text() or self.edit_output_dir.text() or '.',
             'Model Files (*.pt *.onnx);;All Files (*.*)'
         )
         if path:
-            self.edit_bbox_path.setText(path)
+            line_edit.setText(path)
 
-    def _load_config(self):
-        """Load configuration"""
-        # Data source
-        data_source = self.config.get('data_source', {})
+    def _browse_bbox_model_file(self):
+        """Browse for main BBox model file."""
+        self._browse_bbox_model_file_to_line_edit(self.edit_bbox_path, '选择 BBox 模型文件')
+
+    def _browse_bbox_specialized_model_file(self, line_edit: QLineEdit, part_key: str):
+        part_labels = {
+            'head': '头部',
+            'upper_body': '上半身',
+            'lower_body': '下半身',
+        }
+        part_label = part_labels.get(str(part_key or '').strip(), '专用')
+        self._browse_bbox_model_file_to_line_edit(line_edit, f'选择 {part_label} 专用模型文件')
+
+    def _browse_bbox_review_pose_model_file(self):
+        self._browse_bbox_model_file_to_line_edit(self.edit_bbox_review_pose_path, '选择 BBox Pose 复核模型文件')
+
+    def _browse_bbox_review_sam_model_file(self):
+        self._browse_bbox_model_file_to_line_edit(self.edit_bbox_review_sam_path, '选择 BBox SAM 复核模型文件')
+
+    def _load_data_source_config(self, data_source: dict):
         source_type = data_source.get('type', 'local_parquet')
 
         if source_type == 'local_parquet':
@@ -4521,27 +5113,21 @@ class SettingsPanel(QWidget):
                 self.list_parquet_files.addItem(file)
             self.edit_extract_dir.setText(local_config.get('extract_dir', './extracted'))
             self.spin_local_samples.setValue(local_config.get('num_samples', 0))
-        else:
-            self.combo_source_type.setCurrentText(tr('streaming_dataset'))
-            streaming_config = data_source.get('streaming', {})
-            self.edit_dataset_id.setText(streaming_config.get('dataset_id', ''))
-            self.edit_split.setText(streaming_config.get('split', 'train'))
-            self.edit_hf_token.setText(streaming_config.get('hf_token', '') or '')
-            self.spin_num_samples.setValue(streaming_config.get('num_samples', 10000))
-            self.edit_streaming_extract_dir.setText(streaming_config.get('extract_dir', './extracted'))
+            return
 
-        # Processing
-        processing = self.config.get('processing', {})
-        self.spin_processing_threads.setValue(processing.get('thread_count', 1))
-        self.spin_preload_count.setValue(processing.get('preload_count', 15))
-        self._set_processing_mode(processing.get('mode', 'controlnet'))
+        self.combo_source_type.setCurrentText(tr('streaming_dataset'))
+        streaming_config = data_source.get('streaming', {})
+        self.edit_dataset_id.setText(streaming_config.get('dataset_id', ''))
+        self.edit_split.setText(streaming_config.get('split', 'train'))
+        self.edit_hf_token.setText(streaming_config.get('hf_token', '') or '')
+        self.spin_num_samples.setValue(streaming_config.get('num_samples', 10000))
+        self.edit_streaming_extract_dir.setText(streaming_config.get('extract_dir', './extracted'))
 
-        # Quality profile
-        scoring = self.config.get('scoring', {})
+    def _load_quality_profile_config(self, scoring: dict):
         active_profile = scoring.get('active_profile', 'general')
         if active_profile not in ['general', 'anime']:
             active_profile = 'general'
-        self.combo_quality_profile.setCurrentText(active_profile)
+        self.combo_quality_profile.setCurrentText(tr('anime') if active_profile == 'anime' else tr('general'))
 
         # Load thresholds from active profile
         profiles = scoring.get('profiles', {})
@@ -4549,17 +5135,10 @@ class SettingsPanel(QWidget):
         default_accept = int(profile.get('auto_accept', 55))
         default_reject = int(profile.get('auto_reject', 40))
 
-        # Load per-control-type thresholds, fallback to default if not set
-        self.spin_canny_accept.setValue(int(profile.get('canny_auto_accept', default_accept)))
-        self.spin_canny_reject.setValue(int(profile.get('canny_auto_reject', default_reject)))
-        self.spin_pose_accept.setValue(int(profile.get('pose_auto_accept', default_accept)))
-        self.spin_pose_reject.setValue(int(profile.get('pose_auto_reject', default_reject)))
-        self.spin_depth_accept.setValue(int(profile.get('depth_auto_accept', default_accept)))
-        self.spin_depth_reject.setValue(int(profile.get('depth_auto_reject', default_reject)))
-        self.spin_bbox_accept.setValue(int(profile.get('bbox_auto_accept', default_accept)))
-        self.spin_bbox_reject.setValue(int(profile.get('bbox_auto_reject', default_reject)))
+        # Load per-control-type thresholds, fallback to default if not set.
+        self._apply_profile_thresholds(profile, default_accept, default_reject)
 
-        prefilter = self.config.get('prefilter', {})
+    def _load_score_filter_from_config(self, prefilter: dict, processing: dict):
         score_filter = FusionScoreFilter.normalize_config(prefilter.get('score_filter', {}))
         self.check_score_filter_enabled.setChecked(bool(score_filter.get('enabled', False)))
         self.edit_score_checkpoint_path.setText(
@@ -4576,6 +5155,7 @@ class SettingsPanel(QWidget):
         self._refresh_score_filter_status()
         self._schedule_score_filter_progress_count_refresh()
 
+    def _load_control_types_and_model_config(self, processing: dict):
         # Control types (nested under processing)
         control_types = processing.get('control_types', {})
         self.check_canny.setChecked(control_types.get('canny', True))
@@ -4590,6 +5170,37 @@ class SettingsPanel(QWidget):
         self.spin_bbox_conf.setValue(float(bbox_config.get('conf_threshold', 0.25)))
         self.spin_bbox_iou.setValue(float(bbox_config.get('iou_threshold', 0.45)))
         self.check_bbox_person_only.setChecked(bool(bbox_config.get('person_only', True)))
+        self.combo_bbox_target_part.setCurrentText(
+            self._bbox_target_part_from_key(str(bbox_config.get('target_part', 'person')))
+        )
+        self.check_bbox_specialized_channels.setChecked(bool(bbox_config.get('use_specialized_channels', False)))
+        specialized_models = bbox_config.get('specialized_models', {}) if isinstance(bbox_config, dict) else {}
+        if not isinstance(specialized_models, dict):
+            specialized_models = {}
+        self.edit_bbox_specialized_head_path.setText(str(specialized_models.get('head', '') or ''))
+        self.edit_bbox_specialized_upper_path.setText(str(specialized_models.get('upper_body', '') or ''))
+        self.edit_bbox_specialized_lower_path.setText(str(specialized_models.get('lower_body', '') or ''))
+        review_config = bbox_config.get('review', {}) if isinstance(bbox_config, dict) else {}
+        if not isinstance(review_config, dict):
+            review_config = {}
+        self.check_bbox_review_enabled.setChecked(bool(review_config.get('enabled', False)))
+        self.check_bbox_review_override_score.setChecked(bool(review_config.get('override_score', False)))
+        self.spin_bbox_review_pass.setValue(float(review_config.get('pass_threshold', 0.72)))
+        self.spin_bbox_review_fail.setValue(float(review_config.get('fail_threshold', 0.45)))
+        pose_review = review_config.get('pose', {}) if isinstance(review_config, dict) else {}
+        if not isinstance(pose_review, dict):
+            pose_review = {}
+        self.check_bbox_review_pose_enabled.setChecked(bool(pose_review.get('enabled', False)))
+        self.edit_bbox_review_pose_path.setText(
+            str(pose_review.get('vitpose_path', 'models/vitpose/vitpose-l-wholebody.onnx') or '')
+        )
+        sam_review = review_config.get('sam', {}) if isinstance(review_config, dict) else {}
+        if not isinstance(sam_review, dict):
+            sam_review = {}
+        self.check_bbox_review_sam_enabled.setChecked(bool(sam_review.get('enabled', False)))
+        self.edit_bbox_review_sam_path.setText(str(sam_review.get('model_path', 'models/sam/sam2_b.pt') or ''))
+        self._update_bbox_specialized_controls()
+        self._update_bbox_review_controls()
 
         # Retry strategy (nested under processing)
         retry_config = processing.get('retry_strategy', {})
@@ -4601,6 +5212,8 @@ class SettingsPanel(QWidget):
         self.spin_jsona_backup_every_entries.setValue(processing.get('jsona_backup_every_entries', 200))
         self.spin_jsona_backup_every_seconds.setValue(processing.get('jsona_backup_every_seconds', 600))
         self.spin_jsona_backup_keep.setValue(processing.get('jsona_backup_keep', 10))
+
+    def _load_xml_mapping_from_config(self, processing: dict):
         xml_mapping = processing.get('xml_mapping', {})
         self.edit_xml_template_path.setText(str(xml_mapping.get('template_path', '') or ''))
         if self.edit_xml_template_path.text().strip():
@@ -4616,13 +5229,11 @@ class SettingsPanel(QWidget):
         self.spin_xml_character2_tag_index.setValue(int(xml_mapping.get('character_2_tag_index', 3) or 3))
         self._load_xml_custom_mappings(xml_mapping.get('custom_mappings', []))
 
-        # Custom tags
-        custom_tags = self.config.get('custom_tags', {})
+    def _load_custom_tags_from_config(self, custom_tags: dict):
         self.check_append_tags.setChecked(custom_tags.get('enabled', False))
         self.edit_custom_tags.setPlainText(custom_tags.get('tags', ''))
 
-        # Output
-        output = self.config.get('output', {})
+    def _load_output_from_config(self, output: dict):
         self.edit_output_dir.setText(output.get('base_dir', './output'))
         discard_action = output.get('discard_action', 'trash')
         if discard_action == 'delete':
@@ -4630,9 +5241,37 @@ class SettingsPanel(QWidget):
         else:
             self.combo_discard_action.setCurrentText(tr('move_to_trash'))
 
-    def get_settings(self) -> dict:
-        """Get current settings"""
-        settings = {
+    def _load_config(self):
+        """Load configuration"""
+        # Data source
+        data_source = self.config.get('data_source', {})
+        self._load_data_source_config(data_source)
+
+        # Processing
+        processing = self.config.get('processing', {})
+        self.spin_processing_threads.setValue(processing.get('thread_count', 1))
+        self.spin_preload_count.setValue(processing.get('preload_count', 15))
+        self._set_processing_mode(processing.get('mode', 'controlnet'))
+
+        # Quality profile
+        scoring = self.config.get('scoring', {})
+        self._load_quality_profile_config(scoring)
+
+        prefilter = self.config.get('prefilter', {})
+        self._load_score_filter_from_config(prefilter, processing)
+        self._load_control_types_and_model_config(processing)
+        self._load_xml_mapping_from_config(processing)
+
+        # Custom tags
+        custom_tags = self.config.get('custom_tags', {})
+        self._load_custom_tags_from_config(custom_tags)
+
+        # Output
+        output = self.config.get('output', {})
+        self._load_output_from_config(output)
+
+    def _build_base_settings(self) -> dict:
+        return {
             'data_source': {},
             'processing': {},
             'vlm': {},
@@ -4644,32 +5283,33 @@ class SettingsPanel(QWidget):
             'scoring': self.config.get('scoring', {})
         }
 
-        # Data source
+    def _build_data_source_settings(self) -> dict:
         if self.combo_source_type.currentText() == tr('local_parquet'):
-            parquet_files = [self.list_parquet_files.item(i).text()
-                           for i in range(self.list_parquet_files.count())]
-            settings['data_source'] = {
+            return {
                 'type': 'local_parquet',
                 'local_parquet': {
-                    'parquet_files': parquet_files,
+                    'parquet_files': self._collect_local_parquet_files(),
                     'extract_dir': self.edit_extract_dir.text(),
                     'num_samples': self.spin_local_samples.value()
                 }
             }
-        else:
-            settings['data_source'] = {
-                'type': 'streaming',
-                'streaming': {
-                    'dataset_id': self.edit_dataset_id.text(),
-                    'split': self.edit_split.text(),
-                    'hf_token': self.edit_hf_token.text() or None,
-                    'num_samples': self.spin_num_samples.value(),
-                    'extract_dir': self.edit_streaming_extract_dir.text()
-                }
-            }
 
-        # Processing
-        settings['processing'] = {
+        return {
+            'type': 'streaming',
+            'streaming': {
+                'dataset_id': self.edit_dataset_id.text(),
+                'split': self.edit_split.text(),
+                'hf_token': self.edit_hf_token.text() or None,
+                'num_samples': self.spin_num_samples.value(),
+                'extract_dir': self.edit_streaming_extract_dir.text()
+            }
+        }
+
+    def _build_processing_settings(self) -> dict:
+        openpose_model_type = self._get_openpose_model_type()
+        depth_model_type = self.combo_depth_model.currentText()
+        bbox_model_type = self.combo_bbox_model.currentText()
+        return {
             'use_custom_dir': self.radio_use_custom_dir.isChecked(),
             'custom_input_dir': self.edit_custom_input_dir.text(),
             'thread_count': self.spin_processing_threads.value(),
@@ -4683,22 +5323,43 @@ class SettingsPanel(QWidget):
             },
             'model_config': {
                 'openpose': {
-                    'type': self._get_openpose_model_type(),
-                    'yolo_version': self.combo_yolo_version.currentText() if self._get_openpose_model_type() in ['ViTPose', 'SDPose-Wholebody'] else None,
-                    'yolo_model_type': self.combo_yolo_model_type.currentText() if self._get_openpose_model_type() in ['ViTPose', 'SDPose-Wholebody'] else None,
-                    'custom_path': self.edit_openpose_path.text() if self._get_openpose_model_type() == 'Custom Path' else None
+                    'type': openpose_model_type,
+                    'yolo_version': self.combo_yolo_version.currentText() if openpose_model_type in ['ViTPose', 'SDPose-Wholebody'] else None,
+                    'yolo_model_type': self.combo_yolo_model_type.currentText() if openpose_model_type in ['ViTPose', 'SDPose-Wholebody'] else None,
+                    'custom_path': self.edit_openpose_path.text() if openpose_model_type == 'Custom Path' else None
                 },
                 'depth': {
-                    'type': self.combo_depth_model.currentText(),
-                    'custom_path': self.edit_depth_path.text() if self.combo_depth_model.currentText() == 'Custom Path' else None
+                    'type': depth_model_type,
+                    'custom_path': self.edit_depth_path.text() if depth_model_type == 'Custom Path' else None
                 },
                 'bbox': {
-                    'type': self.combo_bbox_model.currentText(),
-                    'custom_path': self.edit_bbox_path.text().strip() if self.combo_bbox_model.currentText() == 'Custom Path' else '',
+                    'type': bbox_model_type,
+                    'custom_path': self.edit_bbox_path.text().strip() if bbox_model_type == 'Custom Path' else '',
                     'conf_threshold': float(self.spin_bbox_conf.value()),
                     'iou_threshold': float(self.spin_bbox_iou.value()),
                     'max_detections': 20,
                     'person_only': self.check_bbox_person_only.isChecked(),
+                    'target_part': self._collect_bbox_target_part_key(),
+                    'use_specialized_channels': self.check_bbox_specialized_channels.isChecked(),
+                    'specialized_models': {
+                        'head': self.edit_bbox_specialized_head_path.text().strip(),
+                        'upper_body': self.edit_bbox_specialized_upper_path.text().strip(),
+                        'lower_body': self.edit_bbox_specialized_lower_path.text().strip(),
+                    },
+                    'review': {
+                        'enabled': self.check_bbox_review_enabled.isChecked(),
+                        'override_score': self.check_bbox_review_override_score.isChecked(),
+                        'pass_threshold': float(self.spin_bbox_review_pass.value()),
+                        'fail_threshold': float(self.spin_bbox_review_fail.value()),
+                        'pose': {
+                            'enabled': self.check_bbox_review_pose_enabled.isChecked(),
+                            'vitpose_path': self.edit_bbox_review_pose_path.text().strip(),
+                        },
+                        'sam': {
+                            'enabled': self.check_bbox_review_sam_enabled.isChecked(),
+                            'model_path': self.edit_bbox_review_sam_path.text().strip(),
+                        },
+                    },
                 }
             },
             'retry_strategy': {
@@ -4722,7 +5383,8 @@ class SettingsPanel(QWidget):
             ),
         }
 
-        settings['vlm'] = {
+    def _build_vlm_settings(self) -> dict:
+        return {
             'backend': self.combo_vlm_backend.currentText(),
             'base_url': self.edit_vlm_base_url.text().strip(),
             'model': self.edit_vlm_model.text().strip(),
@@ -4730,19 +5392,11 @@ class SettingsPanel(QWidget):
             'timeout_seconds': int(self.spin_vlm_timeout.value()),
         }
 
-        # Apply selected quality profile
+    def _apply_profile_settings(self, settings: dict):
         if 'scoring' not in settings or not isinstance(settings['scoring'], dict):
             settings['scoring'] = {}
 
-        # Map translated text back to English key
-        profile_text = self.combo_quality_profile.currentText()
-        if profile_text == tr('general') or '通用' in profile_text:
-            profile_key = 'general'
-        elif profile_text == tr('anime') or '动漫' in profile_text:
-            profile_key = 'anime'
-        else:
-            profile_key = 'general'  # Default
-
+        profile_key = self._current_profile_key()
         settings['scoring']['active_profile'] = profile_key
 
         # Update the active profile's thresholds with UI values
@@ -4753,36 +5407,40 @@ class SettingsPanel(QWidget):
             settings['scoring']['profiles'][profile_key] = {}
 
         # Save per-control-type thresholds
-        settings['scoring']['profiles'][profile_key]['canny_auto_accept'] = self.spin_canny_accept.value()
-        settings['scoring']['profiles'][profile_key]['canny_auto_reject'] = self.spin_canny_reject.value()
-        settings['scoring']['profiles'][profile_key]['pose_auto_accept'] = self.spin_pose_accept.value()
-        settings['scoring']['profiles'][profile_key]['pose_auto_reject'] = self.spin_pose_reject.value()
-        settings['scoring']['profiles'][profile_key]['depth_auto_accept'] = self.spin_depth_accept.value()
-        settings['scoring']['profiles'][profile_key]['depth_auto_reject'] = self.spin_depth_reject.value()
-        settings['scoring']['profiles'][profile_key]['bbox_auto_accept'] = self.spin_bbox_accept.value()
-        settings['scoring']['profiles'][profile_key]['bbox_auto_reject'] = self.spin_bbox_reject.value()
+        self._persist_profile_thresholds(settings['scoring']['profiles'][profile_key])
 
         # Also keep the general auto_accept/auto_reject for backward compatibility
         settings['scoring']['profiles'][profile_key]['auto_accept'] = self.spin_canny_accept.value()
         settings['scoring']['profiles'][profile_key]['auto_reject'] = self.spin_canny_reject.value()
 
-        if 'prefilter' not in settings or not isinstance(settings['prefilter'], dict):
-            settings['prefilter'] = {}
-        settings['prefilter']['score_filter'] = self._build_score_filter_config()
-
-        # Custom tags
-        settings['custom_tags'] = {
+    def _build_custom_tags_settings(self) -> dict:
+        return {
             'enabled': self.check_append_tags.isChecked(),
             'tags': self.edit_custom_tags.toPlainText()
         }
 
-        # Output
-        settings['output'] = {
+    def _build_output_settings(self) -> dict:
+        return {
             'base_dir': self.edit_output_dir.text(),
             'discard_action': 'delete' if self.combo_discard_action.currentText() == tr('delete_permanently') else 'trash',
             'trash_dir_name': self.config.get('output', {}).get('trash_dir_name', '_trash'),
             'accepted_dir_name': self.config.get('output', {}).get('accepted_dir_name', 'accepted')
         }
+
+    def get_settings(self) -> dict:
+        """Get current settings"""
+        settings = self._build_base_settings()
+        settings['data_source'] = self._build_data_source_settings()
+        settings['processing'] = self._build_processing_settings()
+        settings['vlm'] = self._build_vlm_settings()
+        self._apply_profile_settings(settings)
+
+        if 'prefilter' not in settings or not isinstance(settings['prefilter'], dict):
+            settings['prefilter'] = {}
+        settings['prefilter']['score_filter'] = self._build_score_filter_config()
+
+        settings['custom_tags'] = self._build_custom_tags_settings()
+        settings['output'] = self._build_output_settings()
 
         return settings
 
@@ -5039,40 +5697,64 @@ class SettingsPanel(QWidget):
         prompt_text: str = '',
         show_result: bool = True,
     ) -> int:
-        if self._is_processing_running():
-            if show_result:
-                QMessageBox.warning(self, 'JSONA 重置', '当前任务正在运行，请先停止任务后再重置 JSONA 文件。')
+        if not self._can_reset_jsona_files(show_result):
             return 0
 
-        cleaned_types = [str(item or '').strip().lower() for item in control_types if str(item or '').strip()]
+        cleaned_types = self._normalize_jsona_control_types(control_types)
         if not cleaned_types:
             return 0
 
-        if require_confirmation:
-            if len(cleaned_types) == 1:
-                default_text = f'确定要清空 {cleaned_types[0].upper()} 的 JSONA 文件吗？\n\n此操作不可恢复！'
-            else:
-                default_text = (
-                    '确定要清空以下 JSONA 文件吗？\n\n'
-                    + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
-                    + '\n\n此操作不可恢复！'
-                )
-            reply = QMessageBox.question(
-                self,
-                prompt_title,
-                prompt_text or default_text,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return 0
+        if not self._confirm_jsona_reset(cleaned_types, require_confirmation, prompt_title, prompt_text):
+            return 0
 
-        settings = self.get_settings()
-        output_dir = settings['output']['base_dir']
+        output_dir = self.get_settings()['output']['base_dir']
+        reset_count, restore_points, error = self._execute_jsona_reset(cleaned_types, output_dir)
+        if error is not None:
+            if show_result:
+                QMessageBox.critical(self, '重置失败', f'清空 JSONA 文件时出错：\n{str(error)}')
+            return 0
+
+        self._update_jsona_statistics()
+        if show_result:
+            self._show_jsona_reset_result(reset_count, cleaned_types, restore_points)
+        return reset_count
+
+    def _can_reset_jsona_files(self, show_result: bool) -> bool:
+        if not self._is_processing_running():
+            return True
+        if show_result:
+            QMessageBox.warning(self, 'JSONA 重置', '当前任务正在运行，请先停止任务后再重置 JSONA 文件。')
+        return False
+
+    def _normalize_jsona_control_types(self, control_types: list) -> list:
+        return [str(item or '').strip().lower() for item in control_types if str(item or '').strip()]
+
+    def _confirm_jsona_reset(
+        self, cleaned_types: list, require_confirmation: bool, prompt_title: str, prompt_text: str
+    ) -> bool:
+        if not require_confirmation:
+            return True
+        if len(cleaned_types) == 1:
+            default_text = f'确定要清空 {cleaned_types[0].upper()} 的 JSONA 文件吗？\n\n此操作不可恢复！'
+        else:
+            default_text = (
+                '确定要清空以下 JSONA 文件吗？\n\n'
+                + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
+                + '\n\n此操作不可恢复！'
+            )
+        reply = QMessageBox.question(
+            self,
+            prompt_title,
+            prompt_text or default_text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        return reply == QMessageBox.Yes
+
+    def _execute_jsona_reset(self, cleaned_types: list, output_dir: str):
         backup_manager = JsonaBackupManager()
         restore_points = []
         reset_count = 0
-
         try:
             for control_type in cleaned_types:
                 jsona_file = self._jsona_filename_for_control_type(control_type)
@@ -5085,23 +5767,21 @@ class SettingsPanel(QWidget):
                 if restore_point:
                     restore_points.append(restore_point)
                 reset_count += 1
-        except Exception as e:
-            if show_result:
-                QMessageBox.critical(self, '重置失败', f'清空 JSONA 文件时出错：\n{str(e)}')
-            return 0
+            return reset_count, restore_points, None
+        except Exception as exc:
+            return 0, [], exc
 
-        self._update_jsona_statistics()
-
-        if show_result:
-            if reset_count > 0:
-                message = '已清空以下 JSONA 文件：\n' + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
-                if restore_points:
-                    message += '\n\n恢复点备份：\n' + '\n'.join(restore_points)
-                QMessageBox.information(self, '重置完成', message)
-            else:
-                QMessageBox.information(self, '文件不存在', '目标 JSONA 文件不存在，无需重置。')
-        return reset_count
+    def _show_jsona_reset_result(self, reset_count: int, cleaned_types: list, restore_points: list):
+        if reset_count <= 0:
+            QMessageBox.information(self, '文件不存在', '目标 JSONA 文件不存在，无需重置。')
+            return
+        message = '已清空以下 JSONA 文件：\n' + '\n'.join(f' - {name}.jsona' for name in cleaned_types)
+        if restore_points:
+            message += '\n\n恢复点备份：\n' + '\n'.join(restore_points)
+        QMessageBox.information(self, '重置完成', message)
 
     def _reset_jsona_file(self, control_type: str):
         """Reset (clear) a specific jsona file with confirmation."""
         self._reset_jsona_files([control_type], require_confirmation=True)
+
+

@@ -60,72 +60,25 @@ class CannyScorer:
         Returns:
             CannyScoreResult: 包含详细评分信息的结果对象
         """
-        if canny_image is None or canny_image.size == 0:
-            return CannyScoreResult(0, 0, 0, 0, 0, 0, 0, False)
-        
-        # 确保是灰度图
-        if len(canny_image.shape) == 3:
-            canny_image = cv2.cvtColor(canny_image, cv2.COLOR_BGR2GRAY)
-        
-        # 二值化确保只有0和255
-        _, binary = cv2.threshold(canny_image, 127, 255, cv2.THRESH_BINARY)
-        
-        total_pixels = binary.shape[0] * binary.shape[1]
-        white_pixels = np.sum(binary > 0)
-        white_ratio = white_pixels / total_pixels
-        
-        # 连通组件分析
-        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-        
+        invalid_result = self._build_invalid_canny_result(canny_image)
+        if invalid_result is not None:
+            return invalid_result
+
+        binary = self._to_binary_canny(canny_image)
+        white_ratio = self._white_ratio(binary)
+        num_labels, areas = self._connected_areas(binary)
         if num_labels <= 1:
             return CannyScoreResult(0, white_ratio, 0, 0, 0, 0, 0, False)
-        
-        # 获取所有连通块面积（排除背景，索引0）
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        
-        # 统计噪点数量（面积小于阈值的连通块）
+
         noise_count = int(np.sum(areas < self.noise_threshold))
-        
-        # 计算平均连通块面积
         avg_area = float(np.mean(areas))
-        
-        # === 评分计算 ===
-        total_score = 0.0
-        ratio_score = 0.0
-        noise_penalty = 0.0
-        thickness_bonus = 0.0
-        
-        # 1. 白色占比评分 (最高 weight_ratio 分)
-        if self.white_ratio_min <= white_ratio <= self.white_ratio_max:
-            # 越接近目标值得分越高
-            deviation = abs(white_ratio - self.target_white_ratio)
-            max_deviation = max(
-                self.target_white_ratio - self.white_ratio_min,
-                self.white_ratio_max - self.target_white_ratio
-            )
-            # 防止除零错误
-            if max_deviation > 0:
-                ratio_score = self.weight_ratio * max(0, 1 - deviation / max_deviation)
-            else:
-                ratio_score = self.weight_ratio  # 完美匹配
-            total_score += ratio_score
-        
-        # 2. 噪点惩罚 (最高扣 weight_noise 分)
-        noise_penalty = min(noise_count * 0.3, self.weight_noise)
-        total_score -= noise_penalty
-        
-        # 3. 线条粗细奖励 (最高 weight_thickness 分)
-        # 平均面积越大，线条越粗实
-        thickness_bonus = min(avg_area / 100 * self.weight_thickness, self.weight_thickness)
-        total_score += thickness_bonus
-        
-        # 确保分数非负
-        total_score = max(0, total_score)
-        
-        # 判断是否有效
-        is_valid = (self.white_ratio_min <= white_ratio <= self.white_ratio_max and 
-                    total_score > 0)
-        
+
+        ratio_score = self._ratio_score(white_ratio)
+        noise_penalty = self._noise_penalty(noise_count)
+        thickness_bonus = self._thickness_bonus(avg_area)
+        total_score = max(0, ratio_score - noise_penalty + thickness_bonus)
+        is_valid = self._is_valid_canny_score(total_score, white_ratio)
+
         return CannyScoreResult(
             total_score=total_score,
             white_ratio=white_ratio,
@@ -136,6 +89,52 @@ class CannyScorer:
             thickness_bonus=thickness_bonus,
             is_valid=is_valid
         )
+
+    @staticmethod
+    def _build_invalid_canny_result(canny_image: np.ndarray) -> Optional[CannyScoreResult]:
+        if canny_image is None or canny_image.size == 0:
+            return CannyScoreResult(0, 0, 0, 0, 0, 0, 0, False)
+        return None
+
+    @staticmethod
+    def _to_binary_canny(canny_image: np.ndarray) -> np.ndarray:
+        if len(canny_image.shape) == 3:
+            canny_image = cv2.cvtColor(canny_image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(canny_image, 127, 255, cv2.THRESH_BINARY)
+        return binary
+
+    @staticmethod
+    def _white_ratio(binary: np.ndarray) -> float:
+        total_pixels = binary.shape[0] * binary.shape[1]
+        white_pixels = np.sum(binary > 0)
+        return white_pixels / total_pixels
+
+    @staticmethod
+    def _connected_areas(binary: np.ndarray) -> Tuple[int, np.ndarray]:
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        areas = stats[1:, cv2.CC_STAT_AREA] if num_labels > 1 else np.array([])
+        return num_labels, areas
+
+    def _ratio_score(self, white_ratio: float) -> float:
+        if not (self.white_ratio_min <= white_ratio <= self.white_ratio_max):
+            return 0.0
+        deviation = abs(white_ratio - self.target_white_ratio)
+        max_deviation = max(
+            self.target_white_ratio - self.white_ratio_min,
+            self.white_ratio_max - self.target_white_ratio
+        )
+        if max_deviation > 0:
+            return self.weight_ratio * max(0, 1 - deviation / max_deviation)
+        return self.weight_ratio
+
+    def _noise_penalty(self, noise_count: int) -> float:
+        return min(noise_count * 0.3, self.weight_noise)
+
+    def _thickness_bonus(self, avg_area: float) -> float:
+        return min(avg_area / 100 * self.weight_thickness, self.weight_thickness)
+
+    def _is_valid_canny_score(self, total_score: float, white_ratio: float) -> bool:
+        return self.white_ratio_min <= white_ratio <= self.white_ratio_max and total_score > 0
 
 
 @dataclass
@@ -206,62 +205,25 @@ class OpenPoseScorer:
         Returns:
             OpenPoseScoreResult: 包含详细评分信息的结果对象
         """
-        if keypoints is None:
-            return OpenPoseScoreResult(
-                is_valid=False,
-                confidence_score=0,
-                avg_confidence=0,
-                anatomy_score=0,
-                root_confidences=[],
-                core_keypoints_count=0,
-                error="no_keypoints"
-            )
-        
-        # 确保是numpy数组
-        if not isinstance(keypoints, np.ndarray):
-            keypoints = np.array(keypoints)
-        
-        if len(keypoints) < 18:
-            return OpenPoseScoreResult(
-                is_valid=False,
-                confidence_score=0,
-                avg_confidence=0,
-                anatomy_score=0,
-                root_confidences=[],
-                core_keypoints_count=len(keypoints),
-                error="insufficient_keypoints"
-            )
-        
-        # 提取核心关键点
-        core_keypoints = keypoints[self.CORE_INDICES]
-        core_confidences = core_keypoints[:, 2]
-        
-        # 根节点检查 (脖子、双肩必须存在)
-        root_confidences = keypoints[self.ROOT_INDICES, 2].tolist()
-        
-        if any(c < self.root_confidence_threshold for c in root_confidences):
-            return OpenPoseScoreResult(
-                is_valid=False,
-                confidence_score=0,
-                avg_confidence=float(np.mean(core_confidences)),
-                anatomy_score=0,
-                root_confidences=root_confidences,
-                core_keypoints_count=len(keypoints),
-                error="missing_root_keypoints"
-            )
-        
-        # 计算核心置信度
+        invalid_result, keypoints = self._validate_openpose_input(keypoints)
+        if invalid_result is not None:
+            return invalid_result
+
+        core_confidences, root_confidences = self._extract_openpose_confidences(keypoints)
         avg_confidence = float(np.mean(core_confidences))
-        
-        # 解剖合理性检查
+        root_error = self._root_keypoint_error(root_confidences)
+        if root_error is not None:
+            return self._build_openpose_invalid_result(
+                error=root_error,
+                keypoint_count=len(keypoints),
+                avg_confidence=avg_confidence,
+                root_confidences=root_confidences,
+            )
+
         anatomy_score = self._check_anatomy_plausibility(keypoints)
-        
-        # 综合评分
         confidence_score = avg_confidence * 100
-        
-        is_valid = (avg_confidence >= self.min_core_confidence and 
-                    anatomy_score > 0.5)
-        
+        is_valid = avg_confidence >= self.min_core_confidence and anatomy_score > 0.5
+
         return OpenPoseScoreResult(
             is_valid=is_valid,
             confidence_score=confidence_score,
@@ -270,6 +232,57 @@ class OpenPoseScorer:
             root_confidences=root_confidences,
             core_keypoints_count=len(keypoints)
         )
+
+    def _validate_openpose_input(self, keypoints: Optional[np.ndarray]):
+        if keypoints is None:
+            return self._build_openpose_invalid_result(
+                error="no_keypoints",
+                keypoint_count=0,
+                avg_confidence=0,
+                root_confidences=[],
+            ), keypoints
+
+        if not isinstance(keypoints, np.ndarray):
+            keypoints = np.array(keypoints)
+
+        if len(keypoints) < 18:
+            return self._build_openpose_invalid_result(
+                error="insufficient_keypoints",
+                keypoint_count=len(keypoints),
+                avg_confidence=0,
+                root_confidences=[],
+            ), keypoints
+
+        return None, keypoints
+
+    @staticmethod
+    def _build_openpose_invalid_result(
+        *,
+        error: str,
+        keypoint_count: int,
+        avg_confidence: float,
+        root_confidences: list,
+    ) -> OpenPoseScoreResult:
+        return OpenPoseScoreResult(
+            is_valid=False,
+            confidence_score=0,
+            avg_confidence=avg_confidence,
+            anatomy_score=0,
+            root_confidences=root_confidences,
+            core_keypoints_count=keypoint_count,
+            error=error,
+        )
+
+    def _extract_openpose_confidences(self, keypoints: np.ndarray):
+        core_keypoints = keypoints[self.CORE_INDICES]
+        core_confidences = core_keypoints[:, 2]
+        root_confidences = keypoints[self.ROOT_INDICES, 2].tolist()
+        return core_confidences, root_confidences
+
+    def _root_keypoint_error(self, root_confidences: list) -> Optional[str]:
+        if any(c < self.root_confidence_threshold for c in root_confidences):
+            return "missing_root_keypoints"
+        return None
     
     def _check_anatomy_plausibility(self, keypoints: np.ndarray) -> float:
         """

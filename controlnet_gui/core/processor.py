@@ -149,67 +149,90 @@ class ImageProcessor:
         self._initialize_detectors()
         
         try:
-            # 转换为numpy数组
-            pil_image = image_data.image
-            np_image = np.array(pil_image)
-            
-            # 生成多阈值Canny图
-            canny_images = []
-            canny_scores = []
-            
-            for preset in self.canny_presets:
-                canny_img = self._generate_canny(
-                    np_image, 
-                    low_threshold=preset["low"],
-                    high_threshold=preset["high"]
-                )
-                canny_images.append(canny_img)
-                
-                # 评分
-                score_result = self.canny_scorer.calculate_score(canny_img)
-                canny_scores.append(score_result)
-            
-            # 找出最佳Canny
-            best_canny_index = max(range(len(canny_scores)), 
-                                   key=lambda i: canny_scores[i].total_score)
-            
-            # 生成OpenPose图
-            pose_image = None
-            pose_result = None
-            if self.enable_pose and self._pose_detector:
-                pose_image, pose_result = self._generate_pose(np_image)
-            
-            # 生成Depth图
-            depth_image = None
-            depth_result = None
-            if self.enable_depth and self._depth_detector:
-                depth_image, depth_result = self._generate_depth(np_image)
-            
-            return ProcessingResult(
-                source_data=image_data,
+            np_image = np.array(image_data.image)
+            canny_images, canny_scores = self._build_canny_variants(np_image)
+            best_canny_index = self._best_canny_index(canny_scores)
+            pose_image, pose_result = self._generate_optional_pose(np_image)
+            depth_image, depth_result = self._generate_optional_depth(np_image)
+
+            return self._build_success_result(
+                image_data=image_data,
                 canny_images=canny_images,
                 canny_scores=canny_scores,
-                canny_presets=self.canny_presets,
+                best_canny_index=best_canny_index,
                 pose_image=pose_image,
                 pose_result=pose_result,
                 depth_image=depth_image,
                 depth_result=depth_result,
-                best_canny_index=best_canny_index
             )
-            
+             
         except Exception as e:
-            return ProcessingResult(
-                source_data=image_data,
-                canny_images=[],
-                canny_scores=[],
-                canny_presets=self.canny_presets,
-                pose_image=None,
-                pose_result=None,
-                depth_image=None,
-                depth_result=None,
-                best_canny_index=0,
-                error=str(e)
+            return self._build_error_result(image_data, str(e))
+
+    def _build_canny_variants(self, np_image: np.ndarray) -> tuple[List[np.ndarray], List[CannyScoreResult]]:
+        canny_images = []
+        canny_scores = []
+        for preset in self.canny_presets:
+            canny_img = self._generate_canny(
+                np_image,
+                low_threshold=preset["low"],
+                high_threshold=preset["high"]
             )
+            canny_images.append(canny_img)
+            canny_scores.append(self.canny_scorer.calculate_score(canny_img))
+        return canny_images, canny_scores
+
+    @staticmethod
+    def _best_canny_index(canny_scores: List[CannyScoreResult]) -> int:
+        return max(range(len(canny_scores)), key=lambda i: canny_scores[i].total_score)
+
+    def _generate_optional_pose(self, np_image: np.ndarray):
+        if self.enable_pose and self._pose_detector:
+            return self._generate_pose(np_image)
+        return None, None
+
+    def _generate_optional_depth(self, np_image: np.ndarray):
+        if self.enable_depth and self._depth_detector:
+            return self._generate_depth(np_image)
+        return None, None
+
+    def _build_success_result(
+        self,
+        *,
+        image_data: ImageData,
+        canny_images: List[np.ndarray],
+        canny_scores: List[CannyScoreResult],
+        best_canny_index: int,
+        pose_image,
+        pose_result,
+        depth_image,
+        depth_result,
+    ) -> ProcessingResult:
+        return ProcessingResult(
+            source_data=image_data,
+            canny_images=canny_images,
+            canny_scores=canny_scores,
+            canny_presets=self.canny_presets,
+            pose_image=pose_image,
+            pose_result=pose_result,
+            depth_image=depth_image,
+            depth_result=depth_result,
+            best_canny_index=best_canny_index
+        )
+
+    def _build_error_result(self, image_data: ImageData, error: str) -> ProcessingResult:
+        return ProcessingResult(
+            source_data=image_data,
+            canny_images=[],
+            canny_scores=[],
+            canny_presets=self.canny_presets,
+            pose_image=None,
+            pose_result=None,
+            depth_image=None,
+            depth_result=None,
+            best_canny_index=0,
+            error=error
+        )
     
     def _generate_canny(
         self,

@@ -293,7 +293,38 @@ class FusionScoreFilter:
                         os.environ[key] = old_value
 
     def evaluate(self, image) -> Dict[str, Any]:
-        result = {
+        result = self._init_eval_result()
+        if not self.is_enabled():
+            return result
+
+        ok, error = self.ensure_runtime_ready()
+        if not ok:
+            raise RuntimeError(error)
+
+        runtime = self._runtime
+        reg_row, cls_prob = self._run_runtime_inference(runtime, image)
+        parsed = self._parse_runtime_scores(reg_row, cls_prob)
+        passed, reasons = self._evaluate_pass_rules(parsed)
+
+        result.update(
+            {
+                "available": True,
+                "device": runtime.get("device", self.config.get("device", "auto")),
+                "aesthetic": parsed["aesthetic"],
+                "composition": parsed["composition"],
+                "color": parsed["color"],
+                "sexual": parsed["sexual"],
+                "in_domain_prob": parsed["in_domain_prob"],
+                "in_domain_pred": parsed["in_domain_pred"],
+                "passed": passed,
+                "should_reject": not passed,
+                "reason": "; ".join(reasons),
+            }
+        )
+        return result
+
+    def _init_eval_result(self) -> Dict[str, Any]:
+        return {
             "enabled": self.is_enabled(),
             "available": False,
             "device": None,
@@ -307,17 +338,15 @@ class FusionScoreFilter:
             "should_reject": False,
             "reason": "",
         }
-        if not self.is_enabled():
-            return result
 
-        ok, error = self.ensure_runtime_ready()
-        if not ok:
-            raise RuntimeError(error)
+    @staticmethod
+    def _to_rgb_image(image):
+        return image.convert("RGB") if getattr(image, "mode", "") != "RGB" else image
 
+    def _run_runtime_inference(self, runtime: Dict[str, Any], image) -> tuple[list, Optional[float]]:
         import torch
 
-        runtime = self._runtime
-        pil_image = image.convert("RGB") if getattr(image, "mode", "") != "RGB" else image
+        pil_image = self._to_rgb_image(image)
         with torch.no_grad():
             f1 = runtime["jtp"]([pil_image])
             f2 = runtime["waifu"]([pil_image])
@@ -326,7 +355,9 @@ class FusionScoreFilter:
             cls_prob = None
             if runtime.get("has_cls_head", False):
                 cls_prob = float(torch.sigmoid(cls_logit).detach().cpu().view(-1)[0].item())
+        return reg_row, cls_prob
 
+    def _parse_runtime_scores(self, reg_row: list, cls_prob: Optional[float]) -> Dict[str, Any]:
         aesthetic = float(reg_row[0]) if len(reg_row) > 0 else None
         composition = float(reg_row[1]) if len(reg_row) > 1 else None
         color = float(reg_row[2]) if len(reg_row) > 2 else None
@@ -334,10 +365,20 @@ class FusionScoreFilter:
         in_domain_prob = None if cls_prob is None else float(cls_prob)
         threshold = float(self.config.get("min_in_domain_prob", 0.5))
         in_domain_pred = None if in_domain_prob is None else (1 if in_domain_prob >= threshold else 0)
+        return {
+            "aesthetic": aesthetic,
+            "composition": composition,
+            "color": color,
+            "sexual": sexual,
+            "in_domain_prob": in_domain_prob,
+            "in_domain_pred": in_domain_pred,
+        }
 
+    def _evaluate_pass_rules(self, parsed: Dict[str, Any]) -> tuple[bool, list]:
         passed = True
         reasons = []
         min_aesthetic = float(self.config.get("min_aesthetic_score", 2.5))
+        aesthetic = parsed["aesthetic"]
         if aesthetic is None:
             passed = False
             reasons.append("评分结果缺少 aesthetic 分数")
@@ -345,6 +386,8 @@ class FusionScoreFilter:
             passed = False
             reasons.append(f"aesthetic {aesthetic:.3f} < {min_aesthetic:.3f}")
 
+        in_domain_prob = parsed["in_domain_prob"]
+        threshold = float(self.config.get("min_in_domain_prob", 0.5))
         if bool(self.config.get("require_in_domain", True)):
             if in_domain_prob is None:
                 passed = False
@@ -352,21 +395,5 @@ class FusionScoreFilter:
             elif in_domain_prob < threshold:
                 passed = False
                 reasons.append(f"in_domain_prob {in_domain_prob:.3f} < {threshold:.3f}")
-
-        result.update(
-            {
-                "available": True,
-                "device": runtime.get("device", self.config.get("device", "auto")),
-                "aesthetic": aesthetic,
-                "composition": composition,
-                "color": color,
-                "sexual": sexual,
-                "in_domain_prob": in_domain_prob,
-                "in_domain_pred": in_domain_pred,
-                "passed": passed,
-                "should_reject": not passed,
-                "reason": "; ".join(reasons),
-            }
-        )
-        return result
+        return passed, reasons
 

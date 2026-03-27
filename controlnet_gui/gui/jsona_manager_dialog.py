@@ -32,12 +32,20 @@ class JsonaManagerDialog(QDialog):
     def _setup_ui(self):
         self.setWindowTitle('JSONA 管理')
         self.resize(1180, 620)
-
         layout = QVBoxLayout(self)
+        self._init_summary_label(layout)
+        self._init_table(layout)
+        self._init_result_label(layout)
+        layout.addLayout(self._create_top_actions_row())
+        layout.addLayout(self._create_bottom_actions_row())
+        self._apply_mutation_permission_state()
+
+    def _init_summary_label(self, layout: QVBoxLayout):
         self.summary_label = QLabel()
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
+    def _init_table(self, layout: QVBoxLayout):
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(['类型', '文件', '条目数', '状态', '最后修改', '备份数'])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -46,66 +54,51 @@ class JsonaManagerDialog(QDialog):
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
+    def _init_result_label(self, layout: QVBoxLayout):
         self.result_label = QLabel('尚未执行 JSONA 核对。')
         self.result_label.setWordWrap(True)
         layout.addWidget(self.result_label)
 
+    def _create_top_actions_row(self) -> QHBoxLayout:
         top_row = QHBoxLayout()
-        self.refresh_button = QPushButton('刷新')
-        self.refresh_button.clicked.connect(self.refresh_table)
-        top_row.addWidget(self.refresh_button)
-
-        self.import_button = QPushButton('导入 JSONA')
-        self.import_button.clicked.connect(self.import_jsona)
-        top_row.addWidget(self.import_button)
-
-        self.merge_button = QPushButton('合并多个 JSONA')
-        self.merge_button.clicked.connect(self.merge_jsona)
-        top_row.addWidget(self.merge_button)
-
-        self.check_button = QPushButton('核对选中项')
-        self.check_button.clicked.connect(self.check_selected)
-        top_row.addWidget(self.check_button)
-
-        self.export_button = QPushButton('导出问题项')
-        self.export_button.clicked.connect(self.export_selected_report)
-        top_row.addWidget(self.export_button)
+        self.refresh_button = self._create_action_button('刷新', self.refresh_table, top_row)
+        self.import_button = self._create_action_button('导入 JSONA', self.import_jsona, top_row)
+        self.merge_button = self._create_action_button('合并多个 JSONA', self.merge_jsona, top_row)
+        self.check_button = self._create_action_button('核对选中项', self.check_selected, top_row)
+        self.export_button = self._create_action_button('导出问题项', self.export_selected_report, top_row)
         top_row.addStretch(1)
-        layout.addLayout(top_row)
+        return top_row
 
+    def _create_bottom_actions_row(self) -> QHBoxLayout:
         bottom_row = QHBoxLayout()
-        self.backup_button = QPushButton('备份选中项')
-        self.backup_button.clicked.connect(self.backup_selected)
-        bottom_row.addWidget(self.backup_button)
-
-        self.restore_button = QPushButton('恢复选中项')
-        self.restore_button.clicked.connect(self.restore_selected)
-        bottom_row.addWidget(self.restore_button)
-
-        self.remove_missing_button = QPushButton('移除不存在条目')
-        self.remove_missing_button.clicked.connect(self.remove_missing_selected)
-        bottom_row.addWidget(self.remove_missing_button)
-
-        self.repair_button = QPushButton('修复结构')
-        self.repair_button.clicked.connect(self.repair_selected)
-        bottom_row.addWidget(self.repair_button)
-
+        self.backup_button = self._create_action_button('备份选中项', self.backup_selected, bottom_row)
+        self.restore_button = self._create_action_button('恢复选中项', self.restore_selected, bottom_row)
+        self.remove_missing_button = self._create_action_button(
+            '移除不存在条目', self.remove_missing_selected, bottom_row
+        )
+        self.repair_button = self._create_action_button('修复结构', self.repair_selected, bottom_row)
         bottom_row.addStretch(1)
-        self.close_button = QPushButton('关闭')
-        self.close_button.clicked.connect(self.accept)
-        bottom_row.addWidget(self.close_button)
-        layout.addLayout(bottom_row)
+        self.close_button = self._create_action_button('关闭', self.accept, bottom_row)
+        return bottom_row
 
-        if not self.allow_mutation:
-            for button in [
-                self.import_button,
-                self.merge_button,
-                self.backup_button,
-                self.restore_button,
-                self.remove_missing_button,
-                self.repair_button,
-            ]:
-                button.setEnabled(False)
+    def _create_action_button(self, text: str, callback, layout: QHBoxLayout) -> QPushButton:
+        button = QPushButton(text)
+        button.clicked.connect(callback)
+        layout.addWidget(button)
+        return button
+
+    def _apply_mutation_permission_state(self):
+        if self.allow_mutation:
+            return
+        for button in [
+            self.import_button,
+            self.merge_button,
+            self.backup_button,
+            self.restore_button,
+            self.remove_missing_button,
+            self.repair_button,
+        ]:
+            button.setEnabled(False)
 
     def refresh_table(self):
         self._file_rows = self.backup_manager.list_managed_files(self.output_dir)

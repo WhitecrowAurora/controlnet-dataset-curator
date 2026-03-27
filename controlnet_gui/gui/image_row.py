@@ -119,74 +119,77 @@ class ImageRowWidget(QWidget):
         main_layout = QHBoxLayout(self)
         main_layout.setSpacing(8)
         main_layout.setContentsMargins(5, 5, 5, 5)
-        
-        # 原图容器
-        original_container = QWidget()
-        original_layout = QVBoxLayout(original_container)
-        original_layout.setSpacing(2)
-        original_layout.setContentsMargins(0, 0, 0, 0)
-        
+        main_layout.addWidget(self._create_original_container())
+        main_layout.addWidget(self._create_separator())
+
+        self.variant_labels = []
+        self.score_labels = []
+        self.preset_labels = []
+        self.variant_containers = []
+        self._add_variant_containers(main_layout)
+        main_layout.addWidget(self._create_button_container())
+        self._apply_row_style()
+
+    def _create_original_container(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(2)
+        layout.setContentsMargins(0, 0, 0, 0)
+
         self.lbl_original = ImageLabel()
         self.lbl_original.setFixedSize(180, 180)
         self.lbl_original.clicked.connect(self._on_original_clicked)
-        
+
         self.lbl_original_title = QLabel("原图")
         self.lbl_original_title.setAlignment(Qt.AlignCenter)
         self.lbl_original_title.setStyleSheet("color: #aaa; font-size: 10px;")
-        
-        original_layout.addWidget(self.lbl_original)
-        original_layout.addWidget(self.lbl_original_title)
-        main_layout.addWidget(original_container)
-        
-        # 分隔线
+
+        layout.addWidget(self.lbl_original)
+        layout.addWidget(self.lbl_original_title)
+        return container
+
+    def _create_separator(self) -> QFrame:
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setStyleSheet("color: #444;")
-        main_layout.addWidget(separator)
-        
-        # 4个变体（Canny/OpenPose/Depth）
-        self.variant_labels = []
-        self.score_labels = []
-        self.preset_labels = []  # 添加预设名称标签列表
-        self.variant_containers = []
+        return separator
 
+    def _add_variant_containers(self, main_layout: QHBoxLayout):
         for i in range(4):
-            container = QWidget()
-            layout = QVBoxLayout(container)
-            layout.setSpacing(2)
-            layout.setContentsMargins(0, 0, 0, 0)
-
-            # 图片标签
-            img_label = ImageLabel()
-            img_label.setFixedSize(160, 160)
-            img_label.clicked.connect(lambda idx=i: self._on_variant_clicked(idx))
-
-            # 分数标签
-            score_label = ScoreLabel()
-
-            # 预设名称标签
-            preset_label = QLabel(f"变体{i+1}")
-            preset_label.setAlignment(Qt.AlignCenter)
-            preset_label.setStyleSheet("color: #666; font-size: 9px;")
-
-            layout.addWidget(img_label)
-            layout.addWidget(score_label)
-            layout.addWidget(preset_label)
-
+            container, img_label, score_label, preset_label = self._create_variant_container(i)
             self.variant_labels.append(img_label)
             self.score_labels.append(score_label)
-            self.preset_labels.append(preset_label)  # 保存引用
+            self.preset_labels.append(preset_label)
             self.variant_containers.append(container)
-
             main_layout.addWidget(container)
 
-        # 添加按钮容器
-        button_container = QWidget()
-        button_layout = QVBoxLayout(button_container)
-        button_layout.setSpacing(10)
-        button_layout.setContentsMargins(10, 0, 10, 0)
+    def _create_variant_container(self, index: int):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(2)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # 确认按钮
+        img_label = ImageLabel()
+        img_label.setFixedSize(160, 160)
+        img_label.clicked.connect(lambda idx=index: self._on_variant_clicked(idx))
+
+        score_label = ScoreLabel()
+
+        preset_label = QLabel(f"变体{index + 1}")
+        preset_label.setAlignment(Qt.AlignCenter)
+        preset_label.setStyleSheet("color: #666; font-size: 9px;")
+
+        layout.addWidget(img_label)
+        layout.addWidget(score_label)
+        layout.addWidget(preset_label)
+        return container, img_label, score_label, preset_label
+
+    def _create_button_container(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(10)
+        layout.setContentsMargins(10, 0, 10, 0)
+
         self.btn_confirm = QPushButton("✓ 确认")
         self.btn_confirm.setFixedSize(80, 40)
         self.btn_confirm.setEnabled(False)
@@ -209,7 +212,6 @@ class ImageRowWidget(QWidget):
         """)
         self.btn_confirm.clicked.connect(self._on_confirm_clicked)
 
-        # 废弃按钮
         self.btn_discard = QPushButton("✗ 废弃")
         self.btn_discard.setFixedSize(80, 40)
         self.btn_discard.setStyleSheet("""
@@ -227,15 +229,11 @@ class ImageRowWidget(QWidget):
         """)
         self.btn_discard.clicked.connect(self._on_discard_clicked)
 
-        button_layout.addStretch()
-        button_layout.addWidget(self.btn_confirm)
-        button_layout.addWidget(self.btn_discard)
-        button_layout.addStretch()
-
-        main_layout.addWidget(button_container)
-
-        # 设置行背景
-        self._apply_row_style()
+        layout.addStretch()
+        layout.addWidget(self.btn_confirm)
+        layout.addWidget(self.btn_discard)
+        layout.addStretch()
+        return container
 
     def _apply_row_style(self):
         """Update row style based on active state."""
@@ -286,53 +284,67 @@ class ImageRowWidget(QWidget):
                 ]
             }
         """
+        self._reset_loaded_data(data)
+        self._show_original_if_available(data)
+        variants = self._visible_variants(data)
+        self._show_all_variant_containers()
+        self._populate_variant_slots(variants)
+        self._hide_unused_variant_slots(len(variants))
+        self._resolve_best_variant_index(variants)
+        self._preselect_single_variant_if_needed()
+        self._refresh_variant_highlights()
+
+    def _reset_loaded_data(self, data: dict):
         self._data = data
         self._selected_index = -1
         self._best_index = -1
 
-        # 显示原图
+    def _show_original_if_available(self, data: dict):
         if data.get('original_image'):
             self._set_image(self.lbl_original, data['original_image'])
 
-        # 显示变体
-        variants = data.get('variants', [])
+    def _visible_variants(self, data: dict):
+        return list(data.get('variants', [])[:4])
 
+    def _show_all_variant_containers(self):
         for container in self.variant_containers:
             container.show()
 
-        for i, variant in enumerate(variants[:4]):
-            if variant.get('image'):
-                self._set_image(self.variant_labels[i], variant['image'])
+    def _populate_variant_slots(self, variants):
+        for index, variant in enumerate(variants):
+            self._populate_variant_slot(index, variant)
 
-            # 使用 1-10 分数显示
-            score_10 = variant.get('score_10', 1.0)
-            is_best = variant.get('is_best', False)
+    def _populate_variant_slot(self, index: int, variant: dict):
+        if variant.get('image'):
+            self._set_image(self.variant_labels[index], variant['image'])
 
-            self.score_labels[i].set_score(score_10, is_best)
+        score_10 = variant.get('score_10', 1.0)
+        is_best = variant.get('is_best', False)
+        self.score_labels[index].set_score(score_10, is_best)
 
-            # 更新预设名称标签
-            preset_name = variant.get('preset_name', f"变体{i+1}")
-            self.preset_labels[i].setText(preset_name)
+        preset_name = variant.get('preset_name', f"变体{index + 1}")
+        self.preset_labels[index].setText(preset_name)
 
-            if is_best:
-                self._best_index = i
+        if is_best:
+            self._best_index = index
 
-        for i in range(len(variants[:4]), len(self.variant_containers)):
-            self.variant_labels[i].clear()
-            self.score_labels[i].clear()
-            self.preset_labels[i].clear()
-            self.variant_containers[i].hide()
+    def _hide_unused_variant_slots(self, used_count: int):
+        for index in range(used_count, len(self.variant_containers)):
+            self.variant_labels[index].clear()
+            self.score_labels[index].clear()
+            self.preset_labels[index].clear()
+            self.variant_containers[index].hide()
 
-        # 如果没有变体被标记为最佳，找出分数最高的
-        if self._best_index == -1 and variants:
-            scores = [v.get('score_10', 1.0) for v in variants[:4]]
-            self._best_index = scores.index(max(scores)) if scores else -1
+    def _resolve_best_variant_index(self, variants):
+        if self._best_index != -1 or not variants:
+            return
+        scores = [variant.get('score_10', 1.0) for variant in variants]
+        self._best_index = scores.index(max(scores)) if scores else -1
 
+    def _preselect_single_variant_if_needed(self):
         # Only one candidate means no real choice; preselect it for faster review.
         if self.get_variant_count() == 1:
             self._selected_index = 0
-
-        self._refresh_variant_highlights()
     
     def _set_image(self, label: ImageLabel, pil_image):
         """将PIL图像设置到标签上"""
