@@ -245,3 +245,28 @@ class ImageListWidget(QWidget):
     def _on_row_discarded(self, row_index: int):
         """行被废弃"""
         self.row_discarded.emit(row_index)
+
+    def get_all_rows(self):
+        """获取所有行"""
+        return self._rows
+
+    def get_selected_rows(self):
+        """获取所有被选中的行（暂时返回当前激活的行）"""
+        # TODO: 实现多选功能
+        active = self.get_active_row()
+        return [active] if active else []
+
+    def batch_accept_rows(self, rows):
+        """批量接受行"""
+        for row in rows:
+            if row and row.get_selected_variant() >= 0:
+                row_index = self._rows.index(row)
+                variant_index = row.get_selected_variant()
+                self.variant_confirmed.emit(row_index, variant_index)
+
+    def batch_discard_rows(self, rows):
+        """批量拒绝行"""
+        for row in rows:
+            if row:
+                row_index = self._rows.index(row)
+                self.row_discarded.emit(row_index)

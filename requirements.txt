@@ -32,3 +32,4 @@ huggingface-hub>=0.16.0
 
 # 其他工具
 pyarrow>=12.0.0  # Parquet文件支持
+psutil>=5.9.0  # 内存监控

@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex, QMutexLocker, QProcess
 from PyQt5.QtGui import QIcon
+import datetime
 import json
 import os
 import threading
@@ -39,6 +40,8 @@ from ..core.vlm_client import VlmConfig
 from ..core.score_converter import (
     bbox_to_10_scale, canny_to_10_scale, openpose_to_10_scale, depth_to_10_scale
 )
+from ..core.undo_manager import UndoManager, UndoAction, ActionType
+from ..core.memory_monitor import MemoryMonitor
 from ..language import get_lang_manager, tr
 
 
@@ -2039,12 +2042,21 @@ class MainWindow(QMainWindow):
         self.lang_manager = get_lang_manager()
         self.jsona_backup_interval = 200
 
+        # 撤销/重做管理器
+        self.undo_manager = UndoManager(max_history=100)
+
+        # 内存监控
+        self.memory_monitor = MemoryMonitor()
+
         # Load language from config
         saved_lang = self.config.get('language', 'zh')  # Default to Chinese
         self.lang_manager.set_language(saved_lang)
 
         self._init_ui()
         self._connect_signals()
+
+        # 启动内存监控定时器
+        self._start_memory_monitor()
 
     def _load_config(self) -> dict:
         """Load configuration from file."""
@@ -2158,6 +2170,17 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
+        # 添加统计信息标签（左侧）
+        self.stats_label = QLabel("统计: 待处理")
+        self.stats_label.setStyleSheet("color: #4CAF50; padding: 0 10px; font-weight: bold;")
+        self.status_bar.addWidget(self.stats_label)
+
+        # 添加内存监控标签（左侧，统计后面）
+        self.memory_label = QLabel("内存: 0 MB")
+        self.memory_label.setStyleSheet("color: #888; padding: 0 10px;")
+        self.status_bar.addWidget(self.memory_label)
+
+        # 添加设备信息标签（右侧永久显示）
         self.device_label = QLabel("Device: Checking...")
         self.device_label.setStyleSheet("color: #888; padding: 0 10px;")
         self.status_bar.addPermanentWidget(self.device_label)
@@ -2190,6 +2213,30 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.device_label.setText("Device: Unknown")
             self.device_label.setStyleSheet("color: #888; padding: 0 10px;")
+
+    def _start_memory_monitor(self):
+        """启动内存监控定时器"""
+        from PyQt5.QtCore import QTimer
+        self.memory_timer = QTimer(self)
+        self.memory_timer.timeout.connect(self._update_memory_display)
+        self.memory_timer.start(2000)  # 每2秒更新一次
+
+    def _update_memory_display(self):
+        """更新内存显示"""
+        try:
+            memory_mb = self.memory_monitor.get_current_memory_mb()
+            memory_str = self.memory_monitor.format_memory_size(memory_mb)
+            self.memory_label.setText(f"内存: {memory_str}")
+
+            # 根据内存使用量改变颜色
+            if memory_mb > 4096:  # 超过4GB显示红色
+                self.memory_label.setStyleSheet("color: #F44336; padding: 0 10px;")
+            elif memory_mb > 2048:  # 超过2GB显示橙色
+                self.memory_label.setStyleSheet("color: #FFA726; padding: 0 10px;")
+            else:
+                self.memory_label.setStyleSheet("color: #888; padding: 0 10px;")
+        except Exception:
+            pass
 
     def _create_menu_bar(self):
         """Create menu bar."""
@@ -2253,6 +2300,21 @@ class MainWindow(QMainWindow):
     def _create_edit_menu(self, menubar):
         self.edit_menu = menubar.addMenu(tr('edit'))
 
+        # 添加撤销/重做
+        self.undo_action = QAction("撤销", self)
+        self.undo_action.setShortcut("Ctrl+Z")
+        self.undo_action.setEnabled(False)
+        self.undo_action.triggered.connect(self._undo)
+        self.edit_menu.addAction(self.undo_action)
+
+        self.redo_action = QAction("重做", self)
+        self.redo_action.setShortcut("Ctrl+Y")
+        self.redo_action.setEnabled(False)
+        self.redo_action.triggered.connect(self._redo)
+        self.edit_menu.addAction(self.redo_action)
+
+        self.edit_menu.addSeparator()
+
         self.pause_action = QAction(tr('pause_processing'), self)
         self.pause_action.setEnabled(False)
         self.pause_action.triggered.connect(self._toggle_pause)
@@ -2285,6 +2347,8 @@ class MainWindow(QMainWindow):
         self.tools_menu.addSeparator()
         self._add_jsona_tool_actions()
         self.tools_menu.addSeparator()
+        self._add_report_tool_actions()
+        self.tools_menu.addSeparator()
         self._add_dependency_tool_actions()
 
     def _add_torch_tool_actions(self):
@@ -2307,6 +2371,69 @@ class MainWindow(QMainWindow):
         self.jsona_checker_action = self._add_tool_action('JSONA 核对检查器', self._open_jsona_checker)
         self.review_inbox_import_action = self._add_tool_action('导入审核箱 (需要人工审核)', self._import_review_inbox)
         self.vlm_tag_action = self._add_tool_action('VLM 核对 Tag 并输出 NL', self._open_vlm_tag_dialog)
+
+    def _add_report_tool_actions(self):
+        self.export_html_report_action = self._add_tool_action('导出 HTML 筛选报告', self._export_html_report)
+
+    def _export_html_report(self):
+        """导出 HTML 筛选结果报告"""
+        from ..core.html_reporter import generate_html_report
+
+        # 获取统计数据
+        stats = getattr(self, 'current_stats', None)
+        if not stats or stats.get('total', 0) == 0:
+            QMessageBox.warning(self, '导出报告', '暂无处理数据，请先运行处理后再导出报告。')
+            return
+
+        # 选择保存路径
+        default_path = os.path.join(
+            os.path.expanduser('~'),
+            f'controlnet_report_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.html'
+        )
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, '保存 HTML 报告', default_path, 'HTML 文件 (*.html)'
+        )
+        if not output_path:
+            return
+
+        # 收集行数据并标注状态
+        rows_data = []
+        for row_widget in self.image_list.get_all_rows():
+            data = getattr(row_widget, '_data', None)
+            if data is None:
+                continue
+            row_copy = dict(data)
+            # 根据行的审核状态打标签（auto_action 由处理线程写入）
+            auto_action = row_copy.get('auto_action', '')
+            if auto_action == 'accept':
+                row_copy['_report_status'] = 'accept'
+            elif auto_action in ('reject', 'discard'):
+                row_copy['_report_status'] = 'reject'
+            else:
+                row_copy['_report_status'] = 'review'
+            rows_data.append(row_copy)
+
+        try:
+            self.status_bar.showMessage('正在生成 HTML 报告，请稍候...')
+            QApplication.processEvents()
+            generate_html_report(
+                stats=stats,
+                rows=rows_data,
+                output_path=output_path,
+            )
+            self.status_bar.showMessage(f'HTML 报告已导出: {output_path}')
+            # 询问是否在浏览器中打开
+            reply = QMessageBox.question(
+                self, '导出完成',
+                f'报告已保存到:\n{output_path}\n\n是否立即在浏览器中打开？',
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                import webbrowser
+                webbrowser.open(f'file:///{output_path.replace(chr(92), "/")}')
+        except Exception as e:
+            self.status_bar.showMessage('HTML 报告导出失败')
+            QMessageBox.critical(self, '导出失败', f'生成报告时出错：\n{e}')
 
     def _add_dependency_tool_actions(self):
         self.install_all_deps_action = self._add_tool_action(tr('install_all_dependencies'), self._install_all_dependencies)
@@ -2446,10 +2573,37 @@ class MainWindow(QMainWindow):
         if key in (Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4):
             return self.image_list.select_variant_on_active(key - Qt.Key_1)
 
+        if key == Qt.Key_Space:
+            # 空格键：快速接受当前选中的变体（如果有），否则接受最佳变体
+            row = self.image_list.get_active_row()
+            if row:
+                selected = row.get_selected_variant()
+                if selected >= 0:
+                    return self.image_list.confirm_active_selection()
+                else:
+                    # 自动选择最佳变体并确认
+                    best_index = row.get_best_variant_index()
+                    if best_index >= 0:
+                        row.select_variant(best_index, emit_signal=True)
+                        return self.image_list.confirm_active_selection()
+            return True
+
         if key in (Qt.Key_Return, Qt.Key_Enter):
             if self.image_list.confirm_active_selection():
                 return True
             self.status_bar.showMessage("请先按 1-4 选择变体，再按 Enter 确认")
+            return True
+
+        if key == Qt.Key_A:
+            # A键：选择所有变体（暂不实现，预留）
+            self.status_bar.showMessage("批量选择功能开发中")
+            return True
+
+        if key == Qt.Key_S:
+            # S键：跳过当前图片（移到下一张）
+            handled = self.image_list.activate_next_row(1)
+            if handled:
+                self._show_active_row_preview()
             return True
 
         if key in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace):
@@ -2765,7 +2919,21 @@ class MainWindow(QMainWindow):
     def _on_stats_updated(self, stats: dict):
         """Update status bar with statistics."""
         self.current_stats = stats
-        # Don't update status bar here, let progress_updated handle it
+        self._update_stats_display()
+
+    def _update_stats_display(self):
+        """更新统计信息显示"""
+        if not hasattr(self, 'current_stats'):
+            return
+
+        stats = self.current_stats
+        stats_text = (f"已处理: {stats['total']} | "
+                     f"接受: {stats['auto_accept']} | "
+                     f"拒绝: {stats['auto_reject']} | "
+                     f"待审: {stats['need_review']}")
+
+        if hasattr(self, 'stats_label'):
+            self.stats_label.setText(stats_text)
 
     def _on_progress_updated(self, progress_text: str):
         """Update status bar with current progress and statistics."""
@@ -2778,19 +2946,11 @@ class MainWindow(QMainWindow):
                 self.pause_action.setText(tr('pause_processing'))
                 self.settings_panel.btn_pause.setText(tr('pause_processing'))
 
-        if hasattr(self, 'current_stats'):
-            stats = self.current_stats
-            msg = (f"{progress_text} | "
-                   f"{tr('processed')}: {stats['total']} | "
-                   f"{tr('auto_accepted')}: {stats['auto_accept']} | "
-                   f"{tr('auto_rejected')}: {stats['auto_reject']} | "
-                   f"{tr('need_review')}: {stats['need_review']} | "
-                   f"{tr('inbox_pending')}: {stats.get('inbox_pending', 0)} | "
-                   f"{tr('in_queue')}: {stats.get('in_queue', 0)} | "
-                   f"{tr('displaying')}: {len(self.image_list._rows)}")
-        else:
-            msg = progress_text
-        self.status_bar.showMessage(msg)
+        # 更新统计显示
+        self._update_stats_display()
+
+        # 在临时消息区域显示进度文本
+        self.status_bar.showMessage(progress_text)
 
     def _on_processing_complete(self):
         """Handle processing completion."""
@@ -3186,6 +3346,41 @@ class MainWindow(QMainWindow):
             self.image_list.clear()
             self.preview_panel.clear()
             self.status_bar.showMessage("Images cleared")
+
+    def _undo(self):
+        """撤销上一个操作"""
+        action = self.undo_manager.undo()
+        if action:
+            self.status_bar.showMessage(f"已撤销: {self.undo_manager.get_last_action_description()}")
+            self._update_undo_redo_state()
+        else:
+            self.status_bar.showMessage("没有可撤销的操作")
+
+    def _redo(self):
+        """重做上一个被撤销的操作"""
+        action = self.undo_manager.redo()
+        if action:
+            self.status_bar.showMessage(f"已重做操作")
+            self._update_undo_redo_state()
+        else:
+            self.status_bar.showMessage("没有可重做的操作")
+
+    def _update_undo_redo_state(self):
+        """更新撤销/重做按钮状态"""
+        self.undo_action.setEnabled(self.undo_manager.can_undo())
+        self.redo_action.setEnabled(self.undo_manager.can_redo())
+
+        # 更新菜单文本显示操作描述
+        if self.undo_manager.can_undo():
+            desc = self.undo_manager.get_last_action_description()
+            self.undo_action.setText(f"撤销 {desc}")
+        else:
+            self.undo_action.setText("撤销")
+
+        if self.undo_manager.can_redo():
+            self.redo_action.setText("重做")
+        else:
+            self.redo_action.setText("重做")
 
     def _set_delete_behavior(self, behavior: str):
         """Set delete behavior for rejected images"""

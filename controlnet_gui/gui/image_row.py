@@ -237,29 +237,65 @@ class ImageRowWidget(QWidget):
 
     def _apply_row_style(self):
         """Update row style based on active state."""
+        # 获取质量颜色
+        quality_color = self._get_quality_color()
+
         if self._is_active:
-            self.setStyleSheet("""
-                ImageRowWidget {
+            self.setStyleSheet(f"""
+                ImageRowWidget {{
                     background-color: #1a1a1a;
                     border-bottom: 1px solid #333;
                     border-left: 3px solid #0078d4;
-                }
-                ImageRowWidget:hover {
+                    border-top: 2px solid {quality_color};
+                }}
+                ImageRowWidget:hover {{
                     background-color: #1f1f1f;
-                }
+                }}
             """)
         else:
-            self.setStyleSheet("""
-                ImageRowWidget {
+            self.setStyleSheet(f"""
+                ImageRowWidget {{
                     background-color: #0d0d0d;
                     border-bottom: 1px solid #333;
                     border-left: 3px solid transparent;
-                }
-                ImageRowWidget:hover {
+                    border-top: 2px solid {quality_color};
+                }}
+                ImageRowWidget:hover {{
                     background-color: #151515;
-                }
+                }}
             """)
-    
+
+    def _get_quality_color(self) -> str:
+        """根据最佳变体分数获取质量颜色"""
+        if not self._data or 'variants' not in self._data:
+            return "#333"  # 默认灰色
+
+        variants = self._data.get('variants', [])
+        if not variants:
+            return "#333"
+
+        # 获取最佳分数
+        scores = []
+        for v in variants:
+            score = v.get('score_10', 0)
+            if score > 0:
+                scores.append(score)
+
+        if not scores:
+            return "#333"
+
+        best_score = max(scores)
+
+        # 根据分数返回颜色（10分制）
+        if best_score >= 8.0:
+            return "#4CAF50"  # 绿色 - 高质量
+        elif best_score >= 6.0:
+            return "#FFC107"  # 黄色 - 中等质量
+        elif best_score >= 4.0:
+            return "#FF9800"  # 橙色 - 较低质量
+        else:
+            return "#F44336"  # 红色 - 低质量
+
 
     def load_data(self, data: dict):
         """
@@ -464,7 +500,11 @@ class ImageRowWidget(QWidget):
         """Trigger discard action for this row."""
         self.row_discarded.emit(self.row_index)
         return True
-    
+
+    def get_best_variant_index(self) -> int:
+        """获取最佳变体的索引"""
+        return self._best_index
+
     def clear(self):
         """清空显示"""
         self.lbl_original.clear()
