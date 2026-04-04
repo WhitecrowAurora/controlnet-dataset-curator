@@ -522,6 +522,7 @@ class SettingsPanel(QWidget):
         self._settings_tracking_suspended = True
         self._settings_history_limit = 500
         self._last_saved_flat_settings = None
+        self._startup_guide_seen = False
         self._maintenance_prompt_timers = {}
         self._maintenance_prompt_pending = {}
         self._maintenance_prompt_handled = {}
@@ -1138,6 +1139,7 @@ class SettingsPanel(QWidget):
             ('processing_threads', lambda: self.spin_processing_threads.value()),
             ('preload_count', lambda: self.spin_preload_count.value()),
             ('processing_mode', self._current_processing_mode),
+            ('startup_guide_seen', lambda: bool(self._startup_guide_seen)),
             ('canny_enabled', lambda: self.check_canny.isChecked()),
             ('openpose_enabled', lambda: self.check_openpose.isChecked()),
             ('depth_enabled', lambda: self.check_depth.isChecked()),
@@ -1243,6 +1245,7 @@ class SettingsPanel(QWidget):
             'processing_threads': '处理线程数',
             'preload_count': '预加载数量',
             'processing_mode': '处理模式',
+            'startup_guide_seen': '已查看新手引导',
             'canny_enabled': '启用 Canny',
             'openpose_enabled': '启用 Pose',
             'depth_enabled': '启用 Depth',
@@ -1592,6 +1595,32 @@ class SettingsPanel(QWidget):
         self._apply_flat_settings(config)
         return
 
+    def is_startup_guide_seen(self) -> bool:
+        return bool(self._startup_guide_seen)
+
+    def mark_startup_guide_seen(self, seen: bool = True) -> bool:
+        target_seen = bool(seen)
+        previous_seen = bool(self._startup_guide_seen)
+        if previous_seen == target_seen and self._last_saved_flat_settings is not None:
+            return True
+
+        previous_state = self._settings_tracking_suspended
+        self._settings_tracking_suspended = True
+        self._startup_guide_seen = target_seen
+        try:
+            config = self._collect_flat_settings()
+            config_file = self._get_settings_file_path()
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            self._last_saved_flat_settings = deepcopy(config)
+            return True
+        except Exception as e:
+            self._startup_guide_seen = previous_seen
+            print(f"Failed to persist startup guide flag: {e}")
+            return False
+        finally:
+            self._settings_tracking_suspended = previous_state
+
     def _apply_flat_local_parquet_files(self, files):
         self.list_parquet_files.clear()
         for file_path in files or []:
@@ -1651,6 +1680,7 @@ class SettingsPanel(QWidget):
             ('processing_threads', lambda v: self.spin_processing_threads.setValue(int(v))),
             ('preload_count', lambda v: self.spin_preload_count.setValue(int(v))),
             ('processing_mode', lambda v: self._set_processing_mode(str(v))),
+            ('startup_guide_seen', lambda v: setattr(self, '_startup_guide_seen', bool(v))),
             ('canny_enabled', lambda v: self.check_canny.setChecked(bool(v))),
             ('openpose_enabled', lambda v: self.check_openpose.setChecked(bool(v))),
             ('depth_enabled', lambda v: self.check_depth.setChecked(bool(v))),

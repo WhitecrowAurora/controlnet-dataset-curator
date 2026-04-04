@@ -364,6 +364,67 @@ class InstallProgressDialogWithIndex(QDialog):
             self.close_button.setEnabled(True)
 
 
+class QuickStartGuideDialog(QDialog):
+    """首次启动时显示的快速上手引导。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('快速上手')
+        self.setModal(True)
+        self.resize(760, 560)
+
+        layout = QVBoxLayout(self)
+
+        intro_label = QLabel(
+            '第一次使用建议按下面顺序操作。这个窗口只会在首次启动时自动弹出一次，之后可以从“帮助 → 快速上手”再次打开。'
+        )
+        intro_label.setWordWrap(True)
+        layout.addWidget(intro_label)
+
+        guide_text = QTextEdit()
+        guide_text.setReadOnly(True)
+        guide_text.setHtml(
+            """
+            <h3>1. 先选运行模式</h3>
+            <p>左侧顶部有两个 Tab：</p>
+            <ul>
+              <li><b>ControlNet 图片生成模式</b>：生成并筛选 Canny / Pose / Depth / BBox 控制图。</li>
+              <li><b>图片评分模式</b>：只对原图做评分与筛选，不生成控制图。</li>
+            </ul>
+
+            <h3>2. 再选输入来源</h3>
+            <p>在左侧“数据源”区域选择数据集、Parquet 文件，或者直接切到自定义输入目录。</p>
+
+            <h3>3. 配置当前模式需要的参数</h3>
+            <p>ControlNet 模式下，勾选需要输出的控制图类型并设置阈值。</p>
+            <p>评分模式下，开启原图评分筛选并设置 checkpoint、阈值和设备。</p>
+
+            <h3>4. 设置输出目录后开始处理</h3>
+            <p>左侧底部设置输出目录，确认无误后点击“开始处理”。</p>
+
+            <h3>5. 遇到人工审核时，直接用键盘操作</h3>
+            <ul>
+              <li><code>1-4</code>：选择候选图</li>
+              <li><code>Enter</code>：确认当前选择</li>
+              <li><code>Space</code>：快速接受当前选择，未选中时自动接受最佳候选</li>
+              <li><code>Delete / Backspace / D</code>：丢弃当前项</li>
+              <li><code>方向键</code>：切换图片行或候选图</li>
+            </ul>
+
+            <h3>6. 常用工具入口</h3>
+            <p>顶部“工具”菜单里可以打开 JSONA 管理、JSONA 核对检查器、评分模型管理等功能。</p>
+            """
+        )
+        guide_text.setStyleSheet(
+            "background-color: #1e1e1e; color: #d4d4d4; font-size: 13px; line-height: 1.5;"
+        )
+        layout.addWidget(guide_text)
+
+        close_button = QPushButton('开始使用')
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+
 class ProcessingThread(QThread):
     """Background thread for continuous image processing."""
 
@@ -2058,6 +2119,9 @@ class MainWindow(QMainWindow):
         # 启动内存监控定时器
         self._start_memory_monitor()
 
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(300, self._maybe_show_startup_guide)
+
     def _load_config(self) -> dict:
         """Load configuration from file."""
         abs_config_path = os.path.abspath(self.config_path)
@@ -2469,9 +2533,28 @@ class MainWindow(QMainWindow):
     def _create_help_menu(self, menubar):
         self.help_menu = menubar.addMenu(tr('help'))
 
+        self.quick_start_action = QAction('快速上手', self)
+        self.quick_start_action.triggered.connect(lambda: self._show_quick_start_guide(manual=True))
+        self.help_menu.addAction(self.quick_start_action)
+
+        self.help_menu.addSeparator()
+
         self.about_action = QAction(tr('about'), self)
         self.about_action.triggered.connect(self._show_about)
         self.help_menu.addAction(self.about_action)
+
+    def _show_quick_start_guide(self, manual: bool = False):
+        dialog = QuickStartGuideDialog(self)
+        dialog.exec_()
+        if not manual and hasattr(self, 'settings_panel'):
+            self.settings_panel.mark_startup_guide_seen(True)
+
+    def _maybe_show_startup_guide(self):
+        if not hasattr(self, 'settings_panel'):
+            return
+        if self.settings_panel.is_startup_guide_seen():
+            return
+        self._show_quick_start_guide(manual=False)
 
     def _connect_signals(self):
         """Connect signals and slots."""
@@ -3321,6 +3404,7 @@ class MainWindow(QMainWindow):
         self.lang_menu.setTitle(tr('language'))
 
         self.help_menu.setTitle(tr('help'))
+        self.quick_start_action.setText('快速上手')
         self.about_action.setText(tr('about'))
         self.jsona_manager_action.setText('JSONA 管理')
         self.jsona_import_action.setText('导入 JSONA')
