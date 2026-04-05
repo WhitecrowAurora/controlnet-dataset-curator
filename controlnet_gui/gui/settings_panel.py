@@ -1050,6 +1050,52 @@ class SettingsPanel(QWidget):
         return 'pause' if self.combo_unattended_inbox_full_action.currentIndex() == 0 else 'stop'
 
     @staticmethod
+    def _review_display_mode_options() -> list:
+        return [
+            ('固定单行', 'fixed_single'),
+            ('自适应单行', 'adaptive_single'),
+            ('双行 2x2', 'two_row'),
+        ]
+
+    def _review_display_mode_to_key(self, text: str) -> str:
+        value = str(text or '').strip()
+        for label, key in self._review_display_mode_options():
+            if value == label:
+                return key
+        return 'fixed_single'
+
+    def _review_display_mode_from_key(self, key: str) -> str:
+        normalized = str(key or 'fixed_single').strip().lower()
+        alias = {
+            'fixed_single': 'fixed_single',
+            'fixed': 'fixed_single',
+            'single': 'fixed_single',
+            'adaptive_single': 'adaptive_single',
+            'adaptive': 'adaptive_single',
+            'responsive': 'adaptive_single',
+            'two_row': 'two_row',
+            'double_row': 'two_row',
+            'grid': 'two_row',
+        }.get(normalized, 'fixed_single')
+        for label, option_key in self._review_display_mode_options():
+            if option_key == alias:
+                return label
+        return '固定单行'
+
+    def _collect_review_display_mode_key(self) -> str:
+        if not hasattr(self, 'combo_review_display_mode'):
+            return 'fixed_single'
+        return self._review_display_mode_to_key(self.combo_review_display_mode.currentText())
+
+    def _apply_review_display_mode_key(self, value):
+        if not hasattr(self, 'combo_review_display_mode'):
+            return
+        self.combo_review_display_mode.setCurrentText(self._review_display_mode_from_key(str(value)))
+
+    def current_review_display_mode(self) -> str:
+        return self._collect_review_display_mode_key()
+
+    @staticmethod
     def _bbox_target_part_options() -> list:
         return [
             ('全身', 'person'),
@@ -1139,6 +1185,7 @@ class SettingsPanel(QWidget):
             ('processing_threads', lambda: self.spin_processing_threads.value()),
             ('preload_count', lambda: self.spin_preload_count.value()),
             ('processing_mode', self._current_processing_mode),
+            ('review_display_mode', self._collect_review_display_mode_key),
             ('startup_guide_seen', lambda: bool(self._startup_guide_seen)),
             ('canny_enabled', lambda: self.check_canny.isChecked()),
             ('openpose_enabled', lambda: self.check_openpose.isChecked()),
@@ -1245,6 +1292,7 @@ class SettingsPanel(QWidget):
             'processing_threads': '处理线程数',
             'preload_count': '预加载数量',
             'processing_mode': '处理模式',
+            'review_display_mode': '审核区显示模式',
             'startup_guide_seen': '已查看新手引导',
             'canny_enabled': '启用 Canny',
             'openpose_enabled': '启用 Pose',
@@ -1680,6 +1728,7 @@ class SettingsPanel(QWidget):
             ('processing_threads', lambda v: self.spin_processing_threads.setValue(int(v))),
             ('preload_count', lambda v: self.spin_preload_count.setValue(int(v))),
             ('processing_mode', lambda v: self._set_processing_mode(str(v))),
+            ('review_display_mode', self._apply_review_display_mode_key),
             ('startup_guide_seen', lambda v: setattr(self, '_startup_guide_seen', bool(v))),
             ('canny_enabled', lambda v: self.check_canny.setChecked(bool(v))),
             ('openpose_enabled', lambda v: self.check_openpose.setChecked(bool(v))),
@@ -1847,6 +1896,7 @@ class SettingsPanel(QWidget):
         self.combo_discard_action.currentIndexChanged.connect(lambda: self.save_settings())
 
     def _connect_advanced_autosave_signals(self):
+        self.combo_review_display_mode.currentTextChanged.connect(lambda: self.save_settings())
         self.spin_parallel_threads.valueChanged.connect(lambda: self.save_settings())
         self.check_auto_pass_no_review.stateChanged.connect(lambda: self.save_settings())
         self.check_single_jsona.stateChanged.connect(lambda: self.save_settings())
@@ -1967,6 +2017,7 @@ class SettingsPanel(QWidget):
         main_layout = QHBoxLayout(group)
 
         left_layout = QVBoxLayout()
+        left_layout.addWidget(self._create_review_display_group())
         self.advanced_mode_stack = self._create_advanced_mode_stack()
         left_layout.addWidget(self.advanced_mode_stack)
         left_layout.addWidget(self._create_jsona_backup_group())
@@ -1980,6 +2031,22 @@ class SettingsPanel(QWidget):
         right_layout.addWidget(self._create_jsona_stats_group())
         right_layout.addStretch()
         main_layout.addLayout(right_layout)
+        return group
+
+    def _create_review_display_group(self) -> QGroupBox:
+        group = QGroupBox('审核区显示')
+        layout = QFormLayout(group)
+
+        self.combo_review_display_mode = QComboBox()
+        for label, _key in self._review_display_mode_options():
+            self.combo_review_display_mode.addItem(label)
+        self.combo_review_display_mode.setCurrentText('固定单行')
+        self.combo_review_display_mode.setToolTip(
+            '固定单行: 保持当前的一行排布\n'
+            '自适应单行: 根据审核区宽度自动缩放整行图片\n'
+            '双行 2x2: 原图在左侧，4 张候选图按 2x2 排列'
+        )
+        layout.addRow('显示模式:', self.combo_review_display_mode)
         return group
 
     def _create_advanced_mode_stack(self) -> QStackedWidget:
@@ -5282,6 +5349,7 @@ class SettingsPanel(QWidget):
         self.spin_processing_threads.setValue(processing.get('thread_count', 1))
         self.spin_preload_count.setValue(processing.get('preload_count', 15))
         self._set_processing_mode(processing.get('mode', 'controlnet'))
+        self._apply_review_display_mode_key(processing.get('review_display_mode', 'fixed_single'))
 
         # Quality profile
         scoring = self.config.get('scoring', {})
@@ -5345,6 +5413,7 @@ class SettingsPanel(QWidget):
             'thread_count': self.spin_processing_threads.value(),
             'preload_count': self.spin_preload_count.value(),
             'mode': self._current_processing_mode(),
+            'review_display_mode': self.current_review_display_mode(),
             'control_types': {
                 'canny': self.check_canny.isChecked(),
                 'openpose': self.check_openpose.isChecked(),

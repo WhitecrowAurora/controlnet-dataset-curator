@@ -2176,6 +2176,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.settings_scroll)
 
         self.image_list = ImageListWidget()
+        self.image_list.set_display_mode(self._current_review_display_mode())
         self.image_list.setMinimumWidth(760)
         splitter.addWidget(self.image_list)
 
@@ -2594,9 +2595,21 @@ class MainWindow(QMainWindow):
         self.settings_scroll.setWidget(self.settings_panel)
         self._bind_settings_panel_signals()
         self._sync_settings_panel_runtime_state()
+        self._apply_review_display_mode()
 
         if old_panel is not None:
             old_panel.deleteLater()
+
+    def _current_review_display_mode(self) -> str:
+        if hasattr(self, 'settings_panel') and hasattr(self.settings_panel, 'current_review_display_mode'):
+            return self.settings_panel.current_review_display_mode()
+        processing = self.config.get('processing', {}) if isinstance(self.config, dict) else {}
+        return str(processing.get('review_display_mode', 'fixed_single') or 'fixed_single')
+
+    def _apply_review_display_mode(self):
+        if hasattr(self, 'image_list'):
+            self.image_list.set_display_mode(self._current_review_display_mode())
+            self._ensure_review_area_width()
 
     def _is_text_input_focused(self) -> bool:
         """Avoid hijacking keyboard when user is typing in form inputs."""
@@ -2714,7 +2727,7 @@ class MainWindow(QMainWindow):
             return
 
         _, middle, _ = sizes
-        min_middle = 980
+        min_middle = self._review_area_min_width()
 
         if middle >= min_middle:
             return
@@ -2742,6 +2755,14 @@ class MainWindow(QMainWindow):
         finally:
             self._auto_expanding_window = False
 
+    def _review_area_min_width(self) -> int:
+        mode = self._current_review_display_mode()
+        if mode == 'adaptive_single':
+            return 760
+        if mode == 'two_row':
+            return 720
+        return 980
+
     def resizeEvent(self, event):
         """Keep review area usable on window resize."""
         super().resizeEvent(event)
@@ -2750,6 +2771,7 @@ class MainWindow(QMainWindow):
     def _on_settings_changed(self, settings: dict):
         """Handle settings changes."""
         self.config = settings
+        self._apply_review_display_mode()
 
     def _on_extraction_finished(self, count: int):
         """Handle data extraction completion"""

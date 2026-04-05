@@ -1,20 +1,23 @@
 """
 ControlNet GUI - 单行图片组件
-每行显示：原图 + 4张不同阈值的Canny图 + 确认/废弃按钮
+每行显示：原图 + 候选图 + 确认/废弃按钮
 """
 
-from PyQt5.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QFrame, QPushButton
+from PyQt5.QtWidgets import (
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QLabel, QFrame, QPushButton, QSizePolicy
+)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QCursor
 
 import numpy as np
-from PIL import Image
 
 
 class ImageLabel(QLabel):
     """可点击的图片标签"""
+
     clicked = pyqtSignal()
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setScaledContents(False)
@@ -32,16 +35,17 @@ class ImageLabel(QLabel):
         """)
         self.setCursor(QCursor(Qt.PointingHandCursor))
         self._pixmap = None
-    
+        self._source_image = None
+
     def setPixmap(self, pixmap):
         super().setPixmap(pixmap)
         self._pixmap = pixmap
-    
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
-    
+
     def set_highlight(self, highlight: bool, color: str = "#00ff00"):
         """设置高亮边框"""
         if highlight:
@@ -72,12 +76,12 @@ class ImageLabel(QLabel):
 
 class ScoreLabel(QLabel):
     """分数显示标签"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("color: #888; font-size: 11px; padding: 2px;")
-    
+
     def set_score(self, score: float, is_best: bool = False):
         """设置分数显示"""
         if is_best:
@@ -90,20 +94,22 @@ class ScoreLabel(QLabel):
 
 class ImageRowWidget(QWidget):
     """
-    单行图片组件
+    单条审核记录组件
 
-    布局: [原图] [Canny1+分数] [Canny2+分数] [Canny3+分数] [Canny4+分数] [确认按钮] [废弃按钮]
-
-    信号:
-        variant_selected: (row_index, variant_index) 用户选择了某个变体
-        variant_confirmed: (row_index, variant_index) 用户确认了某个变体
-        row_discarded: (row_index) 用户废弃了整行
+    支持三种显示模式：
+    - 固定单行
+    - 自适应单行
+    - 双行 2x2
     """
 
-    variant_selected = pyqtSignal(int, int)  # row_index, variant_index
-    variant_confirmed = pyqtSignal(int, int)  # row_index, variant_index
-    row_discarded = pyqtSignal(int)  # row_index
-    
+    variant_selected = pyqtSignal(int, int)
+    variant_confirmed = pyqtSignal(int, int)
+    row_discarded = pyqtSignal(int)
+
+    DISPLAY_MODE_FIXED_SINGLE = 'fixed_single'
+    DISPLAY_MODE_ADAPTIVE_SINGLE = 'adaptive_single'
+    DISPLAY_MODE_TWO_ROW = 'two_row'
+
     def __init__(self, row_index: int, parent=None):
         super().__init__(parent)
         self.row_index = row_index
@@ -111,33 +117,144 @@ class ImageRowWidget(QWidget):
         self._selected_index = -1
         self._best_index = -1
         self._is_active = False
-        
-        self._setup_ui()
-    
-    def _setup_ui(self):
-        """设置UI布局"""
-        main_layout = QHBoxLayout(self)
-        main_layout.setSpacing(8)
-        main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.addWidget(self._create_original_container())
-        main_layout.addWidget(self._create_separator())
+        self._display_mode = self.DISPLAY_MODE_FIXED_SINGLE
 
+        self._root_layout = QVBoxLayout(self)
+        self._content_widget = None
+        self._main_content_layout = None
+        self._reset_layout_refs()
+        self._setup_ui()
+
+    @classmethod
+    def normalize_display_mode(cls, mode: str) -> str:
+        normalized = str(mode or cls.DISPLAY_MODE_FIXED_SINGLE).strip().lower()
+        alias = {
+            cls.DISPLAY_MODE_FIXED_SINGLE: cls.DISPLAY_MODE_FIXED_SINGLE,
+            'fixed': cls.DISPLAY_MODE_FIXED_SINGLE,
+            'single': cls.DISPLAY_MODE_FIXED_SINGLE,
+            cls.DISPLAY_MODE_ADAPTIVE_SINGLE: cls.DISPLAY_MODE_ADAPTIVE_SINGLE,
+            'adaptive': cls.DISPLAY_MODE_ADAPTIVE_SINGLE,
+            'responsive': cls.DISPLAY_MODE_ADAPTIVE_SINGLE,
+            cls.DISPLAY_MODE_TWO_ROW: cls.DISPLAY_MODE_TWO_ROW,
+            'double_row': cls.DISPLAY_MODE_TWO_ROW,
+            'grid': cls.DISPLAY_MODE_TWO_ROW,
+        }
+        return alias.get(normalized, cls.DISPLAY_MODE_FIXED_SINGLE)
+
+    def set_display_mode(self, mode: str):
+        normalized = self.normalize_display_mode(mode)
+        if normalized == self._display_mode:
+            return
+        self._display_mode = normalized
+        self._rebuild_content_layout()
+
+    def get_display_mode(self) -> str:
+        return self._display_mode
+
+    def _setup_ui(self):
+        """设置基础 UI 容器"""
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self._root_layout.setSpacing(0)
+        self._root_layout.setContentsMargins(0, 0, 0, 0)
+        self._rebuild_content_layout()
+
+    def _reset_layout_refs(self):
+        self.lbl_original = None
+        self.lbl_original_title = None
         self.variant_labels = []
         self.score_labels = []
         self.preset_labels = []
         self.variant_containers = []
-        self._add_variant_containers(main_layout)
-        main_layout.addWidget(self._create_button_container())
+        self.btn_confirm = None
+        self.btn_discard = None
+
+    def _rebuild_content_layout(self):
+        current_data = self._data
+        previous_selected = self._selected_index
+        was_active = self._is_active
+
+        if self._content_widget is not None:
+            self._root_layout.removeWidget(self._content_widget)
+            self._content_widget.deleteLater()
+
+        self._reset_layout_refs()
+        self._content_widget = QWidget(self)
+        self._content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self._root_layout.addWidget(self._content_widget)
+
+        if self._display_mode == self.DISPLAY_MODE_TWO_ROW:
+            self._build_two_row_layout()
+        else:
+            self._build_single_row_layout()
+
+        self._apply_layout_mode_sizes()
         self._apply_row_style()
+
+        if current_data is not None:
+            self.load_data(current_data)
+            if 0 <= previous_selected < self.get_variant_count():
+                self.select_variant(previous_selected, emit_signal=False)
+            self.set_active(was_active)
+
+    def _build_single_row_layout(self):
+        main_layout = QHBoxLayout(self._content_widget)
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        main_layout.addWidget(self._create_original_container(), 0, Qt.AlignTop)
+        main_layout.addWidget(self._create_separator(), 0, Qt.AlignVCenter)
+
+        for index in range(4):
+            container, img_label, score_label, preset_label = self._create_variant_container(index)
+            self.variant_labels.append(img_label)
+            self.score_labels.append(score_label)
+            self.preset_labels.append(preset_label)
+            self.variant_containers.append(container)
+            main_layout.addWidget(container, 0, Qt.AlignTop)
+
+        main_layout.addWidget(self._create_button_container(), 0, Qt.AlignVCenter)
+        main_layout.addStretch(1)
+        self._main_content_layout = main_layout
+
+    def _build_two_row_layout(self):
+        main_layout = QHBoxLayout(self._content_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        main_layout.addWidget(self._create_original_container(), 0, Qt.AlignTop)
+        main_layout.addWidget(self._create_separator(), 0, Qt.AlignVCenter)
+
+        variant_grid_widget = QWidget()
+        variant_grid_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        variant_grid = QGridLayout(variant_grid_widget)
+        variant_grid.setSpacing(8)
+        variant_grid.setContentsMargins(0, 0, 0, 0)
+        variant_grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        for index in range(4):
+            container, img_label, score_label, preset_label = self._create_variant_container(index)
+            self.variant_labels.append(img_label)
+            self.score_labels.append(score_label)
+            self.preset_labels.append(preset_label)
+            self.variant_containers.append(container)
+            variant_grid.addWidget(container, index // 2, index % 2)
+
+        main_layout.addWidget(variant_grid_widget, 0, Qt.AlignTop)
+        main_layout.addWidget(self._create_button_container(), 0, Qt.AlignVCenter)
+        main_layout.addStretch(1)
+        self._main_content_layout = main_layout
 
     def _create_original_container(self) -> QWidget:
         container = QWidget()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         layout = QVBoxLayout(container)
         layout.setSpacing(2)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
 
         self.lbl_original = ImageLabel()
-        self.lbl_original.setFixedSize(180, 180)
         self.lbl_original.clicked.connect(self._on_original_clicked)
 
         self.lbl_original_title = QLabel("原图")
@@ -154,23 +271,15 @@ class ImageRowWidget(QWidget):
         separator.setStyleSheet("color: #444;")
         return separator
 
-    def _add_variant_containers(self, main_layout: QHBoxLayout):
-        for i in range(4):
-            container, img_label, score_label, preset_label = self._create_variant_container(i)
-            self.variant_labels.append(img_label)
-            self.score_labels.append(score_label)
-            self.preset_labels.append(preset_label)
-            self.variant_containers.append(container)
-            main_layout.addWidget(container)
-
     def _create_variant_container(self, index: int):
         container = QWidget()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         layout = QVBoxLayout(container)
         layout.setSpacing(2)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
 
         img_label = ImageLabel()
-        img_label.setFixedSize(160, 160)
         img_label.clicked.connect(lambda idx=index: self._on_variant_clicked(idx))
 
         score_label = ScoreLabel()
@@ -186,12 +295,12 @@ class ImageRowWidget(QWidget):
 
     def _create_button_container(self) -> QWidget:
         container = QWidget()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         layout = QVBoxLayout(container)
         layout.setSpacing(10)
         layout.setContentsMargins(10, 0, 10, 0)
 
         self.btn_confirm = QPushButton("✓ 确认")
-        self.btn_confirm.setFixedSize(80, 40)
         self.btn_confirm.setEnabled(False)
         self.btn_confirm.setStyleSheet("""
             QPushButton {
@@ -213,7 +322,6 @@ class ImageRowWidget(QWidget):
         self.btn_confirm.clicked.connect(self._on_confirm_clicked)
 
         self.btn_discard = QPushButton("✗ 废弃")
-        self.btn_discard.setFixedSize(80, 40)
         self.btn_discard.setStyleSheet("""
             QPushButton {
                 background-color: #d13438;
@@ -235,9 +343,78 @@ class ImageRowWidget(QWidget):
         layout.addStretch()
         return container
 
+    def _fixed_single_sizes(self):
+        return {
+            'original_width': 180,
+            'original_height': 180,
+            'variant_size': 160,
+            'button_width': 84,
+            'button_height': 40,
+        }
+
+    def _adaptive_single_sizes(self):
+        width = max(self.width(), 760)
+        usable_width = max(width - 170, 680)
+        variant_size = int((usable_width - 210) / 5.15)
+        variant_size = max(96, min(variant_size, 170))
+        original_size = max(110, min(int(variant_size * 1.12), 200))
+        button_width = 84 if variant_size >= 120 else 80
+        button_height = 40
+        return {
+            'original_width': original_size,
+            'original_height': original_size,
+            'variant_size': variant_size,
+            'button_width': button_width,
+            'button_height': button_height,
+        }
+
+    def _two_row_sizes(self):
+        width = max(self.width(), 720)
+        usable_width = max(width - 210, 520)
+        variant_size = int((usable_width - 180) / 2.35)
+        variant_size = max(104, min(variant_size, 172))
+        original_width = max(120, min(int(variant_size * 1.18), 220))
+        original_height = variant_size * 2 + 34
+        button_width = 88 if variant_size >= 132 else 82
+        button_height = 40
+        return {
+            'original_width': original_width,
+            'original_height': original_height,
+            'variant_size': variant_size,
+            'button_width': button_width,
+            'button_height': button_height,
+        }
+
+    def _apply_layout_mode_sizes(self):
+        if self.lbl_original is None:
+            return
+
+        if self._display_mode == self.DISPLAY_MODE_ADAPTIVE_SINGLE:
+            sizes = self._adaptive_single_sizes()
+        elif self._display_mode == self.DISPLAY_MODE_TWO_ROW:
+            sizes = self._two_row_sizes()
+        else:
+            sizes = self._fixed_single_sizes()
+
+        self.lbl_original.setFixedSize(sizes['original_width'], sizes['original_height'])
+        for label in self.variant_labels:
+            label.setFixedSize(sizes['variant_size'], sizes['variant_size'])
+
+        if self.btn_confirm is not None:
+            self.btn_confirm.setFixedSize(sizes['button_width'], sizes['button_height'])
+        if self.btn_discard is not None:
+            self.btn_discard.setFixedSize(sizes['button_width'], sizes['button_height'])
+
+        self.updateGeometry()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._display_mode in {self.DISPLAY_MODE_ADAPTIVE_SINGLE, self.DISPLAY_MODE_TWO_ROW}:
+            self._apply_layout_mode_sizes()
+            self._refresh_loaded_images()
+
     def _apply_row_style(self):
-        """Update row style based on active state."""
-        # 获取质量颜色
+        """根据当前状态更新行样式"""
         quality_color = self._get_quality_color()
 
         if self._is_active:
@@ -266,18 +443,17 @@ class ImageRowWidget(QWidget):
             """)
 
     def _get_quality_color(self) -> str:
-        """根据最佳变体分数获取质量颜色"""
+        """根据最佳候选图分数返回颜色"""
         if not self._data or 'variants' not in self._data:
-            return "#333"  # 默认灰色
+            return "#333"
 
         variants = self._data.get('variants', [])
         if not variants:
             return "#333"
 
-        # 获取最佳分数
         scores = []
-        for v in variants:
-            score = v.get('score_10', 0)
+        for variant in variants:
+            score = variant.get('score_10', 0)
             if score > 0:
                 scores.append(score)
 
@@ -285,39 +461,25 @@ class ImageRowWidget(QWidget):
             return "#333"
 
         best_score = max(scores)
-
-        # 根据分数返回颜色（10分制）
         if best_score >= 8.0:
-            return "#4CAF50"  # 绿色 - 高质量
-        elif best_score >= 6.0:
-            return "#FFC107"  # 黄色 - 中等质量
-        elif best_score >= 4.0:
-            return "#FF9800"  # 橙色 - 较低质量
-        else:
-            return "#F44336"  # 红色 - 低质量
-
+            return "#4CAF50"
+        if best_score >= 6.0:
+            return "#FFC107"
+        if best_score >= 4.0:
+            return "#FF9800"
+        return "#F44336"
 
     def load_data(self, data: dict):
         """
-        加载数据
+        加载一条审核记录的数据
 
         Args:
             data: {
                 'original_image': PIL.Image,
                 'original_path': str,
                 'basename': str,
-                'control_type': str,  # 'canny', 'openpose', or 'depth'
-                'variants': [
-                    {
-                        'image': PIL.Image,
-                        'score': float,  # Raw score (0-100)
-                        'score_10': float,  # 1-10 score
-                        'is_best': bool,
-                        'preset': dict,
-                        'preset_name': str
-                    },
-                    ...
-                ]
+                'control_type': str,
+                'variants': [...]
             }
         """
         self._reset_loaded_data(data)
@@ -329,6 +491,7 @@ class ImageRowWidget(QWidget):
         self._resolve_best_variant_index(variants)
         self._preselect_single_variant_if_needed()
         self._refresh_variant_highlights()
+        self._apply_row_style()
 
     def _reset_loaded_data(self, data: dict):
         self._data = data
@@ -336,8 +499,11 @@ class ImageRowWidget(QWidget):
         self._best_index = -1
 
     def _show_original_if_available(self, data: dict):
-        if data.get('original_image'):
-            self._set_image(self.lbl_original, data['original_image'])
+        image = data.get('original_image')
+        if image is not None:
+            self._set_image(self.lbl_original, image)
+            return
+        self._clear_image_label(self.lbl_original)
 
     def _visible_variants(self, data: dict):
         return list(data.get('variants', [])[:4])
@@ -351,8 +517,11 @@ class ImageRowWidget(QWidget):
             self._populate_variant_slot(index, variant)
 
     def _populate_variant_slot(self, index: int, variant: dict):
-        if variant.get('image'):
-            self._set_image(self.variant_labels[index], variant['image'])
+        image = variant.get('image')
+        if image is not None:
+            self._set_image(self.variant_labels[index], image)
+        else:
+            self._clear_image_label(self.variant_labels[index])
 
         score_10 = variant.get('score_10', 1.0)
         is_best = variant.get('is_best', False)
@@ -366,7 +535,7 @@ class ImageRowWidget(QWidget):
 
     def _hide_unused_variant_slots(self, used_count: int):
         for index in range(used_count, len(self.variant_containers)):
-            self.variant_labels[index].clear()
+            self._clear_image_label(self.variant_labels[index])
             self.score_labels[index].clear()
             self.preset_labels[index].clear()
             self.variant_containers[index].hide()
@@ -378,94 +547,102 @@ class ImageRowWidget(QWidget):
         self._best_index = scores.index(max(scores)) if scores else -1
 
     def _preselect_single_variant_if_needed(self):
-        # Only one candidate means no real choice; preselect it for faster review.
         if self.get_variant_count() == 1:
             self._selected_index = 0
-    
+
     def _set_image(self, label: ImageLabel, pil_image):
-        """将PIL图像设置到标签上"""
-        if pil_image is None:
+        """将 PIL 图像缩放后显示到标签"""
+        if label is None or pil_image is None:
             return
 
-        # 确保是RGB模式
         if pil_image.mode != 'RGB':
             pil_image = pil_image.convert('RGB')
 
-        # 转换为numpy数组并复制以确保数据独立
+        label._source_image = pil_image
         arr = np.array(pil_image).copy()
         h, w, ch = arr.shape
         bytes_per_line = ch * w
-
-        # 创建QImage（使用copy确保数据独立）
         q_image = QImage(arr.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
-
-        # 缩放并设置
         pixmap = QPixmap.fromImage(q_image).scaled(
-            label.width() - 4, label.height() - 4,
+            max(1, label.width() - 4),
+            max(1, label.height() - 4),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
         label.setPixmap(pixmap)
-    
+
+    def _clear_image_label(self, label: ImageLabel):
+        if label is None:
+            return
+        label.clear()
+        label._source_image = None
+
+    def _refresh_loaded_images(self):
+        if not self._data:
+            return
+
+        self._show_original_if_available(self._data)
+        variants = self._visible_variants(self._data)
+        for index, label in enumerate(self.variant_labels):
+            if index < len(variants) and variants[index].get('image') is not None:
+                self._set_image(label, variants[index]['image'])
+            else:
+                self._clear_image_label(label)
+
     def _on_original_clicked(self):
-        """原图被点击"""
-        # 可以用于预览大图
-        pass
-    
+        """原图点击预留入口"""
+
     def _on_variant_clicked(self, variant_index: int):
-        # Handle variant click.
         self.select_variant(variant_index, emit_signal=True)
 
     def _on_confirm_clicked(self):
-        """确认按钮被点击"""
         self.confirm_selected()
 
     def _on_discard_clicked(self):
-        """废弃按钮被点击"""
         self.discard_row()
-    
+
     def get_selected_variant(self) -> int:
-        """获取选中的变体索引"""
+        """获取当前选中的候选图索引"""
         return self._selected_index
-    
+
     def get_data(self) -> dict:
-        """获取数据"""
+        """获取当前行数据"""
         return self._data
-    
+
     def set_row_index(self, index: int):
-        """设置行索引"""
+        """更新当前行索引"""
         self.row_index = index
 
     def set_active(self, active: bool):
-        """Set row active state for keyboard navigation."""
+        """设置当前行是否为键盘焦点行"""
         self._is_active = active
         self._apply_row_style()
 
     def get_variant_count(self) -> int:
-        """Get available variant count (max 4)."""
+        """获取可用候选图数量"""
         if not self._data:
             return 0
         return min(len(self._data.get('variants', [])), 4)
 
     def _refresh_variant_highlights(self):
-        """Refresh variant border highlights for selected/best states."""
+        """刷新候选图高亮状态"""
         variant_count = self.get_variant_count()
         self.btn_confirm.setEnabled(self._selected_index >= 0)
 
-        for i, label in enumerate(self.variant_labels):
-            if i >= variant_count:
+        for index, label in enumerate(self.variant_labels):
+            if index >= variant_count:
                 label.set_highlight(False)
                 continue
 
-            if i == self._selected_index:
+            if index == self._selected_index:
                 label.set_highlight(True, "#0078d4")
-            elif i == self._best_index:
+            elif index == self._best_index:
                 label.set_highlight(True, "#00ff00")
             else:
                 label.set_highlight(False)
 
     def select_variant(self, variant_index: int, emit_signal: bool = True) -> bool:
-        """Select a variant programmatically."""
+        """程序化选择某个候选图"""
         if variant_index < 0 or variant_index >= self.get_variant_count():
             return False
 
@@ -477,7 +654,7 @@ class ImageRowWidget(QWidget):
         return True
 
     def select_next_variant(self, step: int) -> bool:
-        """Select next/previous variant with wrap-around."""
+        """按步进循环选择前后候选图"""
         variant_count = self.get_variant_count()
         if variant_count == 0:
             return False
@@ -486,32 +663,34 @@ class ImageRowWidget(QWidget):
             next_index = 0 if step >= 0 else variant_count - 1
         else:
             next_index = (self._selected_index + step) % variant_count
-
         return self.select_variant(next_index, emit_signal=True)
 
     def confirm_selected(self) -> bool:
-        """Trigger confirm action for selected variant."""
+        """确认当前选中的候选图"""
         if self._selected_index < 0:
             return False
         self.variant_confirmed.emit(self.row_index, self._selected_index)
         return True
 
     def discard_row(self) -> bool:
-        """Trigger discard action for this row."""
+        """废弃当前行"""
         self.row_discarded.emit(self.row_index)
         return True
 
     def get_best_variant_index(self) -> int:
-        """获取最佳变体的索引"""
+        """获取最佳候选图索引"""
         return self._best_index
 
     def clear(self):
-        """清空显示"""
-        self.lbl_original.clear()
+        """清空当前显示"""
+        self._clear_image_label(self.lbl_original)
         for label in self.variant_labels:
-            label.clear()
+            self._clear_image_label(label)
         for score_label in self.score_labels:
             score_label.clear()
+        for preset_label in self.preset_labels:
+            preset_label.clear()
         self._data = None
         self._selected_index = -1
         self._best_index = -1
+

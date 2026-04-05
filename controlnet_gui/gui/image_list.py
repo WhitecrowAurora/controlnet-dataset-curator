@@ -30,6 +30,7 @@ class ImageListWidget(QWidget):
         super().__init__(parent)
         self._rows = []
         self._active_row_index = -1
+        self._display_mode = 'fixed_single'
         self._setup_ui()
 
     def _setup_ui(self):
@@ -65,12 +66,15 @@ class ImageListWidget(QWidget):
                 height: 0px;
             }
         """)
+        self.scroll_area.viewport().setStyleSheet("background-color: #0d0d0d;")
 
         # 容器widget
         self.container = QWidget()
+        self.container.setStyleSheet("background-color: #0d0d0d;")
         self.container_layout = QVBoxLayout(self.container)
         self.container_layout.setContentsMargins(0, 0, 0, 0)
         self.container_layout.setSpacing(0)
+        self.container_layout.setAlignment(Qt.AlignTop)
         self.container_layout.addStretch()
 
         self.scroll_area.setWidget(self.container)
@@ -104,6 +108,7 @@ class ImageListWidget(QWidget):
 
         row_index = len(self._rows)
         row_widget = ImageRowWidget(row_index)
+        row_widget.set_display_mode(self._display_mode)
         row_widget.load_data(data)
 
         # 连接信号
@@ -119,6 +124,17 @@ class ImageListWidget(QWidget):
             self.set_active_row(0)
 
         return row_widget
+
+    def set_display_mode(self, mode: str):
+        normalized = ImageRowWidget.normalize_display_mode(mode)
+        if normalized == self._display_mode:
+            return
+        self._display_mode = normalized
+        for row_widget in self._rows:
+            row_widget.set_display_mode(normalized)
+
+    def get_display_mode(self) -> str:
+        return self._display_mode
 
     def remove_row(self, row_index: int):
         """移除指定行"""
